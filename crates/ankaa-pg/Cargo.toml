@@ -1,0 +1,27 @@
+[package]
+name = "ankaa-pg"
+description = "Read-only PostgreSQL wire protocol front end (psql, JDBC, BI tools) over the ANKAA DataFusion session."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+ankaa-core.workspace = true
+datafusion = { workspace = true, features = ["nested_expressions", "sql", "unicode_expressions"] }
+datafusion-postgres = { version = "=0.19.0", default-features = false }
+tokio.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+rand = "0.10"
+
+[dev-dependencies]
+ankaa-store.workspace = true
+ankaa-sql.workspace = true
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+
+[lints]
+workspace = true

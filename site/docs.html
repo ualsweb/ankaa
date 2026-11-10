@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANKAA · Documentation</title>
+<meta name="description" content="ANKAA documentation: architecture, bringing your own feed (MQTT, Kafka, NATS), continuous queries, time semantics, deployment, replication, metrics, security and the SQL reference.">
+<meta name="theme-color" content="#0b1220">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+<meta property="og:title" content="ANKAA · Documentation">
+<meta property="og:image" content="https://ualsweb.github.io/ankaa/assets/og.png">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="assets/logo.svg" alt="" width="26" height="26">ANKAA</a>
+    <nav class="nav" aria-label="Main">
+      <a class="hide-s" href="./#why">Why</a>
+      <a class="hide-s" href="./#industries">Industries</a>
+      <a class="hide-s" href="./#architecture">Architecture</a>
+      <a href="benchmarks.html">Measurements</a>
+      <a href="docs.html" aria-current="page">Docs</a>
+      <a class="gh" href="https://github.com/ualsweb/ankaa">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<div class="page-head">
+  <div class="wrap">
+    <span class="eyebrow">Documentation</span>
+    <h1>Everything is in the repository.</h1>
+    <p>The docs live next to the code they describe and change in the same commits. This page is the map: where to start, how to run it, and how it works inside.</p>
+  </div>
+</div>
+
+<section>
+  <div class="wrap">
+    <div class="grid g3">
+      <div class="card doc-group">
+        <span class="tag">Start here</span>
+        <h3>Learn the engine</h3>
+        <ul class="doc-list">
+          <li><a href="https://github.com/ualsweb/ankaa#readme">README</a><span>What ANKAA is, the 60-second quickstart, status.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/architecture.md">Architecture</a><span>The crates, the data path and the threads.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/data-model.md">Data model</a><span>Chunks, partitions, fixed-point values, dictionaries.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/tree/main/examples/python">Python quickstart</a><span>In-process and over Arrow Flight, with a notebook.</span></li>
+        </ul>
+      </div>
+      <div class="card doc-group">
+        <span class="tag">Your data</span>
+        <h3>Bring your own feed</h3>
+        <ul class="doc-list">
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/generic-ingest.md">Tables and sources</a><span>MQTT, Kafka, NATS and files; JSON and CSV; topic mapping; nullable columns; late data; retention.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/continuous-queries.md">Continuous queries</a><span>Bars, quantiles, rolling windows and ASOF joins kept up to date as rows arrive.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/temporal-architecture.md">Time semantics</a><span>Watermarks, ordering, lateness, scans in time order, how aggregates use it.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/crates/ankaa-ingest/examples/custom_feed.rs">Custom binary feed</a><span>The framing helper for a protocol of your own.</span></li>
+        </ul>
+      </div>
+      <div class="card doc-group">
+        <span class="tag">Operate</span>
+        <h3>Run it in production</h3>
+        <ul class="doc-list">
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/deployment.md">Deployment guide</a><span>Sizing, kernel settings, systemd, TLS, backups, upgrades.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/replication.md">Replication and failover</a><span>A standby that streams the log and serves reads.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/metrics-semantics.md">Metrics reference</a><span>Every Prometheus metric, its unit and the alert built on it.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/tree/main/deploy">deploy/</a><span>Example config, systemd unit, Prometheus rules, Grafana dashboard.</span></li>
+        </ul>
+      </div>
+      <div class="card doc-group">
+        <span class="tag">Trust</span>
+        <h3>Security and quality</h3>
+        <ul class="doc-list">
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/security.md">Security model</a><span>Threats, authentication, what is and is not exposed.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/SECURITY.md">Reporting a vulnerability</a><span>Private disclosure process.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/unsafe-policy.md">Unsafe policy</a><span>Where <code>unsafe</code> is allowed and how it is checked.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/measurement-protocol.md">Measurement protocol</a><span>What it takes before a number becomes a claim.</span></li>
+        </ul>
+      </div>
+      <div class="card doc-group">
+        <span class="tag">Design</span>
+        <h3>Why it is built this way</h3>
+        <ul class="doc-list">
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/prd/PRD-v4.1.md">Product requirements</a><span>Scope, requirements and phases.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/tree/main/docs/decisions">Decision records</a><span>Product identity, first hardware, build versus reuse, latency claims.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/tree/main/docs/benchmarks">Benchmark notes</a><span>Profiling passes, recovery speed, first light on Axion.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/tree/main/docs/rfc">RFCs</a><span>How design changes are proposed.</span></li>
+        </ul>
+      </div>
+      <div class="card doc-group">
+        <span class="tag">Project</span>
+        <h3>Where it is going</h3>
+        <ul class="doc-list">
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/STATUS.md">Status and known gaps</a><span>What is done, verified and still open.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/ROADMAP.md">Roadmap</a><span>The next phases, in order.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/CHANGELOG.md">Changelog</a><span>Every release, what changed.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/CONTRIBUTING.md">Contributing</a><span>DCO sign-off, tests, the review gates.</span></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="soft" id="reference">
+  <div class="wrap">
+    <p class="kicker">Quick reference</p>
+    <h2>SQL, tables and configuration at a glance.</h2>
+    <div class="grid g2">
+      <div>
+        <h3>Table functions and aggregates</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Function</th><th>Returns</th></tr></thead>
+            <tbody>
+              <tr><td><code>asof_join(left, right, key [, tolerance_ns [, 'forward']])</code></td><td class="wrap-ok">For every left row, the latest (or next) right row with the same key</td></tr>
+              <tr><td><code>ohlcv(table, width_ns [, key])</code></td><td class="wrap-ok">Open, high, low, close, volume, notional and count per bucket</td></tr>
+              <tr><td><code>rolling(table, window_ns, step_ns [, key])</code></td><td class="wrap-ok">Bars over a trailing window at every step</td></tr>
+              <tr><td><code>percentiles(table, column, 'q1,q2' [, key])</code></td><td class="wrap-ok">Streaming quantiles, 1 % relative error</td></tr>
+              <tr><td><code>vwap(price, size)</code></td><td class="wrap-ok">Volume-weighted average price, exact integer sums</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="note">Plus all of Apache DataFusion's SQL: joins, window functions, <code>date_bin</code>, CTEs. Rows without a value (<code>NULL</code>) are skipped by every aggregate.</p>
+      </div>
+      <div>
+        <h3>Tables you query</h3>
+        <div class="tbl-wrap">
+          <table>
+            <thead><tr><th>Table</th><th>Contents</th></tr></thead>
+            <tbody>
+              <tr><td><code>&lt;your table&gt;</code></td><td class="wrap-ok">Whatever <code>[[tables]]</code> declares, fed by its <code>[[sources]]</code></td></tr>
+              <tr><td><code>dictionaries</code></td><td class="wrap-ok">Names behind every <code>dict</code> column: <code>table, column, id, name</code></td></tr>
+              <tr><td><code>cq_&lt;name&gt;</code>, <code>cq_&lt;name&gt;_live</code></td><td class="wrap-ok">Closed and open results of a continuous query</td></tr>
+              <tr><td><code>trades</code>, <code>quotes</code>, <code>book_deltas</code>, <code>symbols</code></td><td class="wrap-ok">The built-in market-data schema</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <h3 class="mt-l">Column types</h3>
+        <p class="note" style="margin-top:0"><code>timestamp_ns</code> · <code>fixed8</code> (exact decimal, 8 places) · <code>int64</code> · <code>float64</code> · <code>u8</code> · <code>dict</code> (string to dense id). Any column but the timestamp and <code>dict</code> keys may be <code>nullable</code>.</p>
+      </div>
+    </div>
+    <div class="code-card mt-l">
+      <header><span>Configuration skeleton</span><span>ankaad.toml · <a href="https://github.com/ualsweb/ankaa/blob/main/deploy/ankaad.example.toml" style="color:var(--code-key)">annotated example</a></span></header>
+<pre><span class="c-key">[server]</span>     flight_addr, metrics_addr, pg_addr, token_env, tls_cert, tls_key, tls_client_ca, query_timeout_s
+<span class="c-key">[storage]</span>    wal_dir, checkpoint_dir, snapshot_ms, hot_sealed_chunks, warm_budget_mib, market_retention
+<span class="c-key">[resources]</span>  query_memory_mib, memory_budget_mib, memlock_mib
+<span class="c-key">[feed]</span>       enabled, url, streams, depth_snapshots          <span class="c-dim"># built-in exchange feed (optional)</span>
+<span class="c-key">[[tables]]</span>   name, columns, partition_by, max_lateness_ms, retention, max_dict_entries
+<span class="c-key">[[sources]]</span>  name, kind (mqtt|kafka|nats|file), url, subject, format, table, map, ts_unit
+<span class="c-key">[[continuous]]</span> name, kind (ohlcv|percentiles|rolling|asof), table, key, value, width_ns
+<span class="c-key">[replication]</span> serve_wal, standby_of
+
+<span class="c-dim">$ ankaad config print   # every key with its default</span>
+<span class="c-dim">$ ankaad config check   # validate without side effects</span></pre>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="fine" style="border-top:0;margin-top:0;padding-top:0"><span>© 2026 The ANKAA authors · Apache License 2.0 · <a href="./">Home</a> · <a href="benchmarks.html">Measurements</a> · <a href="https://github.com/ualsweb/ankaa">GitHub</a></span><span>No cookies, trackers or external resources.</span></div>
+  </div>
+</footer>
+</body>
+</html>

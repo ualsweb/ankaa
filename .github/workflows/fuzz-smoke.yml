@@ -1,0 +1,32 @@
+name: fuzz-smoke
+on:
+  pull_request:
+    paths:
+      - "crates/ankaa-feeds/**"
+      - "crates/ankaa-wal/**"
+      - "crates/ankaa-core/**"
+      - "crates/ankaa-ingest/**"
+      - "fuzz/**"
+  schedule:
+    - cron: "17 2 * * *"
+permissions:
+  contents: read
+jobs:
+  fuzz:
+    name: cargo-fuzz smoke (5 min per target)
+    runs-on: ubuntu-24.04-arm
+    if: ${{ hashFiles('fuzz/Cargo.toml') != '' }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly-2026-10-15
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - run: cargo install cargo-fuzz --locked
+      - name: Run each target for 300 s
+        run: |
+          for t in $(cargo +nightly-2026-10-15 fuzz list); do
+            echo "::group::$t"; cargo +nightly-2026-10-15 fuzz run "$t" -- -max_total_time=300; echo "::endgroup::"
+          done

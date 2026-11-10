@@ -1,0 +1,26 @@
+[package]
+name = "ankaa-simd"
+description = "SIMD backends (scalar, NEON, SVE2 via global_asm!) with selection vectors and runtime dispatch."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# SVE2 backend: aarch64 Linux only; assembled with `.arch_extension sve2` in global_asm!.
+sve2 = []
+# Experimental: nightly SVE intrinsics (stdarch_aarch64_sve). Never enabled in release builds.
+nightly-sve = []
+
+[dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

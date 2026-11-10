@@ -1,0 +1,25 @@
+[package]
+name = "ankaa-tier"
+description = "Warm/cold storage tiers for ANKAA: Vortex (ALP, FastLanes, dictionary) encoding of sealed chunks, cold segment files, checkpoint metadata."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+ankaa-store.workspace = true
+arrow = { workspace = true }
+vortex = { version = "=0.93.0", default-features = false, features = ["files"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

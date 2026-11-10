@@ -1,0 +1,26 @@
+[package]
+name = "ankaa-wire"
+description = "Bare-metal ingest path (PRD F-22, Phase 3 showcase): hardware RX timestamps, PHC<->CNTVCT calibration, AF_XDP placeholder."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# AF_XDP zero-copy receive (Linux >= 6.8, libxdp). Not implemented yet: enabling the feature
+# compiles the API surface and returns `WireError::Unsupported` at runtime.
+afxdp = []
+
+[dependencies]
+thiserror.workspace = true
+libc = "0.2"
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

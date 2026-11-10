@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANKAA · Measurements</title>
+<meta name="description" content="Measurements of ANKAA on Arm server hardware (Google Axion, Neoverse V2): correctness on silicon, hot-path timings, SIMD backends and a preliminary comparison with DuckDB, ClickHouse and QuestDB, with scripts and raw results.">
+<meta name="theme-color" content="#0b1220">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+<meta property="og:title" content="ANKAA · Measurements on Arm hardware">
+<meta property="og:image" content="https://ualsweb.github.io/ankaa/assets/og.png">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="assets/logo.svg" alt="" width="26" height="26">ANKAA</a>
+    <nav class="nav" aria-label="Main">
+      <a class="hide-s" href="./#why">Why</a>
+      <a class="hide-s" href="./#industries">Industries</a>
+      <a class="hide-s" href="./#architecture">Architecture</a>
+      <a href="benchmarks.html" aria-current="page">Measurements</a>
+      <a href="docs.html">Docs</a>
+      <a class="gh" href="https://github.com/ualsweb/ankaa">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<div class="page-head">
+  <div class="wrap">
+    <span class="eyebrow">Measured in the open</span>
+    <h1>Measurements on Arm hardware</h1>
+    <p>Everything on this page was produced by scripts in the repository on named hardware, and the raw results are committed next to them. Rerun them, and tell us what we got wrong.</p>
+  </div>
+</div>
+
+<section>
+  <div class="wrap">
+    <div class="caveat"><svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg><div><b>How to read this page.</b> These are real-hardware numbers from one small virtual machine. They are not a benchmark in the sense of the project's <a href="https://github.com/ualsweb/ankaa/blob/main/docs/measurement-protocol.md">measurement protocol</a> (several instance types, pinned cores, repeated days, independent review), and no general performance claim is drawn from them. Their job is to find problems: the first run found twelve, all fixed and documented.</div></div>
+
+    <p class="kicker">Machine</p>
+    <h2>Google Cloud c4a-standard-4 (Axion)</h2>
+    <div class="tbl-wrap">
+      <table>
+        <tbody>
+          <tr><th>CPU</th><td class="wrap-ok">Arm Neoverse V2, 4 vCPU, one thread per core · SVE2 at 128-bit vectors</td></tr>
+          <tr><th>Caches · memory</th><td class="wrap-ok">64 KiB L1d and 2 MiB L2 per core, 80 MiB shared L3 · 16 GB</td></tr>
+          <tr><th>Disk · OS</th><td class="wrap-ok">Hyperdisk Balanced 150 GB · Ubuntu 24.04, kernel 7.0 · rustc 1.99.1</td></tr>
+          <tr><th>Scripts</th><td class="wrap-ok"><a href="https://github.com/ualsweb/ankaa/tree/main/scripts/gcp"><code>scripts/gcp/</code></a> (VM lifecycle), <a href="https://github.com/ualsweb/ankaa/blob/main/scripts/first-light.sh"><code>scripts/first-light.sh</code></a>, <a href="https://github.com/ualsweb/ankaa/tree/main/bench/compare"><code>bench/compare/</code></a></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section class="soft">
+  <div class="wrap">
+    <p class="kicker">Correctness on silicon</p>
+    <h2>First, it has to be right.</h2>
+    <div class="grid g2">
+      <div class="card"><h3>SVE2 kernels on real Neoverse V2</h3><p>All ten hand-written SVE2 kernels pass the differential suite against scalar and NEON, the first time the assembly ran outside QEMU. Under emulation they are also checked at 256- and 512-bit vectors.</p></div>
+      <div class="card"><h3>31 / 31 oracle checks</h3><p>Query results on real market data match DuckDB and Polars, check for check (<a href="https://github.com/ualsweb/ankaa/tree/main/bench/oracle"><code>bench/oracle/</code></a>).</p></div>
+      <div class="card"><h3>Crash recovery</h3><p><code>kill -9</code> during ingest of a 407,000-frame replay with WAL and segments: identical row counts after restart, serving again 1.14 s after start (20 segments re-attached in 2 ms, WAL replay 1.0 s).</p></div>
+      <div class="card"><h3>1,000 power cuts</h3><p>The write-ahead log under dm-flakey on ext4 in an aarch64 VM: 1,000 of 1,000 iterations without losing an acknowledged record or missing a corruption (<a href="https://github.com/ualsweb/ankaa/blob/main/scripts/power-loss-rig.sh"><code>power-loss-rig.sh</code></a>).</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <p class="kicker">Hot paths</p>
+    <h2>One core, criterion medians.</h2>
+    <div class="grid g2">
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Path</th><th class="num">Median</th></tr></thead>
+          <tbody>
+            <tr><td>Binance trade decode, JSON / SBE binary</td><td class="num">337 ns / 36 ns</td></tr>
+            <tr><td>Depth update (10 levels), JSON / SBE</td><td class="num">1.03 µs / 118 ns</td></tr>
+            <tr><td>Fixed-point price parse</td><td class="num">17 ns</td></tr>
+            <tr><td>Append one row to an open chunk</td><td class="num">22 ns</td></tr>
+            <tr><td>Encode a 64k-row chunk (Vortex) / write its segment</td><td class="num">4.8 / 11.3 ms</td></tr>
+            <tr><td>Generic ingest, 1,024 JSON / CSV messages</td><td class="num">887 / 147 µs</td></tr>
+            <tr><td>Replay, decode + order books + store</td><td class="num">3.3 M events/s</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="tbl-wrap">
+        <table>
+          <thead><tr><th>Kernel, 1,024 values</th><th class="num">scalar</th><th class="num">NEON</th><th class="num">SVE2</th></tr></thead>
+          <tbody>
+            <tr><td>filter_range_f32</td><td class="num">966</td><td class="num best">242</td><td class="num">305</td></tr>
+            <tr><td>sum_f32</td><td class="num">665</td><td class="num best">89</td><td class="num">261</td></tr>
+            <tr><td>min_max_f32</td><td class="num">119</td><td class="num best">55</td><td class="num">162</td></tr>
+            <tr><td>min_max_i64</td><td class="num">183</td><td class="num">181</td><td class="num best">114</td></tr>
+            <tr><td>count_f32_gt</td><td class="num">175</td><td class="num best">57</td><td class="num">196</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+    <p class="note">Nanoseconds unless stated. At 128-bit vectors NEON wins most kernels, so the engine picks per kernel at start-up: NEON on Axion and Graviton4 except 64-bit integer min/max, where SVE2 has instructions NEON lacks. Wider SVE vectors switch the default to SVE2. Full tables: <a href="https://github.com/ualsweb/ankaa/blob/main/docs/benchmarks/2026-11-10-axion-first-light.md">first-light note</a>.</p>
+  </div>
+</section>
+
+<section class="soft" id="comparison">
+  <div class="wrap">
+    <p class="kicker">Preliminary comparison</p>
+    <h2>Seventeen queries, four engines, one hour of live data.</h2>
+    <p class="sub">Trades, quotes and order-book deltas for 12 symbols captured live from Binance (584,617 trades, 214,895 quotes, 4,849,537 book deltas), loaded into each engine on the same VM. 20 runs after 3 warm-ups; median and (p95) milliseconds; every result checked against the DuckDB reference.</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Query</th><th class="num">ANKAA in server</th><th class="num">ANKAA over Flight</th><th class="num">DuckDB 2.0</th><th class="num">ClickHouse 26.8</th><th class="num">QuestDB 10.1</th></tr></thead>
+        <tbody>
+          <tr><td>Range count <span class="tag" style="margin:0">q01</span></td><td class="num">0.220 <span style="color:var(--ink-faint)">(0.270)</span></td><td class="num best">0.466 <span style="color:var(--ink-faint)">(0.537)</span></td><td class="num">1.566 <span style="color:var(--ink-faint)">(1.667)</span></td><td class="num">5.062 <span style="color:var(--ink-faint)">(5.713)</span></td><td class="num">1.227 <span style="color:var(--ink-faint)">(1.512)</span></td></tr>
+          <tr><td>Aggregate by symbol <span class="tag" style="margin:0">q02</span></td><td class="num">0.340 <span style="color:var(--ink-faint)">(0.350)</span></td><td class="num best">0.665 <span style="color:var(--ink-faint)">(0.746)</span></td><td class="num">3.030 <span style="color:var(--ink-faint)">(3.381)</span></td><td class="num">5.812 <span style="color:var(--ink-faint)">(6.282)</span></td><td class="num">6.741 <span style="color:var(--ink-faint)">(9.756)</span></td></tr>
+          <tr><td>Latest row per symbol <span class="tag" style="margin:0">q03</span></td><td class="num">2.405 <span style="color:var(--ink-faint)">(2.910)</span></td><td class="num best">2.506 <span style="color:var(--ink-faint)">(2.735)</span></td><td class="num">4.158 <span style="color:var(--ink-faint)">(4.277)</span></td><td class="num">10.6 <span style="color:var(--ink-faint)">(11.7)</span></td><td class="num">15.7 <span style="color:var(--ink-faint)">(26.8)</span></td></tr>
+          <tr><td>VWAP by symbol <span class="tag" style="margin:0">q04</span></td><td class="num">0.965 <span style="color:var(--ink-faint)">(1.390)</span></td><td class="num best">1.264 <span style="color:var(--ink-faint)">(1.337)</span></td><td class="num">2.734 <span style="color:var(--ink-faint)">(2.913)</span></td><td class="num">6.090 <span style="color:var(--ink-faint)">(7.173)</span></td><td class="num">4.041 <span style="color:var(--ink-faint)">(6.645)</span></td></tr>
+          <tr><td>OHLCV, 1-second bars <span class="tag" style="margin:0">q05</span></td><td class="num">3.680 <span style="color:var(--ink-faint)">(3.800)</span></td><td class="num best">4.379 <span style="color:var(--ink-faint)">(4.642)</span></td><td class="num">21.1 <span style="color:var(--ink-faint)">(21.8)</span></td><td class="num">75.7 <span style="color:var(--ink-faint)">(76.7)</span></td><td class="num">43.6 <span style="color:var(--ink-faint)">(58.6)</span></td></tr>
+          <tr><td>OHLCV, 5-second bars <span class="tag" style="margin:0">q06</span></td><td class="num">2.825 <span style="color:var(--ink-faint)">(2.940)</span></td><td class="num best">3.197 <span style="color:var(--ink-faint)">(3.705)</span></td><td class="num">18.4 <span style="color:var(--ink-faint)">(21.0)</span></td><td class="num">51.4 <span style="color:var(--ink-faint)">(52.1)</span></td><td class="num">18.3 <span style="color:var(--ink-faint)">(21.7)</span></td></tr>
+          <tr><td>Crossed quotes <span class="tag" style="margin:0">q10</span></td><td class="num">0.335 <span style="color:var(--ink-faint)">(0.470)</span></td><td class="num best">0.697 <span style="color:var(--ink-faint)">(0.735)</span></td><td class="num">1.060 <span style="color:var(--ink-faint)">(1.259)</span></td><td class="num">2.687 <span style="color:var(--ink-faint)">(2.999)</span></td><td class="num">2.005 <span style="color:var(--ink-faint)">(2.369)</span></td></tr>
+          <tr><td>Spread statistics <span class="tag" style="margin:0">q11</span></td><td class="num">1.640 <span style="color:var(--ink-faint)">(1.810)</span></td><td class="num best">1.777 <span style="color:var(--ink-faint)">(1.867)</span></td><td class="num">2.918 <span style="color:var(--ink-faint)">(3.045)</span></td><td class="num">5.470 <span style="color:var(--ink-faint)">(5.947)</span></td><td class="num">3.896 <span style="color:var(--ink-faint)">(4.682)</span></td></tr>
+          <tr><td>Percentiles of price <span class="tag" style="margin:0">q12</span></td><td class="num">3.360 <span style="color:var(--ink-faint)">(3.410)</span></td><td class="num best">3.833 <span style="color:var(--ink-faint)">(4.018)</span></td><td class="num">50.6 <span style="color:var(--ink-faint)">(56.4)</span></td><td class="num">13.0 <span style="color:var(--ink-faint)">(14.7)</span></td><td class="num">631.3 <span style="color:var(--ink-faint)">(632.8)</span></td></tr>
+          <tr><td>Percentiles of size <span class="tag" style="margin:0">q13</span></td><td class="num">3.385 <span style="color:var(--ink-faint)">(3.470)</span></td><td class="num best">3.822 <span style="color:var(--ink-faint)">(3.891)</span></td><td class="num">46.8 <span style="color:var(--ink-faint)">(52.7)</span></td><td class="num">9.518 <span style="color:var(--ink-faint)">(9.779)</span></td><td class="num">196.1 <span style="color:var(--ink-faint)">(239.2)</span></td></tr>
+          <tr><td>Trades per second <span class="tag" style="margin:0">q14</span></td><td class="num">1.600 <span style="color:var(--ink-faint)">(1.710)</span></td><td class="num best">1.909 <span style="color:var(--ink-faint)">(2.099)</span></td><td class="num">4.972 <span style="color:var(--ink-faint)">(6.196)</span></td><td class="num">7.892 <span style="color:var(--ink-faint)">(8.202)</span></td><td class="num">5.822 <span style="color:var(--ink-faint)">(7.999)</span></td></tr>
+          <tr><td>Book-delta statistics (4.8 M rows) <span class="tag" style="margin:0">q15</span></td><td class="num">10.2 <span style="color:var(--ink-faint)">(11.2)</span></td><td class="num best">12.4 <span style="color:var(--ink-faint)">(12.6)</span></td><td class="num">15.9 <span style="color:var(--ink-faint)">(16.4)</span></td><td class="num">21.9 <span style="color:var(--ink-faint)">(22.6)</span></td><td class="num">43.1 <span style="color:var(--ink-faint)">(45.8)</span></td></tr>
+          <tr><td>Range by symbol name <span class="tag" style="margin:0">q16</span></td><td class="num">0.885 <span style="color:var(--ink-faint)">(0.960)</span></td><td class="num best">1.105 <span style="color:var(--ink-faint)">(1.174)</span></td><td class="num">3.286 <span style="color:var(--ink-faint)">(3.464)</span></td><td class="num">7.519 <span style="color:var(--ink-faint)">(8.416)</span></td><td class="num">18.3 <span style="color:var(--ink-faint)">(18.7)</span></td></tr>
+          <tr><td>Large trades (wide result) <span class="tag" style="margin:0">q17</span></td><td class="num">4.955 <span style="color:var(--ink-faint)">(5.150)</span></td><td class="num best">7.039 <span style="color:var(--ink-faint)">(8.056)</span></td><td class="num">7.989 <span style="color:var(--ink-faint)">(8.926)</span></td><td class="num">47.4 <span style="color:var(--ink-faint)">(50.8)</span></td><td class="num">106.0 <span style="color:var(--ink-faint)">(108.2)</span></td></tr>
+          <tr><td>ASOF join, backward <span class="tag" style="margin:0">q18</span></td><td class="num">6.215 <span style="color:var(--ink-faint)">(6.430)</span></td><td class="num best">7.273 <span style="color:var(--ink-faint)">(7.535)</span></td><td class="num">25.6 <span style="color:var(--ink-faint)">(26.6)</span></td><td class="num">16.2 <span style="color:var(--ink-faint)">(17.0)</span></td><td class="num">92.8 <span style="color:var(--ink-faint)">(96.8)</span></td></tr>
+          <tr><td>ASOF join, backward with tolerance <span class="tag" style="margin:0">q19</span></td><td class="num">7.325 <span style="color:var(--ink-faint)">(7.490)</span></td><td class="num best">8.511 <span style="color:var(--ink-faint)">(8.814)</span></td><td class="num">27.6 <span style="color:var(--ink-faint)">(28.7)</span></td><td class="num">16.7 <span style="color:var(--ink-faint)">(17.3)</span></td><td class="num">93.5 <span style="color:var(--ink-faint)">(93.8)</span></td></tr>
+          <tr><td>ASOF join, forward with tolerance <span class="tag" style="margin:0">q20</span></td><td class="num">6.580 <span style="color:var(--ink-faint)">(7.350)</span></td><td class="num best">7.515 <span style="color:var(--ink-faint)">(7.860)</span></td><td class="num">34.9 <span style="color:var(--ink-faint)">(39.1)</span></td><td class="num">16.7 <span style="color:var(--ink-faint)">(17.6)</span></td><td class="num">n/a</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note"><b>Timing scopes differ, and that matters.</b> “ANKAA in server” is plan, execute and collect inside ankaad. “ANKAA over Flight” is client-observed: request sent to last row received, the column to compare. DuckDB runs in process (execute and fetch Arrow, no network). ClickHouse is client-observed over HTTP, QuestDB over the Postgres protocol. Green marks the lowest median among the client-observed columns. Raw results: <a href="https://github.com/ualsweb/ankaa/blob/main/bench/compare/results/2026-11-11-gcp-c4a-standard-4.md">markdown</a> · <a href="https://github.com/ualsweb/ankaa/blob/main/bench/compare/results/2026-11-11-gcp-c4a-standard-4.json">JSON</a> · <a href="https://github.com/ualsweb/ankaa/blob/main/docs/benchmarks/comparison-method.md">method</a>.</p>
+    <p class="note">What this does not show: concurrency, ingest under query load, larger-than-memory data, other instance sizes, or tuned configurations of the other engines. Those belong to the full benchmark, which will be reviewed before it is published.</p>
+  </div>
+</section>
+
+<section id="soak">
+  <div class="wrap">
+    <p class="kicker">Endurance</p>
+    <h2>Live soaks on Google Axion.</h2>
+    <p class="sub">The server runs as a hardened systemd service on live Binance streams (trades and 100 ms depth for three symbols), with WAL, segments, retention and two continuous queries. <a href="https://github.com/ualsweb/ankaa/blob/main/scripts/soak.sh"><code>scripts/soak.sh</code></a> scrapes the metrics every 30 seconds and fails on any feed gap, dropped frame, WAL error, rejected row, restart or memory growth outside the data tiers.</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Run (Google Axion c4a-standard-4)</th><th class="num">Duration</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td>Run 1, development build</td><td class="num">3.9 h</td><td class="wrap-ok">Clean: no feed gap, dropped frame, WAL error or rejected row. Stopped to deploy a newer build.</td></tr>
+          <tr><td>Run 2, development build</td><td class="num">2.6 h</td><td class="wrap-ok">Clean. Stopped to deploy a newer build.</td></tr>
+          <tr><td>Run 3, development build</td><td class="num">2.0 h</td><td class="wrap-ok">Clean. Stopped to deploy a newer build.</td></tr>
+          <tr><td>Run 4, development build</td><td class="num">2.8 h</td><td class="wrap-ok"><b>Failed the memory check</b> at 2 h 47 min: resident memory rose while the in-memory warm tier filled to its budget, by design, and the check counted that as growth. The check now measures memory <i>outside</i> the data tiers. No data problem: no gap, drop or WAL error.</td></tr>
+          <tr><td>Run 5, development build</td><td class="num">1.6 h</td><td class="wrap-ok">Clean. Stopped to deploy a newer build.</td></tr>
+          <tr><td>Run 6, development build</td><td class="num">0.6 h</td><td class="wrap-ok">Clean. Stopped to deploy the release build.</td></tr>
+          <tr><td>Run 7, release build</td><td class="num">running</td><td class="wrap-ok">Started after a passing <code>kill -9</code> crash test (identical row counts after recovery, serving again in about a second), with a 2-hour retention window that expires and deletes segments on live data.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Not done yet: one uninterrupted 24-hour run of the release build. It is the next item on the <a href="https://github.com/ualsweb/ankaa/blob/main/docs/launch-checklist.md">launch checklist</a>, and this table will say how it went, pass or fail.</p>
+  </div>
+</section>
+
+<section class="soft">
+  <div class="wrap">
+    <p class="kicker">Development signals</p>
+    <h2>Measured on a laptop, labelled as such.</h2>
+    <p class="sub">Some tests are about scale rather than speed. They run on the development machine (Apple M4 Pro) and are reported as signals, not results.</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Test</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td>100,000 devices in one table, one partition each (<a href="https://github.com/ualsweb/ankaa/blob/main/crates/ankaa-store/tests/scale.rs"><code>scale.rs</code></a>)</td><td class="wrap-ok">2 M rows ingested single-threaded at about 20 M rows/s · query snapshot 3 ms · about 1.4 KB per device plus 1.3 KB for its query view</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="fine" style="border-top:0;margin-top:0;padding-top:0"><span>© 2026 The ANKAA authors · Apache License 2.0 · <a href="./">Home</a> · <a href="docs.html">Docs</a> · <a href="https://github.com/ualsweb/ankaa">GitHub</a></span><span>No cookies, trackers or external resources.</span></div>
+  </div>
+</footer>
+</body>
+</html>

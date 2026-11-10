@@ -1,0 +1,22 @@
+[package]
+name = "ankaa-store"
+description = "Hot columnar chunk store: 1,024-row vectors, 64k-row sealed chunks, zone maps, watermarks, tiering."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+ankaa-simd.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

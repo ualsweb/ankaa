@@ -1,0 +1,110 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/ankaa-core",
+    "crates/ankaa-time",
+    "crates/ankaa-ring",
+    "crates/ankaa-simd",
+    "crates/ankaa-store",
+    "crates/ankaa-wal",
+    "crates/ankaa-ingest",
+    "crates/ankaa-feeds",
+    "crates/ankaa-ts",
+    "crates/ankaa-sql",
+    "crates/ankaa-flight",
+    "crates/ankaa-tier",
+    "crates/ankaa-pg",
+    "crates/ankaa-wire",
+    "bins/ankaad",
+]
+# ankaa-py (PyO3/maturin), fuzz/ and bench/spikes are built separately; see docs/dev-environment.md.
+exclude = ["crates/ankaa-py", "fuzz", "bench"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+repository = "https://github.com/ualsweb/ankaa"
+authors = ["Urtzi Alfaro"]
+publish = false
+
+[workspace.dependencies]
+# internal
+ankaa-core = { path = "crates/ankaa-core" }
+ankaa-time = { path = "crates/ankaa-time" }
+ankaa-ring = { path = "crates/ankaa-ring" }
+ankaa-simd = { path = "crates/ankaa-simd" }
+ankaa-store = { path = "crates/ankaa-store" }
+ankaa-wal = { path = "crates/ankaa-wal" }
+ankaa-ingest = { path = "crates/ankaa-ingest" }
+ankaa-feeds = { path = "crates/ankaa-feeds" }
+ankaa-ts = { path = "crates/ankaa-ts" }
+ankaa-sql = { path = "crates/ankaa-sql" }
+ankaa-flight = { path = "crates/ankaa-flight" }
+ankaa-tier = { path = "crates/ankaa-tier" }
+ankaa-pg = { path = "crates/ankaa-pg" }
+ankaa-wire = { path = "crates/ankaa-wire" }
+
+# data plane (pinned together: datafusion 55.x <-> arrow 59.x)
+arrow = { version = "59.2", default-features = false }
+arrow-array = "59.2"
+arrow-schema = "59.2"
+arrow-buffer = "59.2"
+datafusion = { version = "55.2.0", default-features = false }
+parquet = { version = "59.2", default-features = false }
+
+# runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "fs"] }
+futures = "0.3"
+async-trait = "0.1"
+bytes = "1"
+bytemuck = "1"
+
+# utils
+thiserror = "2"
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+crc32c = "0.6"
+libc = "0.2"
+parking_lot = "0.12"
+crossbeam-utils = "0.8"
+
+# testing
+proptest = "1"
+criterion = { version = "0.7", default-features = false }
+loom = "0.7"
+
+[profile.dev]
+debug = "line-tables-only"
+incremental = true
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 4
+panic = "abort"
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"

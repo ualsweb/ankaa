@@ -1,0 +1,60 @@
+[package]
+name = "ankaa-py"
+description = "Python bindings for ANKAA (PyO3 + Arrow C Data Interface)."
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[features]
+default = []
+# In-process Flight server for the Python test-suite (`ankaa._native._test_server`).
+test-server = []
+
+[dependencies]
+pyo3 = { version = "0.30", features = ["extension-module", "abi3-py310"] }
+pyo3-arrow = { version = "0.20", default-features = false }
+
+arrow = { version = "59.2", default-features = false, features = ["ipc"] }
+arrow-flight = { version = "59.2", default-features = false }
+datafusion = { version = "55.2.0", default-features = false, features = ["nested_expressions", "sql", "unicode_expressions"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "transport", "channel", "tls-aws-lc"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time"] }
+futures = "0.3"
+bytes = "1"
+
+ankaa-core = { path = "../ankaa-core" }
+ankaa-flight = { path = "../ankaa-flight" }
+ankaa-sql = { path = "../ankaa-sql" }
+ankaa-store = { path = "../ankaa-store" }
+ankaa-feeds = { path = "../ankaa-feeds" }
+ankaa-ingest = { path = "../ankaa-ingest" }
+ankaa-ts = { path = "../ankaa-ts" }
+
+# Standalone package (excluded from the workspace): see docs/dev-environment.md.
+[workspace]
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 4

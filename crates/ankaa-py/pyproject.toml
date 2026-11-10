@@ -1,0 +1,36 @@
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ankaa"
+version = "0.1.0"
+description = "Arm-native real-time tick-data engine (Python bindings)"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = []
+
+[project.optional-dependencies]
+pyarrow = ["pyarrow>=15"]
+polars = ["polars>=1.0"]
+test = ["pytest>=8", "pyarrow>=15", "polars>=1.0"]
+
+[project.urls]
+Repository = "https://github.com/ualsweb/ankaa"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "ankaa._native"
+python-source = "python"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

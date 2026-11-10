@@ -1,0 +1,35 @@
+# Prometheus scrape configuration for ankaad.
+#
+# /metrics requires the same bearer token as Flight when one is configured. Put the token
+# alone on one line in /etc/prometheus/ankaa.token (mode 0640, owned by the prometheus user)
+# and never in this file. The endpoint has no TLS: scrape over loopback, a management network
+# or an SSH tunnel. Validate with `promtool check config prometheus.yml`.
+
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+rule_files:
+  - alerts.yml
+
+scrape_configs:
+  - job_name: ankaad
+    metrics_path: /metrics
+    scheme: http
+    scrape_interval: 10s
+    scrape_timeout: 5s
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/ankaa.token
+    static_configs:
+      - targets:
+          - 127.0.0.1:9100          # server.metrics_addr
+        labels:
+          instance: ankaad-1
+          environment: dev
+
+# Alertmanager (optional):
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["127.0.0.1:9093"]

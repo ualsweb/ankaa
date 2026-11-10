@@ -1,0 +1,25 @@
+[package]
+name = "ankaa-wal"
+description = "Write-ahead log: CRC32C records, group commit, replay, truncation at checkpoint."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "wal-torture"
+path = "src/bin/wal_torture.rs"
+
+[dependencies]
+crc32c.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+proptest.workspace = true
+
+[lints]
+workspace = true

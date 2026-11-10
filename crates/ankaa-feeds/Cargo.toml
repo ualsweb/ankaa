@@ -1,0 +1,61 @@
+[package]
+name = "ankaa-feeds"
+description = "Feed decoders: Binance JSON/SBE, Databento DBN, generic framing; capture tool."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "ankaa-capture"
+path = "src/bin/capture.rs"
+required-features = ["capture"]
+
+[features]
+default = []
+live = ["dep:tokio", "dep:tokio-tungstenite", "dep:futures", "dep:tracing", "dep:rustls", "dep:reqwest"]
+capture = ["live", "dep:tracing-subscriber", "dep:clap", "dep:anyhow"]
+# Use simd-json (NEON/AVX2 accelerated scanning) instead of serde_json for the JSON path.
+simd-json = ["dep:simd-json"]
+# Databento DBN replay (adds zstd).
+dbn = ["dep:dbn", "dep:time"]
+# Generic message sources for user-defined tables.
+sources = ["dep:tokio", "dep:futures", "dep:tracing"]
+nats = ["sources", "dep:async-nats"]
+kafka = ["sources", "dep:rskafka"]
+mqtt = ["sources", "dep:rumqttc"]
+
+[dependencies]
+ankaa-core.workspace = true
+ankaa-ingest.workspace = true
+crc32c.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+simd-json = { version = "0.17", default-features = false, features = ["serde_impl", "runtime-detection"], optional = true }
+bytes.workspace = true
+tokio = { workspace = true, optional = true }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"], optional = true }
+futures = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+clap = { version = "4", features = ["derive", "env"], optional = true }
+anyhow = { workspace = true, optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "http2"], optional = true }
+dbn = { version = "0.73", default-features = false, features = ["zstd"], optional = true }
+time = { version = "0.3", optional = true }
+async-nats = { version = "0.52", optional = true }
+rumqttc = { version = "0.25", optional = true, default-features = false }
+rskafka = { version = "0.6", optional = true, default-features = false, features = ["transport-tls"] }
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile = "3"
+ankaa-wal.workspace = true
+
+[lints]
+workspace = true

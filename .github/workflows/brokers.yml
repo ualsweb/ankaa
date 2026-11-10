@@ -1,0 +1,49 @@
+name: brokers
+# Generic sources against real NATS, Kafka (service containers) and MQTT (Mosquitto, started
+# with its no-auth listener config, which a service container cannot pass).
+on:
+  pull_request:
+    paths:
+      - "crates/ankaa-feeds/src/sources/**"
+      - "crates/ankaa-ingest/src/generic.rs"
+      - "bins/ankaad/**"
+      - ".github/workflows/brokers.yml"
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  brokers:
+    name: NATS + Kafka + MQTT end to end (aarch64)
+    runs-on: ubuntu-24.04-arm
+    services:
+      nats:
+        image: nats:2.11-alpine
+        ports: ["4222:4222"]
+      kafka:
+        image: apache/kafka:3.9.1
+        ports: ["9092:9092"]
+        env:
+          KAFKA_NODE_ID: "1"
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://127.0.0.1:9092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - name: Start Mosquitto
+        run: docker run -d --name mqtt -p 1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
+      - name: Wait for Kafka and Mosquitto
+        run: |
+          for i in $(seq 1 60); do (echo > /dev/tcp/127.0.0.1/9092) 2>/dev/null && break; sleep 1; done
+          for i in $(seq 1 30); do (echo > /dev/tcp/127.0.0.1/1883) 2>/dev/null && break; sleep 1; done
+      - run: ANKAA_BROKER_TESTS=1 cargo test -p ankaad --test brokers -- --nocapture

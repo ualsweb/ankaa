@@ -1,0 +1,233 @@
+# Prometheus alerting rules for ankaad. Source of truth and rationale: docs/metrics-semantics.md
+# ("Recommended alert rules"); keep the two in sync. Thresholds are starting points to tune on
+# your feed and hardware; no performance numbers are published for this project yet.
+# Validate with `promtool check rules alerts.yml`.
+
+groups:
+  - name: ankaa-feed
+    rules:
+      - alert: AnkaaFeedStalled
+        expr: rate(ankaa_frames_total{job="ankaad"}[2m]) == 0 and ankaa_uptime_seconds{job="ankaad"} > 120
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "ankaad {{ $labels.instance }} receives no frames"
+          description: "No frames for 2 minutes after warm-up. Check the source log lines (connecting / connect failed) and the exchange status."
+
+      - alert: AnkaaFeedGaps
+        expr: increase(ankaa_feed_gaps_total{job="ankaad"}[10m]) > 0
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "Depth sequence gaps on {{ $labels.instance }}"
+          description: "{{ $value }} sequence gaps in 10 minutes. Each gap triggers a book resync; persistent gaps mean the host or network drops WebSocket frames."
+
+      - alert: AnkaaBookResyncs
+        expr: increase(ankaa_book_resyncs_total{job="ankaad"}[10m]) > 3
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "Order books resynchronising repeatedly on {{ $labels.instance }}"
+          description: "{{ $value }} resync requests in 10 minutes. If gaps are flat, the REST snapshot is arriving too old for the buffered diffs (slow REST or rate limiting)."
+
+      - alert: AnkaaReconnectStorm
+        expr: increase(ankaa_source_connects_total{job="ankaad"}[15m]) > 3
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "WebSocket reconnecting repeatedly on {{ $labels.instance }}"
+          description: "{{ $value }} connections in 15 minutes. Every reconnect resets sequence tracking and refetches every depth snapshot."
+
+      - alert: AnkaaSourceChannelDrops
+        expr: increase(ankaa_source_dropped_full_total{job="ankaad"}[5m]) > 0
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "Frames dropped at the source channel on {{ $labels.instance }}"
+          description: "The ingest loop fell behind the feed and frames were discarded (data loss)."
+
+      - alert: AnkaaBadFrames
+        expr: rate(ankaa_frames_bad_total{job="ankaad"}[5m]) > 0.1
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Decoder rejecting frames on {{ $labels.instance }}"
+          description: "More than one rejected frame per 10 s for 5 minutes: a feed format change or a decoder bug. See the 'frame rejected' warnings."
+
+      - alert: AnkaaOutOfOrderDrops
+        expr: increase(ankaa_dropped_rows_total{job="ankaad"}[10m]) > 0
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "Appenders dropping rows on {{ $labels.instance }}"
+          description: "Rows arrived with a timestamp below the partition watermark (or failed type checks). The feed delivered out of order within a symbol; the rows are not stored."
+
+  - name: ankaa-latency
+    rules:
+      - alert: AnkaaIngestLatencyP99High
+        expr: |
+          ankaa_ingest_latency_ns{job="ankaad",quantile="0.99"} > 50e6
+          and ankaa_ingest_latency_ns{job="ankaad",quantile="0.99"} < 1e9
+          and ankaa_ingest_latency_ns_count{job="ankaad"} > 10 * ankaa_wal_recovered_frames{job="ankaad"} + 1000
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "Ingest p99 above 50 ms on {{ $labels.instance }} (lifetime quantile, software clock)"
+          description: "Receive-to-watermark p99 is {{ $value | humanize }} ns. The summary is cumulative since start; the guards skip the overflow sentinel and the WAL-recovery warm-up. Tune the threshold on your hardware."
+
+      - alert: AnkaaIngestLatencyRecentMeanHigh
+        expr: |
+          rate(ankaa_ingest_latency_ns_sum{job="ankaad"}[5m])
+            / rate(ankaa_ingest_latency_ns_count{job="ankaad"}[5m]) > 20e6
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Recent mean ingest latency above 20 ms on {{ $labels.instance }}"
+          description: "5-minute mean of receive-to-watermark latency is {{ $value | humanize }} ns. This is the windowed signal; the summary quantiles are lifetime."
+
+  - name: ankaa-wal
+    rules:
+      - alert: AnkaaWalErrors
+        expr: increase(ankaa_wal_errors_total{job="ankaad"}[5m]) > 0
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "WAL append/commit errors on {{ $labels.instance }}"
+          description: "{{ $value }} WAL errors in 5 minutes. Check free space and the 'wal commit failed' / 'wal append failed' warnings. Frames since the last good commit are not durable."
+
+      - alert: AnkaaWalQueueDrops
+        expr: increase(ankaa_wal_dropped_total{job="ankaad"}[5m]) > 0
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "Frames refused by the WAL on {{ $labels.instance }}"
+          description: "The log did not accept frames within its 2 s wait (fdatasync stalls, full or failing disk). Those frames were dropped, not ingested: the data is lost for real-time feeds, and file/Kafka sources re-read it after the next restart (their positions are frozen until then)."
+
+      - alert: AnkaaWalStalled
+        expr: |
+          rate(ankaa_wal_durable_lsn{job="ankaad"}[2m]) == 0
+          and rate(ankaa_frames_total{job="ankaad"}[2m]) > 0
+          and ankaa_wal_durable_lsn{job="ankaad"} > 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "WAL durable LSN not advancing on {{ $labels.instance }}"
+          description: "Frames arrive but nothing becomes durable. Storage stall or I/O errors."
+
+      - alert: AnkaaWalPendingBytesHigh
+        expr: ankaa_wal_pending_bytes{job="ankaad"} > 4 * 1024 * 1024
+        for: 1m
+        labels: {severity: warning}
+        annotations:
+          summary: "WAL pending bytes above 4 MiB on {{ $labels.instance }}"
+          description: "Normal operation commits at 256 KiB or every 10 ms; a buffer this large means commits are failing or very slow."
+
+  - name: ankaa-query
+    rules:
+      - alert: AnkaaQueryErrorRate
+        expr: |
+          rate(ankaa_query_errors_total{job="ankaad"}[5m])
+            / clamp_min(rate(ankaa_queries_total{job="ankaad"}[5m]), 1e-9) > 0.5
+          and rate(ankaa_queries_total{job="ankaad"}[5m]) > 0.05
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "More than half of SQL statements fail on {{ $labels.instance }}"
+          description: "Either a client is sending invalid or non-read-only SQL, or a table/function changed."
+
+      - alert: AnkaaUnauthenticatedCalls
+        expr: increase(ankaa_query_unauthenticated_total{job="ankaad"}[5m]) > 10
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "Flight calls with a bad bearer token on {{ $labels.instance }}"
+          description: "{{ $value }} refused calls in 5 minutes: a misconfigured client or an unauthorised probe. Check who can reach the Flight port."
+
+  - name: ankaa-sources
+    rules:
+      - alert: AnkaaUserMessagesRejected
+        expr: increase(ankaa_user_rejected_total{job="ankaad"}[5m]) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Generic sources: messages rejected on {{ $labels.instance }}"
+          description: "{{ $value }} messages produced no row in 5 minutes (unparseable, missing field, dictionary full, out of order, or a timestamp more than a day ahead). Run with RUST_LOG=ankaad=debug to see the reason per message."
+
+      - alert: AnkaaSourceOversizedMessages
+        expr: increase(ankaa_source_oversized_total{job="ankaad"}[5m]) > 0
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "Generic sources: oversized messages dropped on {{ $labels.instance }}"
+          description: "Messages larger than max_message_bytes were dropped. Raise the limit for that source or fix the producer."
+
+      - alert: AnkaaKafkaOffsetReset
+        expr: increase(ankaa_kafka_offset_resets_total{job="ankaad"}[15m]) > 0
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "Kafka position lost on {{ $labels.instance }}"
+          description: "A saved Kafka offset was no longer retained by the broker; the source continued from the earliest retained offset. The messages in between were never ingested. Broker retention is shorter than the time the server was away."
+
+      - alert: AnkaaContinuousQueryRowsRejected
+        expr: increase(ankaa_cq_rejected_rows_total{job="ankaad"}[5m]) > 0
+        for: 0m
+        labels: {severity: critical}
+        annotations:
+          summary: "Continuous query results refused on {{ $labels.instance }}"
+          description: "A continuous query produced rows its output table refused. This is a defect: collect the 'result row refused' log line and report it."
+
+  - name: ankaa-replication
+    rules:
+      - alert: AnkaaStandbyDisconnected
+        expr: ankaa_replication_connects_total{job="ankaad"} > 0 and ankaa_replication_connected{job="ankaad"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "Standby {{ $labels.instance }} is not connected to its primary"
+          description: "The WAL stream has been down for 2 minutes. If the process exited, journalctl shows why ('replication stopped: ...'); a standby that needs records the primary has truncated must be re-seeded (docs/replication.md)."
+
+      - alert: AnkaaStandbyStalled
+        expr: |
+          ankaa_replication_connected{job="ankaad"} == 1
+          and ankaa_replication_received_lsn{job="ankaad"} > ankaa_replication_applied_lsn{job="ankaad"}
+          and ankaa_replication_last_receive_age_seconds{job="ankaad"} > 60
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: "Standby {{ $labels.instance }} is not applying what it received"
+          description: "Records were received but not applied for over a minute: the standby's ingest loop or its WAL disk is stalled."
+
+      - alert: AnkaaWalStreamRefused
+        expr: increase(ankaa_replication_wal_refused_total{job="ankaad"}[5m]) > 0
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "WAL stream requests refused on {{ $labels.instance }}"
+          description: "{{ $value }} requests for the WAL stream were refused (wrong token or replication.max_standbys reached): a misconfigured standby or an unauthorised client."
+
+  - name: ankaa-process
+    rules:
+      - alert: AnkaaDown
+        expr: up{job="ankaad"} == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "ankaad metrics endpoint unreachable on {{ $labels.instance }}"
+          description: "Scrape failed for 1 minute. With the systemd unit, journalctl -u ankaad shows the exit reason (a panic aborts the process and systemd restarts it)."
+
+      - alert: AnkaaRestarted
+        expr: ankaa_uptime_seconds{job="ankaad"} < 300 and changes(ankaa_wal_recovered_frames{job="ankaad"}[10m]) > 0
+        for: 0m
+        labels: {severity: info}
+        annotations:
+          summary: "ankaad restarted on {{ $labels.instance }}"
+          description: "Uptime under 5 minutes and the recovered-frame count changed: a restart with WAL recovery happened."
+
+      - alert: AnkaaSnapshotTickStarved
+        expr: rate(ankaa_snapshots_total{job="ankaad"}[2m]) < 2
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Query snapshots swapping slower than configured on {{ $labels.instance }}"
+          description: "Fewer than 2 swaps/s (default is 4/s at snapshot_ms = 250). The ingest loop is saturated or blocked; queries see stale data. Adjust the threshold if you changed storage.snapshot_ms."

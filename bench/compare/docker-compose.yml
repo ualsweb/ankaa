@@ -1,0 +1,53 @@
+# Comparison engines for bench/compare (pinned, arm64-capable images). DuckDB runs in-process (Python) and
+# ANKAA runs from the repo's own binary, so only QuestDB and ClickHouse are containers.
+#
+#   docker compose -f bench/compare/docker-compose.yml up -d
+#   docker compose -f bench/compare/docker-compose.yml down -v     # also drops the data volumes
+#
+# Tuning follows each vendor's documentation (links in README.md). Nothing here is tuned *down*.
+# Ports: QuestDB REST 9000 / PG wire 8812 / ILP 9009; ClickHouse HTTP 8123 (native 9000 is mapped to 9001
+# to avoid the clash with QuestDB; the harness only uses HTTP).
+services:
+  questdb:
+    image: questdb/questdb:10.1.0
+    container_name: ankaa-bench-questdb
+    ports:
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:8812:8812"
+      - "127.0.0.1:9009:9009"
+    environment:
+      QDB_PG_USER: admin
+      QDB_PG_PASSWORD: quest
+      # https://questdb.com/docs/configuration/ - defaults size worker pools from the CPU count.
+      QDB_HTTP_QUERY_TIMEOUT: 600000
+      QDB_PG_NET_CONNECTION_TIMEOUT: 600000
+    volumes:
+      - questdb-data:/var/lib/questdb
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.8.36.3
+    container_name: ankaa-bench-clickhouse
+    ports:
+      - "127.0.0.1:8123:8123"
+      - "127.0.0.1:9001:9000"
+    environment:
+      # https://hub.docker.com/r/clickhouse/clickhouse-server : default user, no password, network access
+      CLICKHOUSE_SKIP_USER_SETUP: "1"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    cap_add:
+      - SYS_NICE
+      - NET_ADMIN
+      - IPC_LOCK
+
+volumes:
+  questdb-data:
+  clickhouse-data:

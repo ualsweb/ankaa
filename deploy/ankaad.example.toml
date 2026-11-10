@@ -1,0 +1,155 @@
+# ankaad configuration (TOML).
+#
+# Start from `ankaad config print` for the defaults and `ankaad config check <file>` to validate.
+# Most keys have a CLI flag of `ankaad serve` (`serve --help`); a flag overrides the file. Unknown
+# keys are rejected. `ankaad config check <file>` validates without creating anything.
+# Secrets never go in this file: the bearer token comes from the environment variable named by
+# `server.token_env` (default ANKAA_TOKEN), the exchange API key from BINANCE_API_KEY.
+#
+# This file as written is the LOOPBACK DEVELOPMENT variant: no token required, no TLS, no WAL.
+# The production variant is shown in the commented blocks marked "production".
+# Schema: crates/ankaa-core/src/config.rs. Guide: docs/deployment.md.
+
+[feed]
+# WebSocket base URL (ws:// or wss://). Stream names are appended as ?streams=a/b/c.
+# Keyless Binance market data:
+url = "wss://data-stream.binance.vision/stream"
+# Binance SBE binary stream (needs an Ed25519 API key in BINANCE_API_KEY):
+# url = "wss://stream-sbe.binance.com/stream"
+
+# REST base for depth snapshots (http:// or https://).
+rest_url = "https://api.binance.com"
+
+# Binance combined-stream names: <symbol>@<stream>. Non-empty.
+streams = [
+    "btcusdt@trade",
+    "btcusdt@depth@100ms",
+    "ethusdt@trade",
+    "ethusdt@depth@100ms",
+]
+
+# Fetch a REST depth snapshot per depth symbol on connect and on resync, and align diffs to it
+# (exact books). false = books start cold from diffs (quotes incomplete until levels churn).
+depth_snapshots = true
+
+# Environment variable holding the exchange API key (`serve --api-key` and BINANCE_API_KEY take
+# precedence).
+# api_key_env = "BINANCE_API_KEY"
+
+[storage]
+# Write-ahead log directory. Unset = no durability (in-memory only). Setting it enables
+# group commit (10 ms / 256 KiB, fdatasync) and recovery on start. Segments are 256 MiB and are
+# deleted once a checkpoint (see checkpoint_dir) covers them.
+# wal_dir = "/var/lib/ankaa/wal"                         # production
+
+# Sealed chunks per partition kept uncompressed (hot) before encoding to the warm tier (>= 1).
+hot_sealed_chunks = 4
+
+# Directory for segment files (Vortex-encoded sealed chunks + the symbol dictionary). With it set,
+# every sealed chunk is written to disk before leaving the hot tier, restarts restore segments
+# without replaying them, and the WAL is truncated behind the checkpoint. Unset = memory only.
+# checkpoint_dir = "/var/lib/ankaa/segments"             # production
+
+# Memory budget for warm (encoded, in-memory) chunks, MiB; older warm chunks are demoted to cold
+# (read from their segment file on demand). Needs checkpoint_dir to be > 0 effective.
+warm_budget_mib = 512
+
+# Minimum seconds between WAL truncations after a checkpoint.
+checkpoint_interval_s = 60
+
+# Share of one core (percent, 1-50) the tiering step may use per snapshot interval.
+tier_budget_pct = 5
+
+# Query-view swap interval in milliseconds (>= 5). Queries see data up to the last swap.
+snapshot_ms = 50
+
+[server]
+# Arrow Flight (gRPC) bind address. Binding beyond loopback REQUIRES a bearer token.
+flight_addr = "127.0.0.1:50051"
+# flight_addr = "10.0.0.12:50051"                        # production: data interface
+
+# Prometheus /metrics bind address. No TLS on this endpoint: keep it on loopback or a management
+# interface. By default it accepts the Flight token; set metrics_token_env to give Prometheus its
+# own secret so a scrape path never carries the SQL credential.
+metrics_addr = "127.0.0.1:9100"
+# metrics_addr = "10.0.1.12:9100"                        # production: management interface
+# metrics_token_env = "ANKAA_METRICS_TOKEN"              # production
+
+# Optional read-only PostgreSQL wire protocol listener (psql, JDBC, BI tools). SCRAM-SHA-256,
+# password = the bearer token. Plaintext transport: loopback or behind a TLS terminator.
+# pg_addr = "127.0.0.1:5432"
+
+# Wall-clock budget per query (planning + execution + transfer), seconds.
+query_timeout_s = 30
+
+# Environment variable that holds the bearer token (the value itself is never in this file).
+# `serve --token` and the ANKAA_TOKEN variable take precedence over a custom name here.
+token_env = "ANKAA_TOKEN"
+
+# TLS for Flight (rustls). Set cert and key together; PEM. Without them the transport is
+# plain HTTP/2 and the token travels in cleartext: loopback only.
+# tls_cert = "/etc/ankaa/tls/server.pem"                 # production
+# tls_key  = "/etc/ankaa/tls/server.key"                 # production
+# Client CA: when set, clients must present a certificate signed by it (mutual TLS).
+# tls_client_ca = "/etc/ankaa/tls/ca.pem"                # production, optional
+
+# ---------------------------------------------------------------------------------------------
+# Beyond market data (docs/generic-ingest.md, docs/continuous-queries.md, docs/replication.md)
+#
+# [[tables]]                       # a user-defined time-series table
+# name = "telemetry"
+# partition_by = "rack"
+# max_dict_entries = 1000000      # cap on distinct values per dict column (= partitions)
+# columns = [ { name = "ts", type = "timestamp_ns" }, { name = "rack", type = "dict" },
+#             { name = "temp", type = "fixed8" } ]
+#
+# [[sources]]                      # NATS / Kafka / file → that table
+# name = "racks"
+# kind = "nats"
+# url = "nats://127.0.0.1:4222"
+# subject = "racks.>"
+# format = "json"
+# table = "telemetry"
+# ts_unit = "millis"
+# map = { ts = "meta.time", rack = "meta.id", temp = "temp" }   # every column must be mapped
+# max_message_bytes = 1048576     # larger messages are dropped and counted
+# start = "latest"                # kafka: latest | earliest, when no position is saved yet
+#
+# [[continuous]]                   # incrementally maintained: cq_btc_1s and cq_btc_1s_live
+# name = "btc_1s"
+# kind = "ohlcv"
+# table = "trades"
+# key = "symbol"
+# value = "price"
+# size = "size"
+# width_ns = 1000000000
+#
+# [replication]                    # primary: let standbys stream the WAL (off by default)
+# serve_wal = true
+# token_env = "ANKAA_REPLICATION_TOKEN"   # its own token: SQL clients cannot read the raw log
+# max_standbys = 4
+#
+# [replication]                    # standby: a read-only copy of a primary
+# standby_of = "10.0.0.12:50051"
+# primary_token_env = "ANKAA_REPLICATION_TOKEN"
+# primary_tls_ca = "/etc/ankaa/tls/ca.pem"
+#
+# [feed]                           # a server fed only by [[sources]] (no exchange feed)
+# enabled = false
+# streams = []
+
+[resources]
+# Locked memory the engine intends to use, MiB. Start-up fails when the soft RLIMIT_MEMLOCK
+# is lower (raise with systemd LimitMEMLOCK= or `ulimit -l`). 0 = skip the check.
+# Nothing is mlocked by this build yet; this is the fail-fast gate for the hugepage arenas.
+memlock_mib = 0
+# memlock_mib = 8192                                     # production
+
+# Resident memory budget, MiB. Start-up fails when it exceeds physical memory. 0 = skip.
+# A check, not a run-time cap.
+memory_budget_mib = 0
+# memory_budget_mib = 24576                              # production
+
+# DataFusion memory pool for queries, MiB (>= 64). A query that needs more fails with an error
+# instead of taking the ingest process down.
+query_memory_mib = 1024

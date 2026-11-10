@@ -1,0 +1,6 @@
+# Stable pinned. Nightly is used only via `rustup run nightly-2026-10-15 ...`
+# for miri and the optional `nightly-sve` intrinsics feature (never for release builds).
+[toolchain]
+channel = "1.99.1"
+components = ["rustfmt", "clippy", "llvm-tools"]
+targets = ["aarch64-unknown-linux-gnu"]

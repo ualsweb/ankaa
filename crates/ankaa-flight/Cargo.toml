@@ -1,0 +1,36 @@
+[package]
+name = "ankaa-flight"
+description = "Arrow Flight server: SQL over DoGet/GetFlightInfo with bearer-token auth."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+ankaa-core.workspace = true
+ankaa-wal.workspace = true
+ankaa-sql.workspace = true
+parking_lot.workspace = true
+arrow = { workspace = true, features = ["ipc"] }
+arrow-flight = { version = "59.2", default-features = false }
+datafusion = { workspace = true, features = ["nested_expressions", "sql", "unicode_expressions"] }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "transport", "channel", "tls-aws-lc"] }
+tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["net"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std"] }
+futures.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+rcgen = "0.14"
+tempfile = "3"
+ankaa-wal.workspace = true
+ankaa-store.workspace = true
+arrow-flight = { version = "59.2", default-features = false }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "transport", "channel"] }
+
+[lints]
+workspace = true

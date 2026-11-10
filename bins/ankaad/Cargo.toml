@@ -1,0 +1,61 @@
+[package]
+name = "ankaad"
+description = "ANKAA server and CLI: ingest, store, SQL over Arrow Flight, /metrics."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+# the SVE2 kernels are part of the server (aarch64 Linux only; a no-op elsewhere): the engine
+# picks per kernel between NEON and SVE2 at run time
+ankaa-simd = { workspace = true, features = ["sve2"] }
+mimalloc = { version = "0.1", default-features = false, optional = true }
+ankaa-core.workspace = true
+ankaa-store.workspace = true
+ankaa-ingest.workspace = true
+ankaa-feeds = { workspace = true, features = ["live", "dbn", "sources", "nats", "kafka", "mqtt"] }
+ankaa-flight.workspace = true
+arrow-flight = { version = "59.2", default-features = false }
+tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "transport", "channel"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+futures.workspace = true
+ankaa-sql.workspace = true
+ankaa-ts.workspace = true
+ankaa-wal.workspace = true
+ankaa-tier.workspace = true
+ankaa-pg.workspace = true
+bytes.workspace = true
+arrow = { workspace = true, features = ["prettyprint", "csv"] }
+parquet = { workspace = true, features = ["arrow", "snap", "zstd"] }
+flate2 = "1.1"
+datafusion = { workspace = true, features = ["nested_expressions", "sql", "unicode_expressions"] }
+tokio.workspace = true
+anyhow.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+tracing.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+async-nats = "0.52"
+rskafka = { version = "0.6", default-features = false }
+rumqttc = { version = "0.25", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[lints]
+workspace = true
+
+[features]
+default = ["mimalloc"]
+# mimalloc as the global allocator. Measured on Neoverse V2 against the glibc allocator: every
+# query of the comparison set 2-17 % faster over Flight and no run-to-run variation on the table
+# functions, for about 19 % more resident memory. `--no-default-features` builds with the system
+# allocator.
+mimalloc = ["dep:mimalloc"]

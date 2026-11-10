@@ -1,0 +1,16 @@
+# No default runner: on an aarch64 Linux host the target triple equals the host
+# triple, and a runner would emulate every test. Select QEMU per invocation
+# (see docs/dev-environment.md) or use the aliases below.
+
+[alias]
+# SVE2 differential tests under QEMU at VL=128 / 256 / 512 bits (16/32/64 bytes).
+# Array form: cargo splits string aliases on whitespace without shell quoting.
+qtest128 = ["test", "--config", "target.aarch64-unknown-linux-gnu.runner='qemu-aarch64 -cpu max,sve-default-vector-length=16'", "--config", "env.ANKAA_EXPECT_SVE2='16'", "-p", "ankaa-simd", "--features", "sve2", "--", "--test-threads=1"]
+qtest256 = ["test", "--config", "target.aarch64-unknown-linux-gnu.runner='qemu-aarch64 -cpu max,sve-default-vector-length=32'", "--config", "env.ANKAA_EXPECT_SVE2='32'", "-p", "ankaa-simd", "--features", "sve2", "--", "--test-threads=1"]
+qtest512 = ["test", "--config", "target.aarch64-unknown-linux-gnu.runner='qemu-aarch64 -cpu max,sve-default-vector-length=64'", "--config", "env.ANKAA_EXPECT_SVE2='64'", "-p", "ankaa-simd", "--features", "sve2", "--", "--test-threads=1"]
+lint = "clippy --workspace --all-targets --all-features -- -D warnings"
+# loom model checking of the SPSC ring (slow; release mode keeps it under a minute)
+loom = "test -p ankaa-ring --test loom --release --config build.rustflags=['--cfg','loom']"
+
+[env]
+RUST_BACKTRACE = "1"

@@ -1,0 +1,17 @@
+[package]
+name = "ankaa-time"
+description = "Time domains: PHC/CNTVCT calibration, monotonic-to-wall mapping, timestamp types."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints]
+workspace = true

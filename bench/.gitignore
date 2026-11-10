@@ -1,0 +1,6 @@
+# benchmark harness / oracle (bench/compare, bench/oracle)
+.venv/
+__pycache__/
+.pytest_cache/
+compare/data/
+compare/results/smoke/

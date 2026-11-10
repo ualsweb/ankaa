@@ -1,0 +1,29 @@
+# Microbenchmarks (criterion). Standalone package so the engine crates stay free of bench deps.
+# Numbers from a laptop are development signals, not product claims (docs/measurement-protocol.md).
+[package]
+name = "ankaa-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+ankaa-simd = { path = "../crates/ankaa-simd" }
+ankaa-ingest = { path = "../crates/ankaa-ingest" }
+ankaa-feeds = { path = "../crates/ankaa-feeds" }
+ankaa-store = { path = "../crates/ankaa-store" }
+ankaa-ts = { path = "../crates/ankaa-ts" }
+ankaa-wal = { path = "../crates/ankaa-wal" }
+ankaa-tier = { path = "../crates/ankaa-tier" }
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+bytes = "1"
+
+[features]
+# Also benchmark the SVE2 backend (aarch64 Linux on a CPU with SVE2 only).
+sve2 = ["ankaa-simd/sve2"]
+
+[[bench]]
+name = "hot_paths"
+harness = false
+
+[workspace]

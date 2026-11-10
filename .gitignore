@@ -1,0 +1,33 @@
+/target
+**/target
+Cargo.lock.bak
+*.profraw
+*.capture
+/captures/
+/.venv/
+__pycache__/
+*.pyc
+.DS_Store
+/docs/benchmarks/raw/
+fuzz/artifacts/
+fuzz/target/
+fuzz/coverage/
+
+# Local working notes, not part of the project
+/internal/
+
+# proptest shrink caches (regressions are re-found by the seeds in the tests)
+**/proptest-regressions/
+# per-crate Python venvs and build outputs
+**/.venv/
+*.so
+*.proptest-regressions
+
+# local tooling and files that never belong in the repository
+.pytest_cache/
+.idea/
+.vscode/
+.env
+.env.*
+*.cast
+/.source-commit

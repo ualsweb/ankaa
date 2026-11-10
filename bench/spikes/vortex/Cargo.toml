@@ -1,0 +1,14 @@
+# P0-07 spike: does Vortex 0.93 build on aarch64 and round-trip ALP / FastLanes bit-packing?
+# Standalone (not a workspace member) so its dependency tree does not affect the engine.
+[package]
+name = "spike-vortex"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0"
+
+[dependencies]
+vortex = "=0.93.0"
+arrow = "59.2"
+
+[workspace]

@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ANKAA · Real-time time-series engine for Arm servers</title>
+<meta name="description" content="ANKAA is an open-source, Arm-native real-time time-series engine in Rust. Stream telemetry, machine data and market feeds in from MQTT, Kafka and NATS; query them with SQL milliseconds later; keep live aggregates and compressed history in one binary.">
+<meta name="theme-color" content="#0b1220">
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+<meta property="og:type" content="website">
+<meta property="og:title" content="ANKAA · Real-time time-series engine for Arm servers">
+<meta property="og:description" content="Stream in, query in milliseconds. Ingest, durable storage, live aggregates and SQL in one Rust binary, built for Arm cloud CPUs. Apache-2.0.">
+<meta property="og:image" content="https://ualsweb.github.io/ankaa/assets/og.png">
+<meta property="og:url" content="https://ualsweb.github.io/ankaa/">
+<meta name="twitter:card" content="summary_large_image">
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="./"><img src="assets/logo.svg" alt="" width="26" height="26">ANKAA</a>
+    <nav class="nav" aria-label="Main">
+      <a class="hide-s" href="#why">Why</a>
+      <a class="hide-s" href="#industries">Industries</a>
+      <a class="hide-s" href="#architecture">Architecture</a>
+      <a href="benchmarks.html">Measurements</a>
+      <a href="docs.html">Docs</a>
+      <a class="gh" href="https://github.com/ualsweb/ankaa"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="main">
+<!-- ============================== HERO ============================== -->
+<section class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <span class="eyebrow">Open source · Rust · Arm-native</span>
+      <h1>Stream in. <em>Query in milliseconds.</em></h1>
+      <p class="lede">ANKAA is a real-time time-series engine for Arm servers. Readings from machines, meters, sensors and markets arrive over MQTT, Kafka, NATS or exchange feeds, become queryable with SQL within milliseconds, stay up to date as live aggregates, and are compressed to disk for months of history. One binary. No pipeline to glue together.</p>
+      <div class="cta">
+        <a class="btn primary" href="#quickstart">Try it in 60 seconds</a>
+        <a class="btn ghost" href="https://github.com/ualsweb/ankaa"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>Star on GitHub</a>
+        <a class="btn ghost" href="docs.html">Read the docs</a>
+      </div>
+      <div class="hero-meta">
+        <span><svg viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></svg>Write-ahead log, crash-safe</span>
+        <span><svg viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></svg>SQL · Arrow Flight · Postgres · Python</span>
+        <span><svg viewBox="0 0 24 24"><path d="M5 12l5 5L20 7"/></svg>NEON + SVE2 kernels</span>
+      </div>
+    </div>
+    <div class="term" aria-label="Example session">
+      <div class="bar"><i></i><i></i><i></i><b>ankaad.toml → SQL</b></div>
+<pre><span class="c-dim"># MQTT topics: plant1/&lt;line&gt;/&lt;machine&gt;/power</span>
+<span class="c-key">[[sources]]</span>
+kind    = <span class="c-str">"mqtt"</span>
+url     = <span class="c-str">"mqtt://broker.plant1:1883"</span>
+subject = <span class="c-str">"plant1/+/+/power"</span>
+map     = { ts = <span class="c-str">"t"</span>, line = <span class="c-str">"$topic.1"</span>,
+            machine = <span class="c-str">"$topic.2"</span>, kw = <span class="c-str">"kw"</span> }
+
+<span class="c-dim">-- milliseconds after the readings arrive</span>
+<span class="c-key">SELECT</span> machine, max(kw), count(kw)
+<span class="c-key">FROM</span>   power
+<span class="c-key">WHERE</span>  ts &gt; now() - interval <span class="c-str">'5 minutes'</span>
+<span class="c-key">GROUP BY</span> machine;
+
+<span class="c-dim">-- live 1-minute bars, maintained as data arrives</span>
+<span class="c-key">SELECT</span> * <span class="c-key">FROM</span> cq_power_1m_live;</pre>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== PROBLEM ============================== -->
+<section id="why">
+  <div class="wrap story">
+    <div>
+      <p class="kicker">The problem</p>
+      <h2>Fresh data and fast queries live in different systems.</h2>
+      <p class="sub" style="margin-bottom:24px">So the answer to a simple question arrives late, or not at all.</p>
+      <p class="quote"><b>On a production line</b>, a press starts drawing 15 % more power at 02:00. By morning someone asks for the per-machine power bars through the night and the p99 over the last five minutes. The readings were on the MQTT broker all along. Answering takes a stream processor, a database, a scheduled job and a dashboard that polls them.</p>
+      <p class="quote"><b>On a trading desk</b>, the book moves 2 % in four seconds. The next question is the quote in force at every trade and one-second bars through the move. The answer is a capture file, an order-book rebuild and an afternoon in pandas.</p>
+    </div>
+    <div>
+      <p class="kicker">The answer</p>
+      <p class="big-statement">ANKAA makes fresh data a <span>query</span>: the reading that arrived 5 ms ago and the one from last quarter, in the same table, with the same SQL.</p>
+      <div class="grid mt-l" style="gap:12px">
+        <div class="card"><h3>One process, end to end</h3><p>Ingest, write-ahead log, columnar storage, live aggregates and the SQL engine share memory. Nothing to synchronise, no second copy of the data.</p></div>
+        <div class="card"><h3>Built for the Arm servers you already rent</h3><p>Graviton, Axion and Cobalt are the most cost-efficient CPUs in each major cloud. ANKAA's hot loops target them directly, with NEON and vector-length-agnostic SVE2 kernels.</p></div>
+        <div class="card"><h3>Open standards, no lock-in</h3><p>Apache Arrow in memory and on the wire, DataFusion SQL, the Postgres protocol, Vortex columnar files, MQTT, Kafka and NATS in. Apache-2.0.</p></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== PROOF ============================== -->
+<section class="soft" aria-label="Verification">
+  <div class="wrap">
+    <p class="kicker">Verified, not just tested</p>
+    <h2>Correctness first. Numbers only from real hardware.</h2>
+    <p class="sub">Every claim on this page links to a test or a script you can run. Performance is measured on named Arm servers, published with its raw data, and never extrapolated.</p>
+    <div class="stats">
+      <div class="stat"><div class="n">1,000<small> / 1,000</small></div><div class="l">simulated power cuts with no acknowledged write lost and no undetected corruption</div></div>
+      <div class="stat"><div class="n">31</div><div class="l">differential SQL checks against DuckDB and Polars on real market data</div></div>
+      <div class="stat"><div class="n">3<small> vector lengths</small></div><div class="l">SVE2 kernels checked against a scalar reference at 128, 256 and 512 bits</div></div>
+      <div class="stat"><div class="n">100k</div><div class="l">devices per table in the scale test, each with its own ordering and late-data window</div></div>
+    </div>
+    <div class="pill-row">
+      <span class="pill">fuzzed parsers</span><span class="pill">loom-checked ring</span><span class="pill">Miri on unsafe code</span>
+      <span class="pill">MQTT · Kafka · NATS against real brokers in CI</span><span class="pill">crash · restart · lost-WAL recovery tests</span>
+      <span class="pill">live soaks on Google Axion</span>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== INDUSTRIES ============================== -->
+<section id="industries">
+  <div class="wrap">
+    <p class="kicker">One engine, many feeds</p>
+    <h2>Proven on the hardest feed. Built for every time series.</h2>
+    <p class="sub">Exchange market data is the most demanding real-time stream there is: bursts of hundreds of thousands of messages per second, strict sequence numbers, nanosecond timestamps, exact decimals, order books that must never drift. ANKAA was built and proven on it first. The same storage, durability, live aggregates and SQL serve any table you declare.</p>
+    <div class="grid g3">
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="M3 21h18M5 21V10l5 3V10l5 3V6l4 2v13"/></svg></div>
+        <span class="tag">Manufacturing · Industrial IoT</span>
+        <h3>Machines, lines and plants</h3>
+        <p>Subscribe to the MQTT broker the PLC gateways already publish to. Line and machine come from the topic, missing readings are stored as <code>NULL</code>, buffered gateway data is accepted late and placed in time.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="M13 2L4 14h7l-1 8 9-12h-7z"/></svg></div>
+        <span class="tag">Energy · Utilities</span>
+        <h3>Meters, grids and assets</h3>
+        <p>Exact fixed-point decimals for energy and money, per-meter partitions, retention windows per table, and quarter-hour bars or quantiles maintained continuously instead of recomputed by a batch job.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="M3 17l5-6 4 4 8-10M21 5v6h-6"/></svg></div>
+        <span class="tag">Capital markets · Digital assets</span>
+        <h3>Trades, quotes and order books</h3>
+        <p>Binance JSON and SBE, Databento files, exact L2 books from snapshot plus diffs, sequence-gap detection, ASOF joins, OHLCV, rolling windows and VWAP in SQL.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24"><circle cx="7" cy="17" r="2"/><circle cx="17" cy="17" r="2"/><path d="M5 17H3V7h11v10H9M14 10h4l3 3v4h-2"/></svg></div>
+        <span class="tag">Fleets · Mobility · Sensors</span>
+        <h3>Many devices, each on its own clock</h3>
+        <p>One partition per device with its own watermark and late-data window, so a vehicle that reconnects after a tunnel does not hold back the rest. Tested with 100,000 devices in one table.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="6" rx="1.5"/><rect x="3" y="14" width="18" height="6" rx="1.5"/><path d="M7 7h.01M7 17h.01"/></svg></div>
+        <span class="tag">Platforms · Infrastructure</span>
+        <h3>Topics into tables</h3>
+        <p>Turn a busy Kafka topic or NATS subject into queryable tables and live aggregates without adding a stream processor and a second database. Resumes from its saved offsets after a restart.</p>
+      </div>
+      <div class="card">
+        <div class="ico"><svg viewBox="0 0 24 24"><path d="M12 3v18M3 12h18"/></svg></div>
+        <span class="tag">Your feed</span>
+        <h3>Declare a table, attach a source</h3>
+        <p>Six column types, JSON or CSV, field paths or topic segments, exact decimal parsing. A custom binary protocol plugs into the same framing, WAL and recovery path.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== ARCHITECTURE ============================== -->
+<section id="architecture" class="soft">
+  <div class="wrap">
+    <p class="kicker">Architecture</p>
+    <h2>A single-node engine that scales up on one Arm server.</h2>
+    <p class="sub">Every message travels the same path: decoded once, logged, appended to columnar chunks partitioned by key, visible to SQL at the next snapshot (50 ms by default), aggregated live, then compressed down the tiers. A standby can stream the log for read scaling and failover.</p>
+    <div class="arch">
+      <svg viewBox="0 0 1060 424" role="img" aria-labelledby="arch-t arch-d">
+        <title id="arch-t">ANKAA data flow</title>
+        <desc id="arch-d">Sources feed a decoder and mapper, which writes to the write-ahead log and to the hot columnar store. The hot store feeds continuous queries and the warm and cold tiers. The SQL engine reads all three and serves Arrow Flight, Postgres wire, Python and Prometheus.</desc>
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--ink-faint)"/></marker>
+        </defs>
+        <style>
+          .bx { fill: var(--bg-card); stroke: var(--line); stroke-width: 1.5; }
+          .hl { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.5; }
+          .t1 { fill: var(--ink); font-size: 15px; font-weight: 650; }
+          .t2 { fill: var(--ink-faint); font-size: 12.5px; }
+          .ln { stroke: var(--ink-faint); stroke-width: 1.6; fill: none; marker-end: url(#ah); }
+          .dl { stroke: var(--ink-faint); stroke-width: 1.4; fill: none; stroke-dasharray: 5 5; marker-end: url(#ah); }
+          .grp { fill: none; stroke: var(--line); stroke-width: 1.2; stroke-dasharray: 3 4; }
+          .gl { fill: var(--ink-faint); font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase; font-weight: 600; }
+        </style>
+        <!-- sources -->
+        <text class="gl" x="20" y="24">IN</text>
+        <rect class="bx" x="20" y="38" width="170" height="54" rx="10"/><text class="t1" x="36" y="62">MQTT</text><text class="t2" x="36" y="80">topic filters, QoS 1</text>
+        <rect class="bx" x="20" y="102" width="170" height="54" rx="10"/><text class="t1" x="36" y="126">Kafka · NATS</text><text class="t2" x="36" y="144">JSON · CSV</text>
+        <rect class="bx" x="20" y="166" width="170" height="54" rx="10"/><text class="t1" x="36" y="190">Exchange feeds</text><text class="t2" x="36" y="208">Binance JSON · SBE</text>
+        <rect class="bx" x="20" y="230" width="170" height="54" rx="10"/><text class="t1" x="36" y="254">Files &amp; captures</text><text class="t2" x="36" y="272">DBN · Parquet · CSV</text>
+        <!-- decode -->
+        <rect class="hl" x="240" y="118" width="170" height="90" rx="12"/>
+        <text class="t1" x="256" y="146">Decode · map</text><text class="t2" x="256" y="166">fixed-point, zero-copy</text><text class="t2" x="256" y="184">order-book sync</text><text class="t2" x="256" y="200">late data · NULLs</text>
+        <path class="ln" d="M190 65 C215 65 215 140 238 145"/><path class="ln" d="M190 129 C214 129 220 150 238 155"/>
+        <path class="ln" d="M190 193 C214 193 220 170 238 168"/><path class="ln" d="M190 257 C215 257 215 190 238 185"/>
+        <!-- wal -->
+        <rect class="bx" x="240" y="300" width="170" height="64" rx="10"/><text class="t1" x="256" y="326">Write-ahead log</text><text class="t2" x="256" y="345">CRC32C · group commit</text>
+        <path class="ln" d="M325 208 L325 298"/>
+        <!-- hot -->
+        <rect class="hl" x="462" y="118" width="190" height="90" rx="12"/>
+        <text class="t1" x="478" y="146">Hot columnar store</text><text class="t2" x="478" y="166">64k-row chunks, per-key</text><text class="t2" x="478" y="184">partitions, zone maps,</text><text class="t2" x="478" y="200">1,024-row block stats</text>
+        <path class="ln" d="M410 163 L460 163"/>
+        <!-- cq -->
+        <rect class="bx" x="462" y="20" width="190" height="64" rx="10"/><text class="t1" x="478" y="46">Continuous queries</text><text class="t2" x="478" y="65">bars · p99 · rolling · ASOF</text>
+        <path class="ln" d="M557 118 L557 86"/>
+        <!-- tiers -->
+        <rect class="bx" x="462" y="250" width="190" height="64" rx="10"/><text class="t1" x="478" y="276">Warm · cold tiers</text><text class="t2" x="478" y="295">Vortex: ALP · FastLanes</text>
+        <rect class="bx" x="462" y="334" width="190" height="64" rx="10"/><text class="t1" x="478" y="360">Retention</text><text class="t2" x="478" y="379">per table, event time</text>
+        <path class="ln" d="M557 208 L557 248"/><path class="ln" d="M557 314 L557 332"/>
+        <!-- sql -->
+        <rect class="hl" x="712" y="118" width="170" height="90" rx="12"/>
+        <text class="t1" x="728" y="146">SQL engine</text><text class="t2" x="728" y="166">DataFusion + ANKAA</text><text class="t2" x="728" y="184">operators, pruning,</text><text class="t2" x="728" y="200">NEON / SVE2 kernels</text>
+        <path class="ln" d="M652 163 L710 163"/><path class="ln" d="M652 52 C690 52 690 135 710 140"/><path class="ln" d="M652 282 C690 282 690 192 710 186"/>
+        <!-- outputs -->
+        <text class="gl" x="930" y="24">OUT</text>
+        <rect class="bx" x="930" y="38" width="112" height="54" rx="10"/><text class="t1" x="944" y="62">Arrow</text><text class="t2" x="944" y="80">Flight · TLS</text>
+        <rect class="bx" x="930" y="102" width="112" height="54" rx="10"/><text class="t1" x="944" y="126">Postgres</text><text class="t2" x="944" y="144">psql · BI</text>
+        <rect class="bx" x="930" y="166" width="112" height="54" rx="10"/><text class="t1" x="944" y="190">Python</text><text class="t2" x="944" y="208">pandas · polars</text>
+        <rect class="bx" x="930" y="230" width="112" height="54" rx="10"/><text class="t1" x="944" y="254">Metrics</text><text class="t2" x="944" y="272">Prometheus</text>
+        <path class="ln" d="M882 150 C905 150 905 66 928 66"/><path class="ln" d="M882 158 C905 158 910 129 928 129"/>
+        <path class="ln" d="M882 170 C905 170 910 193 928 193"/><path class="ln" d="M882 180 C905 180 905 257 928 257"/>
+        <!-- standby -->
+        <rect class="bx" x="712" y="300" width="170" height="64" rx="10"/><text class="t1" x="728" y="326">Standby node</text><text class="t2" x="728" y="345">log stream · read replica</text>
+        <path class="dl" d="M325 364 L325 410 L797 410 L797 367"/>
+      </svg>
+      <div class="legend"><span>Highlighted: the hot path that runs for every message.</span><span>Dashed: asynchronous log shipping to a standby.</span></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== CAPABILITIES ============================== -->
+<section id="capabilities">
+  <div class="wrap">
+    <p class="kicker">Capabilities</p>
+    <h2>What ships in the binary.</h2>
+    <p class="sub">Everything below is implemented and covered by tests in the repository today.</p>
+    <div class="grid g3">
+      <div class="card"><h3>Ingest</h3><ul><li>MQTT with topic-segment mapping</li><li>Kafka (all partitions, saved offsets) and NATS</li><li>Binance JSON and SBE, REST depth snapshots</li><li>Databento DBN, Parquet, CSV, NDJSON replay</li></ul></div>
+      <div class="card"><h3>Time semantics</h3><ul><li>Per-key watermarks and ordering</li><li>Bounded lateness: late rows inserted in time order</li><li>Event-time continuous queries, deterministic on rebuild</li><li>Nanosecond event and receive times kept apart</li></ul></div>
+      <div class="card"><h3>Storage</h3><ul><li>64k-row columnar chunks, 1,024-row block statistics</li><li>Vortex warm and cold tiers (ALP, FastLanes, dictionary)</li><li>Nullable columns with validity bitmaps in every tier</li><li>Retention per table, measured in event time</li></ul></div>
+      <div class="card"><h3>Durability</h3><ul><li>Write-ahead log with CRC32C and group commit</li><li>Exact crash recovery, checkpoints truncate the log</li><li>Segments restore without the WAL</li><li>Standby replication over Arrow Flight</li></ul></div>
+      <div class="card"><h3>Query</h3><ul><li>SQL via Apache DataFusion with time and key pruning</li><li>Hash-free aggregation answered from block statistics</li><li><code>asof_join</code>, <code>ohlcv</code>, <code>rolling</code>, <code>percentiles</code>, <code>vwap</code></li><li>Continuous queries readable as tables</li></ul></div>
+      <div class="card"><h3>Operate</h3><ul><li>One binary, one TOML file, fail-fast config checks</li><li>TLS, mutual TLS and tokens on Flight</li><li>Prometheus metrics, alert rules, Grafana dashboard</li><li>Bounded query memory, timeouts, hardened systemd unit</li></ul></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== MEASURED ============================== -->
+<section class="soft" id="measured">
+  <div class="wrap">
+    <p class="kicker">Measured in the open</p>
+    <h2>A first look on Google Axion.</h2>
+    <p class="sub">A comparison harness against DuckDB, ClickHouse and QuestDB lives in the repository. Its first runs on a small Axion VM are published with scripts and raw results so anyone can rerun them and find what we got wrong.</p>
+    <div class="caveat"><svg viewBox="0 0 24 24"><path d="M12 9v4M12 17h.01M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg><div><b>Preliminary, not a benchmark.</b> One 4-vCPU Axion VM (c4a-standard-4), one hour of live Binance data, median of 20 runs. Engines are measured at different points (ANKAA here over Arrow Flight, DuckDB in process, ClickHouse over HTTP, QuestDB over the Postgres protocol). No performance claims are made from it.</div></div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Query (selection)</th><th class="num">ANKAA over Flight</th><th class="num">DuckDB</th><th class="num">ClickHouse</th><th class="num">QuestDB</th></tr></thead>
+        <tbody>
+          <tr><td>Range count</td><td class="num best">0.47</td><td class="num">1.57</td><td class="num">5.06</td><td class="num">1.23</td></tr>
+          <tr><td>Aggregate by symbol</td><td class="num best">0.67</td><td class="num">3.03</td><td class="num">5.81</td><td class="num">6.74</td></tr>
+          <tr><td>1-second OHLCV bars</td><td class="num best">4.38</td><td class="num">21.1</td><td class="num">75.7</td><td class="num">43.6</td></tr>
+          <tr><td>Percentiles of price</td><td class="num best">3.83</td><td class="num">50.6</td><td class="num">13.0</td><td class="num">631</td></tr>
+          <tr><td>ASOF join (backward), aggregated</td><td class="num best">7.27</td><td class="num">25.6</td><td class="num">16.2</td><td class="num">92.8</td></tr>
+          <tr><td>Latest row per symbol</td><td class="num best">2.51</td><td class="num">4.16</td><td class="num">10.6</td><td class="num">15.7</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note">Median milliseconds, lower is better. 6 of the 17 queries shown; all 17, p95s, timing scopes and the environment are on the <a href="benchmarks.html">measurements page</a>.</p>
+  </div>
+</section>
+
+<!-- ============================== QUICKSTART ============================== -->
+<section id="quickstart">
+  <div class="wrap">
+    <p class="kicker">Quickstart</p>
+    <h2>Try it in 60 seconds. No account, no network.</h2>
+    <p class="sub">Requires <a href="https://rustup.rs">Rust</a>. A 20-second capture of live Binance data ships with the repository.</p>
+    <div class="grid g2">
+      <div class="code-card">
+        <header><span>1 · replay and query a capture</span><span>shell</span></header>
+<pre><span class="c-key">git clone</span> https://github.com/ualsweb/ankaa <span class="c-dim">&amp;&amp;</span> cd ankaa
+
+cargo run --release -p ankaad -- replay \
+  bench/data/binance-btcusdt-trade-depth-20s.ankc \
+  --sql <span class="c-str">"SELECT * FROM ohlcv('trades', 1000000000) LIMIT 5"</span></pre>
+      </div>
+      <div class="code-card">
+        <header><span>2 · run it as a server</span><span>shell</span></header>
+<pre><span class="c-dim"># offline: serve the bundled capture as if it were live</span>
+ANKAA_TOKEN=devtoken cargo run --release -p ankaad -- serve \
+  --url file://bench/data/binance-btcusdt-trade-depth-20s.ankc \
+  --no-depth-snapshots --pg-addr 127.0.0.1:55432
+
+<span class="c-dim"># any Postgres client, Arrow Flight or Python</span>
+PGPASSWORD=devtoken psql -h 127.0.0.1 -p 55432 -U ankaa \
+  -c <span class="c-str">"SELECT count(*) FROM trades"</span></pre>
+      </div>
+      <div class="code-card">
+        <header><span>3 · bring your own feed</span><span>ankaad.toml</span></header>
+<pre><span class="c-key">[[tables]]</span>
+name = <span class="c-str">"power"</span>
+partition_by = <span class="c-str">"machine"</span>
+max_lateness_ms = 300000      <span class="c-dim"># gateways buffer</span>
+retention = <span class="c-str">"180d"</span>
+columns = [
+  { name = <span class="c-str">"ts"</span>, type = <span class="c-str">"timestamp_ns"</span> },
+  { name = <span class="c-str">"machine"</span>, type = <span class="c-str">"dict"</span> },
+  { name = <span class="c-str">"kw"</span>, type = <span class="c-str">"float64"</span>, nullable = true },
+]
+
+<span class="c-key">[[continuous]]</span>
+name = <span class="c-str">"power_1m"</span>   <span class="c-dim"># → cq_power_1m, cq_power_1m_live</span>
+kind = <span class="c-str">"ohlcv"</span>
+table = <span class="c-str">"power"</span>
+key = <span class="c-str">"machine"</span>
+value = <span class="c-str">"kw"</span>
+width_ns = 60000000000</pre>
+      </div>
+      <div class="code-card">
+        <header><span>4 · from Python</span><span>python</span></header>
+<pre><span class="c-key">import</span> ankaa
+
+live = ankaa.connect(<span class="c-str">"127.0.0.1:50051"</span>, token=<span class="c-str">"devtoken"</span>)
+
+bars = live.sql(<span class="c-str">"SELECT * FROM cq_power_1m_live"</span>).to_pandas()
+p99  = live.sql(<span class="c-str">"""
+  SELECT * FROM percentiles('power', 'kw', '0.5,0.99', 'machine')
+"""</span>).to_pandas()
+
+<span class="c-dim"># zero-copy Arrow underneath; polars works the same way</span></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== STATUS ============================== -->
+<section class="soft" id="status">
+  <div class="wrap story">
+    <div>
+      <p class="kicker">Project status</p>
+      <h2>Pre-alpha, and explicit about it.</h2>
+      <p class="sub">The engine is implemented and verified end to end. What is still open needs real hardware or wall-clock time, and is listed rather than hidden.</p>
+      <p><a href="https://github.com/ualsweb/ankaa/blob/main/docs/STATUS.md">Status and known gaps</a> · <a href="https://github.com/ualsweb/ankaa/blob/main/docs/ROADMAP.md">Roadmap</a> · <a href="https://github.com/ualsweb/ankaa/blob/main/CHANGELOG.md">Changelog</a></p>
+    </div>
+    <div class="status-list">
+      <div class="status-row"><div class="dot ok">✓</div><div><b>Ingest, storage tiers, WAL, SQL, Flight, Postgres, Python</b><span>Verified end to end on live data, with crash and restart tests.</span></div></div>
+      <div class="status-row"><div class="dot ok">✓</div><div><b>MQTT, Kafka and NATS sources</b><span>Run against real brokers in CI. MQTT and Kafka resume without loss after restarts.</span></div></div>
+      <div class="status-row"><div class="dot ok">✓</div><div><b>SVE2 kernels on Arm silicon</b><span>Correct on Neoverse V2 (Google Axion) and at 128/256/512-bit under emulation.</span></div></div>
+      <div class="status-row"><div class="dot wip">…</div><div><b>Full benchmark on Graviton4 and Axion</b><span>Harness and first runs published; a complete, reviewed benchmark is next.</span></div></div>
+      <div class="status-row"><div class="dot no">–</div><div><b>Distributed queries across nodes</b><span>Not planned for v1: scale up on one Arm server, standby for reads.</span></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============================== GET INVOLVED ============================== -->
+<section id="involved">
+  <div class="wrap center">
+    <p class="kicker">Get involved</p>
+    <h2>Shape the engine with your data.</h2>
+    <p class="sub">ANKAA is Apache-2.0, free to use, modify and run commercially. The most valuable contributions right now are real workloads and real hardware.</p>
+    <div class="grid g3" style="text-align:left">
+      <div class="card"><h3>Design partners</h3><p>Run it on your plant, meter, fleet or market feeds and tell us what breaks. Open a <a href="https://github.com/ualsweb/ankaa/discussions">discussion</a> with the <i>Design partner</i> label.</p></div>
+      <div class="card"><h3>Hardware and cloud partners</h3><p>Access to Arm server instances for public, reproducible benchmarks moves the project forward most.</p></div>
+      <div class="card"><h3>Contributors</h3><p>Sources and decoders, SQL functions, docs. Start with <a href="https://github.com/ualsweb/ankaa/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> (DCO sign-off, RFCs for design changes).</p></div>
+    </div>
+    <div class="cta mt-l" style="justify-content:center">
+      <a class="btn primary" href="https://github.com/ualsweb/ankaa">Get the code</a>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap">
+    <div class="cols">
+      <div>
+        <a class="brand" href="./"><img src="assets/logo.svg" alt="" width="26" height="26">ANKAA</a>
+        <p style="margin-top:12px;max-width:34ch">Real-time time-series engine for Arm servers. <i>Ankaa</i> is the brightest star of the Phoenix constellation.</p>
+      </div>
+      <div><h4>Project</h4><ul><li><a href="https://github.com/ualsweb/ankaa">Source code</a></li><li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/ROADMAP.md">Roadmap</a></li><li><a href="https://github.com/ualsweb/ankaa/blob/main/CHANGELOG.md">Changelog</a></li><li><a href="https://github.com/ualsweb/ankaa/discussions">Discussions</a></li></ul></div>
+      <div><h4>Learn</h4><ul><li><a href="docs.html">Documentation</a></li><li><a href="benchmarks.html">Measurements</a></li><li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/architecture.md">Architecture</a></li><li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/generic-ingest.md">Bring your own feed</a></li></ul></div>
+      <div><h4>Trust</h4><ul><li><a href="https://github.com/ualsweb/ankaa/blob/main/SECURITY.md">Security policy</a></li><li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/security.md">Security model</a></li><li><a href="https://github.com/ualsweb/ankaa/blob/main/LICENSE">Apache-2.0 license</a></li><li><a href="https://github.com/ualsweb/ankaa/blob/main/CODE_OF_CONDUCT.md">Code of conduct</a></li></ul></div>
+    </div>
+    <div class="fine"><span>© 2026 The ANKAA authors · Apache License 2.0</span><span>This site uses no cookies, trackers or external resources.</span></div>
+  </div>
+</footer>
+</body>
+</html>

@@ -1,0 +1,44 @@
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is a proc-macro used at build time only (via vortex-fastlanes); no runtime exposure" },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is pulled by datafusion-postgres for PEM parsing of operator-supplied files; upstream replacement tracked" },
+]
+
+[licenses]
+version = 2
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0", # webpki-roots (Mozilla CA bundle)
+    "0BSD",                # enum-iterator (via vortex)
+    "Unlicense",           # json-writer (via dbn)
+    "bzip2-1.0.6",         # libbz2-rs-sys (via datafusion compression)
+    "NCSA",                # libfuzzer-sys (LLVM libFuzzer; fuzz targets only)
+]
+confidence-threshold = 0.9
+
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+deny = [
+    { crate = "openssl-sys", reason = "rustls only" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

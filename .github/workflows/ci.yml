@@ -1,0 +1,59 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+permissions:
+  contents: read
+jobs:
+  check:
+    name: fmt · clippy · test (aarch64, native)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Probe CPU features
+        run: |
+          grep -m1 -i 'model name\|cpu implementer' /proc/cpuinfo || true
+          grep -m1 -i features /proc/cpuinfo
+          grep -q -w sve2 /proc/cpuinfo && echo "SVE2=yes" || echo "SVE2=no"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+          components: rustfmt, clippy, llvm-tools
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: nextest
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo nextest run --workspace --all-features
+      - run: cargo test --workspace --doc
+      # crates outside the workspace (their own lockfiles): keep them building
+      - run: cargo check --manifest-path fuzz/Cargo.toml
+      - run: cargo check --manifest-path crates/ankaa-py/Cargo.toml --all-features
+      - run: cargo check --manifest-path bench/Cargo.toml --all-targets
+  deny:
+    name: cargo-deny (${{ matrix.manifest }})
+    runs-on: ubuntu-24.04-arm
+    strategy:
+      fail-fast: false
+      matrix:
+        # every lockfile in the repository: the workspace and the crates that live outside it
+        manifest: [Cargo.toml, crates/ankaa-py/Cargo.toml, fuzz/Cargo.toml, bench/Cargo.toml, bench/spikes/vortex/Cargo.toml]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+        with:
+          command: check
+          manifest-path: ${{ matrix.manifest }}
+          arguments: --all-features

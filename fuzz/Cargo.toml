@@ -1,0 +1,83 @@
+[package]
+name = "ankaa-fuzz"
+version = "0.0.0"
+publish = false
+license = "Apache-2.0"
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ankaa-feeds = { path = "../crates/ankaa-feeds", features = ["dbn"] }
+ankaa-ingest = { path = "../crates/ankaa-ingest" }
+ankaa-store = { path = "../crates/ankaa-store" }
+ankaa-wal = { path = "../crates/ankaa-wal" }
+ankaa-core = { path = "../crates/ankaa-core" }
+tempfile = "3"
+
+[[bin]]
+name = "binance_json"
+path = "fuzz_targets/binance_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "capture_decode"
+path = "fuzz_targets/capture_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_fixed"
+path = "fuzz_targets/parse_fixed.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_replay"
+path = "fuzz_targets/wal_replay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "framing"
+path = "fuzz_targets/framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "binance_sbe"
+path = "fuzz_targets/binance_sbe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dbn_replay"
+path = "fuzz_targets/dbn_replay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "generic_map"
+path = "fuzz_targets/generic_map.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

@@ -1,0 +1,32 @@
+[package]
+name = "ankaa-sql"
+description = "Apache DataFusion integration: TableProvider, ExecutionPlans, UDFs, pushdown."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+ankaa-store.workspace = true
+ankaa-simd.workspace = true
+ankaa-ts.workspace = true
+parking_lot.workspace = true
+arrow = { workspace = true, features = ["prettyprint"] }
+datafusion = { workspace = true, features = ["nested_expressions", "sql", "unicode_expressions"] }
+async-trait.workspace = true
+futures.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+ankaa-tier.workspace = true
+tempfile = "3"
+ankaa-feeds.workspace = true
+ankaa-ingest.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,99 @@
+# ankaad: ANKAA-ENGINE server (live ingest, Arrow Flight, /metrics).
+#
+# Install:
+#   useradd --system --home /var/lib/ankaa --shell /usr/sbin/nologin ankaa
+#   install -m 0755 target/release/ankaad /usr/local/bin/ankaad
+#   install -d -m 0750 -o root -g ankaa /etc/ankaa
+#   install -m 0640 -o root -g ankaa deploy/ankaad.example.toml /etc/ankaa/ankaad.toml   # edit
+#   install -m 0640 -o root -g ankaa /dev/null /etc/ankaa/ankaad.env      # created private, then filled
+#   printf 'ANKAA_TOKEN=%s\n' "$(openssl rand -hex 32)" >> /etc/ankaa/ankaad.env
+#   install -m 0644 deploy/systemd/ankaad.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now ankaad
+#
+# Release builds use panic = "abort": a panic exits the process and this unit restarts it.
+# WAL recovery happens on the next start. See docs/deployment.md.
+
+[Unit]
+Description=ANKAA-ENGINE tick-data server
+Documentation=file:///usr/local/share/doc/ankaa/deployment.md
+After=network-online.target time-sync.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=ankaa
+Group=ankaa
+
+# Secrets: ANKAA_TOKEN (required when binding beyond loopback), optional BINANCE_API_KEY.
+EnvironmentFile=/etc/ankaa/ankaad.env
+Environment=RUST_LOG=info
+# Rust backtraces on abort are useful in the journal; harmless otherwise.
+Environment=RUST_BACKTRACE=1
+
+# Fail fast on a bad config instead of looping on it.
+ExecStartPre=/usr/local/bin/ankaad config check /etc/ankaa/ankaad.toml
+ExecStart=/usr/local/bin/ankaad serve --config /etc/ankaa/ankaad.toml
+
+# Supervision. The process aborts on panic; always come back.
+Restart=always
+RestartSec=2s
+
+# Orderly shutdown: serve handles SIGINT (stop source, drain, final WAL fdatasync, drain Flight).
+KillSignal=SIGINT
+KillMode=mixed
+TimeoutStopSec=30s
+
+# Resource limits. LimitMEMLOCK must cover resources.memlock_mib in the config.
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+TasksMax=4096
+# Cap the whole process below the host's memory so that a runaway query is killed and
+# restarted here instead of taking the host down. The query pool (resources.query_memory_mib)
+# bounds what query operators reserve, not every allocation a query can cause. Size it as:
+# hot data + storage.warm_budget_mib + resources.query_memory_mib + headroom.
+# MemoryHigh=24G
+# MemoryMax=28G
+# Optional, dedicated hosts only: pin away from NIC IRQ cores (see docs/deployment.md §7).
+# CPUAffinity=2-7
+
+# State: /var/lib/ankaa (WAL, checkpoints). Config in /etc/ankaa is read-only to the service.
+StateDirectory=ankaa
+StateDirectoryMode=0750
+ConfigurationDirectory=ankaa
+ConfigurationDirectoryMode=0750
+WorkingDirectory=/var/lib/ankaa
+# If the WAL lives on its own mount, add it here, e.g.:
+# ReadWritePaths=/srv/ankaa-wal
+
+# Hardening.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RemoveIPC=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

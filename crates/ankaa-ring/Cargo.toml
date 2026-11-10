@@ -1,0 +1,21 @@
+[package]
+name = "ankaa-ring"
+description = "Single-producer single-consumer descriptor ring (Acquire/Release only)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[dependencies]
+crossbeam-utils.workspace = true
+
+[target.'cfg(loom)'.dependencies]
+loom.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true
