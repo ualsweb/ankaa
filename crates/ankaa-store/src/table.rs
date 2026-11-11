@@ -549,6 +549,20 @@ impl Table {
         f(p)
     }
 
+    /// Append one row to `partition` under a single lock and say whether it was stored: `false`
+    /// when recovery skips it (its WAL record is already in a segment). The generic ingest path
+    /// uses it so that one row costs one lock round trip.
+    pub fn append_row_stored(&self, partition: usize, row: &[Value]) -> Result<bool, AppendError> {
+        self.with_partition(partition, |p| {
+            if p.skipping() {
+                return Ok(false);
+            }
+            let before = p.stats().rows;
+            p.append_row(row)?;
+            Ok(p.stats().rows != before)
+        })
+    }
+
     /// Append rows that all belong to `partition` (caller groups by key).
     /// Returns `(accepted, first_error)`; processing continues past dropped rows.
     pub fn append_rows(&self, partition: usize, rows: &[&[Value]]) -> (usize, Option<AppendError>) {

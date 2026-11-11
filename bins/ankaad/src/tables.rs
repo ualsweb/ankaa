@@ -226,62 +226,75 @@ impl Tables {
         m
     }
 
-    /// Ingest one message of a user source. Returns `Ok(())` when a row was appended.
-    pub fn ingest_user(
-        &mut self,
-        source_id: u16,
-        msg: &[u8],
-        recv_ns: i64,
-    ) -> Result<(), MapError> {
+    /// Map one message of a user source and store its rows (one, or one per element of the
+    /// source's `rows` array). Rows are checked one by one: a refused row (bad value, out of its
+    /// partition's lateness window, more than a day in the future) is counted and skipped, the
+    /// others are stored. A message that is not valid at all stores nothing.
+    pub fn ingest_user(&mut self, source_id: u16, msg: &[u8], recv_ns: i64) -> UserIngest {
+        let mut out = UserIngest::default();
         let Some(src) = self
             .sources
             .get_mut(usize::from(source_id))
             .and_then(Option::as_mut)
         else {
-            return Err(MapError::Malformed("unknown source id"));
+            out.rejected = 1;
+            out.error = Some(MapError::Malformed("unknown source id"));
+            return out;
         };
         let csv = src.csv;
         let t = &mut self.user[src.table];
-        // Parse first, decide, then intern: a rejected message must not grow a dictionary
-        // (and with it the partition list), or bad input could fill it up.
-        let parsed = match src.mapper.parse(msg, recv_ns, csv, &t.dicts) {
-            Ok(p) => p,
+        // Parse first, decide, then intern: a refused row must not grow a dictionary (and with it
+        // the partition list), or bad input could fill it up.
+        let n = match src.mapper.parse(msg, recv_ns, csv, &t.dicts) {
+            Ok(n) => n,
             Err(e) => {
                 src.rejected += 1;
-                return Err(e);
+                out.rejected = 1;
+                out.error = Some(e);
+                return out;
             }
         };
-        if parsed.ts > recv_ns.saturating_add(MAX_FUTURE_NS) {
-            src.rejected += 1;
-            return Err(MapError::Malformed(
-                "timestamp is more than a day ahead of the receive time (check ts_unit)",
-            ));
+        let listens = self.continuous.listens(&t.name);
+        for r in 0..n {
+            let parsed = match src.mapper.parsed(r) {
+                Ok(p) => p,
+                Err(e) => {
+                    out.reject(e);
+                    continue;
+                }
+            };
+            if parsed.ts > recv_ns.saturating_add(MAX_FUTURE_NS) {
+                out.reject(MapError::Malformed(
+                    "timestamp is more than a day ahead of the receive time (check ts_unit)",
+                ));
+                continue;
+            }
+            if !self.replaying
+                && let Some(k) = parsed.key
+                && t.table
+                    .partition_watermark(k as usize)
+                    .is_some_and(|wm| parsed.ts < wm.saturating_sub(t.table.max_lateness()))
+            {
+                out.reject(MapError::Malformed(STALE));
+                continue;
+            }
+            let (key, row) = src.mapper.finish_row(r, &mut t.dicts);
+            let part = t.table.partition_for(key);
+            match t.table.append_row_stored(part, row) {
+                Ok(stored) => {
+                    out.rows += 1;
+                    // rows skipped during recovery are already in a segment: they must not
+                    // feed a continuous query a second time
+                    if stored && listens {
+                        self.continuous.on_row(&t.name, row);
+                    }
+                }
+                Err(_) => out.reject(MapError::Malformed(STALE)),
+            }
         }
-        if !self.replaying
-            && let Some(k) = parsed.key
-            && t.table
-                .partition_watermark(k as usize)
-                .is_some_and(|wm| parsed.ts < wm.saturating_sub(t.table.max_lateness()))
-        {
-            src.rejected += 1;
-            return Err(MapError::Malformed(STALE));
-        }
-        let (key, row) = src.mapper.finish(&mut t.dicts);
-        let part = t.table.partition_for(key);
-        let before = t.table.with_partition(part, |p| p.stats().rows);
-        let (ok, err) = t.table.append_rows(part, &[row]);
-        if ok == 0 && err.is_some() {
-            src.rejected += 1;
-            return Err(MapError::Malformed(STALE));
-        }
-        src.mapped += 1;
-        // rows skipped during recovery are already in a segment: they must not feed a
-        // continuous query a second time
-        let appended = t.table.with_partition(part, |p| p.stats().rows) != before;
-        if appended && self.continuous.listens(&t.name) {
-            self.continuous.on_row(&t.name, row);
-        }
-        Ok(())
+        src.mapped += out.rows as u64;
+        src.rejected += out.rejected as u64;
+        out
     }
 
     /// Books (read-only view for metrics/tests).
@@ -572,6 +585,26 @@ impl Tables {
     pub fn seal_all(&self) {
         for (_, t) in self.persistent() {
             t.seal_all();
+        }
+    }
+}
+
+/// What one message of a user source did.
+#[derive(Debug, Default)]
+pub struct UserIngest {
+    /// Rows stored.
+    pub rows: usize,
+    /// Rows (or the whole message) refused.
+    pub rejected: usize,
+    /// The first reason a row or the message was refused.
+    pub error: Option<MapError>,
+}
+
+impl UserIngest {
+    fn reject(&mut self, e: MapError) {
+        self.rejected += 1;
+        if self.error.is_none() {
+            self.error = Some(e);
         }
     }
 }

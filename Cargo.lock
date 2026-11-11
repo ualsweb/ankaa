@@ -142,6 +142,7 @@ name = "ankaa-ingest"
 version = "0.1.0"
 dependencies = [
  "ankaa-store",
+ "memchr",
  "proptest",
  "serde_json",
  "thiserror 2.0.21",

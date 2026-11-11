@@ -91,6 +91,45 @@ map = { ts = "meta.time", rack = "meta.id", temp = "temp", ok = "ok", load = "lo
 - A message that does not map is counted in `ankaa_user_rejected_total` and logged at debug
   level; it never stops the server.
 
+### Several readings per message (`rows`)
+
+Gateways and devices often send a batch: one message with the readings of the last seconds.
+`rows` names the array that holds them; every element becomes a row. Column paths are read
+inside each element; a path that starts with `$msg.` is read from the message around the array
+(once per message, whatever the number of elements):
+
+```toml
+[[sources]]
+name = "gateways"
+kind = "mqtt"
+url = "mqtts://broker.plant1:8883"
+subject = "plant1/+/batch"
+format = "json"
+table = "power"
+ts_unit = "millis"
+rows = "samples"                       # {"machine":"press03","samples":[{"t":…,"kw":…},…]}
+map = { ts = "t", machine = "$msg.machine", kw = "kw" }
+```
+
+- Each element is checked on its own: an element with a bad or missing value is refused and
+  counted (`ankaa_user_rejected_total` counts rows), the others are stored. A message without the
+  array is refused whole; an empty array stores nothing and is not an error.
+- `ankaa_user_rows_total` counts rows, not messages.
+- At most 65,536 rows per message, and dictionary values that are new in one message count
+  against `max_dict_entries` together: a batch cannot overshoot the cap.
+- A message is one WAL record however many rows it carries; recovery replays it exactly, also
+  when its rows straddle a chunk boundary.
+- `rows` needs `format = "json"`. `$topic` selectors work in the same mapping.
+
+**How JSON is read.** The mapped paths are compiled once into a small trie, and each message is
+read in one forward pass: values on a mapped path are recorded as byte ranges of the message,
+everything else is skipped without being decoded (strings by a vectorised search for the next
+quote or backslash, objects and arrays by counting brackets). No document tree is built and
+nothing is allocated per message. Values on a mapped path are checked against the JSON grammar;
+unmapped parts are checked for structure (balanced brackets, terminated strings), the way
+on-demand JSON parsers work. Nesting deeper than 128 levels is refused. Numbers are converted
+with correctly rounded parsing (`fixed8` columns with exact decimal parsing).
+
 ### How values are converted
 
 | Column type | Accepted | Notes |
@@ -218,9 +257,6 @@ scans run one partition per group of chunks in parallel.
 
 ## Limits (v1)
 
-- Messages are parsed with `serde_json::Value`: fine for telemetry rates, not tuned for
-  exchange-feed rates (the market decoders are single-pass for that reason).
-- One row per message; arrays of samples inside one message are not exploded yet.
 - No schema migration: changing the columns of a table that already has segments makes those
   segments unreadable for that table (they are skipped with a warning at start).
 - `replay` ignores user frames: it only knows the market tables. Use `serve` with a `file` source

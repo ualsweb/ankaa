@@ -504,6 +504,57 @@ fn generic(c: &mut Criterion) {
     });
     g.finish();
 
+    // batched readings: 1,024 messages of 10 readings each (`rows`), per reading
+    let batch: Vec<Vec<u8>> = (0..1024u64)
+        .map(|i| {
+            let samples: Vec<String> = (0..10u64)
+                .map(|k| {
+                    format!(
+                        r#"{{"t":{},"v":{{"temp":"{}.{:02}","n":{},"ok":true,"load":0.{}}}}}"#,
+                        1_762_700_000_000 + i * 10 + k,
+                        20 + k % 5,
+                        (i + k) % 100,
+                        i,
+                        k % 97
+                    )
+                })
+                .collect();
+            format!(r#"{{"meta":{{"id":"rack-{}"}},"samples":[{}]}}"#, i % 16, samples.join(",")).into_bytes()
+        })
+        .collect();
+    let rows_map: HashMap<String, String> = [
+        ("ts", "t"),
+        ("rack", "$msg.meta.id"),
+        ("temp", "v.temp"),
+        ("n", "v.n"),
+        ("ok", "v.ok"),
+        ("load", "v.load"),
+    ]
+    .into_iter()
+    .map(|(a, b)| (a.to_owned(), b.to_owned()))
+    .collect();
+    let mut g = c.benchmark_group("generic_ingest_rows");
+    g.throughput(Throughput::Elements(10 * 1024));
+    g.bench_function("map_json_rows_10x1024", |b| {
+        let mut m = RowMapper::new(schema.clone(), &rows_map, false, TsUnit::Millis, false, Some("rack"))
+            .unwrap()
+            .with_rows(Some("samples"))
+            .unwrap();
+        let mut dicts = RowMapper::dictionaries_for(&schema);
+        b.iter(|| {
+            let mut acc = 0u32;
+            for msg in &batch {
+                let n = m.parse(black_box(msg), 0, false, &dicts).unwrap();
+                for r in 0..n {
+                    let (key, _) = m.finish_row(r, &mut dicts);
+                    acc = acc.wrapping_add(key);
+                }
+            }
+            acc
+        });
+    });
+    g.finish();
+
     let mut g = c.benchmark_group("continuous_100k");
     g.throughput(Throughput::Elements(100_000));
     g.bench_function("ohlcv_push_16_keys", |b| {

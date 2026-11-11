@@ -657,3 +657,132 @@ fn ureq_get(url: &str) -> String {
     s.read_to_string(&mut out).unwrap();
     out
 }
+
+/// Messages that carry many readings (`rows`): one message is one WAL record holding up to a
+/// thousand rows, so records straddle the 65,536-row chunk boundaries. Every reading must be
+/// stored once: after a clean restart, after a crash, and with the WAL gone.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn rows_messages_are_stored_exactly_once_across_restarts() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("batches.ndjson");
+    let mut f = std::fs::File::create(&data).unwrap();
+    let base = 1_762_700_000_000i64; // ms
+    let per_msg = 1000i64;
+    // 150 messages of 1,000 readings per device, the two devices interleaved: 150,000 rows each,
+    // two chunk boundaries inside messages for both
+    for m in 0..150i64 {
+        for dev in ["m1", "m2"] {
+            write!(f, "{{\"dev\":\"{dev}\",\"samples\":[").unwrap();
+            for k in 0..per_msg {
+                let i = m * per_msg + k;
+                if k > 0 {
+                    write!(f, ",").unwrap();
+                }
+                if i % 7 == 0 {
+                    write!(f, "{{\"t\":{}}}", base + i).unwrap(); // no value: NULL
+                } else {
+                    write!(f, "{{\"t\":{},\"v\":{}.5}}", base + i, i % 100).unwrap();
+                }
+            }
+            writeln!(f, "]}}").unwrap();
+        }
+    }
+    drop(f);
+    let empty = dir.path().join("empty.ndjson");
+    std::fs::write(&empty, "").unwrap();
+    let (flight, metrics) = (free_port(), free_port());
+    let config = format!(
+        r#"
+[feed]
+enabled = false
+streams = []
+[server]
+flight_addr = "127.0.0.1:{flight}"
+metrics_addr = "127.0.0.1:{metrics}"
+[storage]
+snapshot_ms = 100
+wal_dir = "{wal}"
+checkpoint_dir = "{ckpt}"
+hot_sealed_chunks = 1
+checkpoint_interval_s = 1
+
+[[tables]]
+name = "readings"
+partition_by = "dev"
+columns = [
+  {{ name = "ts", type = "timestamp_ns" }},
+  {{ name = "dev", type = "dict" }},
+  {{ name = "v", type = "float64", nullable = true }},
+]
+
+[[sources]]
+name = "batches"
+kind = "file"
+url = "{data}"
+format = "json"
+table = "readings"
+ts_unit = "millis"
+rows = "samples"
+map = {{ ts = "t", dev = "$msg.dev", v = "v" }}
+"#,
+        wal = dir.path().join("wal").display(),
+        ckpt = dir.path().join("ckpt").display(),
+        data = data.display(),
+    );
+    let addr = format!("127.0.0.1:{flight}");
+    let fingerprint = |addr: &str| -> Vec<String> {
+        [
+            "SELECT count(*) FROM readings",
+            "SELECT count(v) FROM readings",
+            "SELECT count(*) FROM (SELECT dev, ts FROM readings GROUP BY dev, ts) x",
+            "SELECT sum(v) FROM readings",
+            "SELECT min(ts) FROM readings",
+            "SELECT max(ts) FROM readings",
+        ]
+        .iter()
+        .map(|q| first_cell(&query(addr, q)))
+        .collect()
+    };
+    let long = Duration::from_secs(60);
+    let s = start(&config, dir.path(), "run1", &[]);
+    wait_for(&s.1, "flight listening", long);
+    wait_for(&s.1, "file source consumed", long);
+    until(&addr, "SELECT count(*) FROM readings", "300000", long);
+    let before = fingerprint(&addr);
+    assert_eq!(before[0], "300000");
+    assert_eq!(before[2], "300000", "every reading once");
+    // 150,000 readings per device, every seventh without a value
+    assert_eq!(
+        before[1],
+        (2 * (150_000 - 150_000_i64.div_euclid(7) - 1)).to_string()
+    );
+    let m = ureq_get(&format!("http://127.0.0.1:{metrics}/metrics"));
+    assert!(m.contains("ankaa_user_rows_total 300000"), "{m}");
+    assert!(m.contains("ankaa_user_rejected_total 0"), "{m}");
+    stop(s);
+
+    // clean restart: identical
+    let s = start(&config, dir.path(), "run2", &[]);
+    wait_for(&s.1, "flight listening", long);
+    wait_for(&s.1, "file source consumed", long);
+    until(&addr, "SELECT count(*) FROM readings", "300000", long);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(fingerprint(&addr), before, "after a clean restart");
+    // crash (SIGKILL) and recover: identical
+    drop(s);
+    let s = start(&config, dir.path(), "run3", &[]);
+    wait_for(&s.1, "flight listening", long);
+    until(&addr, "SELECT count(*) FROM readings", "300000", long);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(fingerprint(&addr), before, "after a crash");
+    stop(s);
+    // the WAL is gone: every row comes from the segments
+    std::fs::remove_dir_all(dir.path().join("wal")).unwrap();
+    let config4 = config.replace(&data.display().to_string(), &empty.display().to_string());
+    let s = start(&config4, dir.path(), "run4", &[]);
+    wait_for(&s.1, "flight listening", long);
+    until(&addr, "SELECT count(*) FROM readings", "300000", long);
+    assert_eq!(fingerprint(&addr), before, "without the WAL");
+    stop(s);
+}

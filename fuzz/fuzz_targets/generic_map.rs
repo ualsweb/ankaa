@@ -1,7 +1,8 @@
 #![no_main]
-//! The generic row mapper (JSON and CSV messages from NATS, Kafka and files → rows) must never
-//! panic on arbitrary bytes, must respect the dictionary cap, and a row it accepts must have the
-//! width and the value types of the table schema.
+//! The generic row mapper (JSON and CSV messages from MQTT, NATS, Kafka and files → rows) must
+//! never panic on arbitrary bytes, must respect the dictionary cap, and a row it accepts must have
+//! the width and the value types of the table schema. Bit 6 of the mode byte turns on `rows`
+//! (one row per element of the array `r`, the key read from the message around it).
 use std::collections::HashMap;
 
 use ankaa_ingest::generic::{RowMapper, TsUnit, parse_rfc3339_ns};
@@ -36,9 +37,10 @@ fuzz_target!(|data: &[u8]| {
         _ => TsUnit::Rfc3339,
     };
     let from_receive = mode & 0x20 != 0;
+    let rows_mode = !csv && mode & 0x40 != 0;
     let cols: &[(&str, &str, &str)] = &[
         ("ts", "t", "0"),
-        ("key", "k.id", "1"),
+        ("key", if rows_mode { "$msg.k.id" } else { "k.id" }, "1"),
         ("px", "v.0", "2"),
         ("n", "n", "3"),
         ("flag", "f", "4"),
@@ -55,12 +57,25 @@ fuzz_target!(|data: &[u8]| {
     else {
         return;
     };
+    let Ok(mapper) = mapper.with_rows(rows_mode.then_some("r")) else {
+        return;
+    };
     let mut mapper = mapper.with_max_dict_entries(DICT_CAP);
     let mut dicts = RowMapper::dictionaries_for(&schema);
     // the same message twice, then split into lines: dictionary state carries over
     let lines = msg.split(|&b| b == b'\n');
     for m in [msg, msg].into_iter().chain(lines) {
-        if let Ok((key, row)) = mapper.map(m, 1_700_000_000_000_000_000, csv, &mut dicts) {
+        let Ok(n) = mapper.parse(m, 1_700_000_000_000_000_000, csv, &dicts) else {
+            continue;
+        };
+        if !rows_mode {
+            assert_eq!(n, 1);
+        }
+        for r in 0..n {
+            if mapper.parsed(r).is_err() {
+                continue;
+            }
+            let (key, row) = mapper.finish_row(r, &mut dicts);
             assert_eq!(row.len(), schema.fields().len());
             for (v, f) in row.iter().zip(schema.fields()) {
                 let ok = match f.ty {

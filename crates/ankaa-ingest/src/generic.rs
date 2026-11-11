@@ -1,9 +1,12 @@
 //! Generic ingest ("bring your own feed"): map JSON or CSV messages onto a user-defined
 //! schema (`[[tables]]` + `[[sources]]` in the server config) and produce store rows.
 //!
-//! The mapper is allocation-light after warm-up: JSON is parsed once into a `serde_json::Value`
-//! (sources are low-rate telemetry, not exchange feeds), decimals are parsed with
-//! [`parse_fixed`] (no floats for `fixed8`), strings go through a per-column [`SymbolDict`].
+//! The mapper allocates nothing per message after warm-up: JSON goes through a path-directed
+//! single-pass scanner ([`crate::json_scan`]: no document tree, unmapped fields skipped at memory
+//! speed), values are converted from byte spans of the message, decimals are parsed with
+//! [`parse_fixed`] (no floats for `fixed8`), strings go through a per-column [`SymbolDict`], and the
+//! output rows live in a buffer that is reused. With `rows`, one message yields one row per
+//! element of an array.
 #![allow(
     clippy::many_single_char_names,
     clippy::unnested_or_patterns,
@@ -18,6 +21,7 @@ use std::collections::HashMap;
 
 use ankaa_store::{ColumnType, Field, Schema, Value};
 
+use crate::json_scan;
 use crate::symbols::{SymbolDict, SymbolId};
 use crate::{DecodeError, parse_fixed};
 
@@ -51,6 +55,21 @@ pub enum Selector {
     Absent,
 }
 
+/// Most rows one message may carry with `rows`: bounds the work and memory one message can
+/// cause.
+pub const MAX_ROWS_PER_MESSAGE: usize = 65_536;
+
+/// Where a column's value comes from once the JSON paths are compiled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColSrc {
+    /// A message-level path (slot of the scan).
+    Msg(usize),
+    /// A path inside each element of the `rows` array (slot of the scan).
+    Elem(usize),
+    /// Not a JSON path (topic, CSV, absent).
+    Other,
+}
+
 /// Compiled mapping for one table.
 #[derive(Debug)]
 pub struct RowMapper {
@@ -60,22 +79,34 @@ pub struct RowMapper {
     ts_from_receive: bool,
     /// Index of the partition column (`DictU32`), if any.
     partition_col: Option<usize>,
-    /// Scratch row.
-    row: Vec<Value>,
-    /// Scratch CSV field ranges.
-    csv_fields: Vec<(usize, usize)>,
     /// Cap on distinct values per dictionary column.
     max_dict_entries: usize,
-    /// Dictionary values of the current row that are not interned yet (per column; the
-    /// strings are reused between rows).
-    pending: Vec<String>,
-    /// Which entries of `pending` belong to the current row.
-    pending_set: Vec<bool>,
     /// Messages arrive as `topic \0 payload` (MQTT sources).
     topic_prefixed: bool,
+    /// JSON: the mapped paths compiled into one scan, and per column which slot feeds it.
+    plan: json_scan::Plan,
+    col_src: Vec<ColSrc>,
+    /// `rows = "<path>"`: one row per element of that array.
+    rows_path: Option<Vec<String>>,
+    /// Scan result of the last message (spans into it); reused.
+    found: json_scan::Found,
+    /// Scratch CSV field ranges.
+    csv_fields: Vec<(usize, usize)>,
+    /// Output rows of the last message, row-major (`n_rows × columns`); reused.
+    rows: Vec<Value>,
+    n_rows: usize,
+    /// Per row of the last message: why it was refused (`None`: accepted so far).
+    row_err: Vec<Option<MapError>>,
+    /// Dictionary values not interned yet, per (row, column); the strings are reused.
+    pending: Vec<String>,
+    /// Which entries of `pending` belong to the last message.
+    pending_set: Vec<bool>,
+    /// Per column: the distinct new dictionary values of the last message, counted against
+    /// `max_dict_entries` so that one message of many rows cannot overshoot the cap.
+    new_names: Vec<std::collections::HashSet<Box<str>>>,
 }
 
-/// What [`RowMapper::parse`] found, before anything was added to a dictionary.
+/// What [`RowMapper::parsed`] found for one row, before anything was added to a dictionary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Parsed {
     /// Timestamp of the row, ns.
@@ -85,8 +116,8 @@ pub struct Parsed {
     pub key: Option<u32>,
 }
 
-/// Mapping error (message rejected, counted by the caller).
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+/// Mapping error (message or row rejected, counted by the caller).
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
 pub enum MapError {
     /// Message is not valid JSON / CSV.
     #[error("malformed message: {0}")]
@@ -112,6 +143,23 @@ impl From<MapError> for DecodeError {
             MapError::Convert { .. } => Self::Malformed("field conversion failed"),
         }
     }
+}
+
+impl From<json_scan::ScanError> for MapError {
+    fn from(e: json_scan::ScanError) -> Self {
+        match e {
+            json_scan::ScanError::Invalid => Self::Malformed("invalid json"),
+            json_scan::ScanError::TooDeep => Self::Malformed("json nested too deeply"),
+            json_scan::ScanError::TooManyRows => Self::Malformed("too many rows in one message"),
+        }
+    }
+}
+
+/// A raw value before conversion: text (CSV field, topic segment) or a JSON span.
+#[derive(Debug, Clone, Copy)]
+enum Scalar<'a> {
+    Text(&'a str),
+    Json(json_scan::Span),
 }
 
 impl RowMapper {
@@ -147,7 +195,16 @@ impl RowMapper {
                         reason: format!("CSV index {spec:?} is not a number"),
                     })?)
                 }
-                Some(spec) => Selector::Path(spec.split('.').map(str::to_owned).collect()),
+                Some(spec) => {
+                    let path: Vec<String> = spec.trim().split('.').map(str::to_owned).collect();
+                    if path.iter().any(String::is_empty) || path == ["$msg"] {
+                        return Err(MapError::Convert {
+                            column: f.name.clone(),
+                            reason: format!("{spec:?} is not a JSON path"),
+                        });
+                    }
+                    Selector::Path(path)
+                }
             };
             selectors.push(sel);
         }
@@ -161,20 +218,86 @@ impl RowMapper {
             ),
             None => None,
         };
-        let n = schema.fields().len();
+        let (plan, col_src) = Self::compile(&selectors, None);
         Ok(Self {
             schema,
             selectors,
             ts_unit,
             ts_from_receive,
             partition_col,
-            row: vec![Value::I64(0); n],
-            csv_fields: Vec::new(),
             max_dict_entries: DEFAULT_MAX_DICT_ENTRIES,
-            pending: vec![String::new(); n],
-            pending_set: vec![false; n],
             topic_prefixed: false,
+            plan,
+            col_src,
+            rows_path: None,
+            found: json_scan::Found::default(),
+            csv_fields: Vec::new(),
+            rows: Vec::new(),
+            n_rows: 0,
+            row_err: Vec::new(),
+            pending: Vec::new(),
+            pending_set: Vec::new(),
+            new_names: Vec::new(),
         })
+    }
+
+    /// Compile the JSON selectors: message paths, and with `rows` the element paths (a path
+    /// starting with `$msg.` stays at message level).
+    fn compile(selectors: &[Selector], rows: Option<&[String]>) -> (json_scan::Plan, Vec<ColSrc>) {
+        let mut msg_paths: Vec<Vec<String>> = Vec::new();
+        let mut elem_paths: Vec<Vec<String>> = Vec::new();
+        let mut col_src = Vec::with_capacity(selectors.len());
+        for sel in selectors {
+            col_src.push(match sel {
+                Selector::Path(p) if p.first().is_some_and(|s| s == "$msg") => {
+                    msg_paths.push(p[1..].to_vec());
+                    ColSrc::Msg(msg_paths.len() - 1)
+                }
+                Selector::Path(p) if rows.is_some() => {
+                    elem_paths.push(p.clone());
+                    ColSrc::Elem(elem_paths.len() - 1)
+                }
+                Selector::Path(p) => {
+                    msg_paths.push(p.clone());
+                    ColSrc::Msg(msg_paths.len() - 1)
+                }
+                _ => ColSrc::Other,
+            });
+        }
+        (
+            json_scan::Plan::new(&msg_paths, rows, &elem_paths, MAX_ROWS_PER_MESSAGE),
+            col_src,
+        )
+    }
+
+    /// One row per element of the JSON array at `rows` (a dotted path): column paths are read
+    /// inside each element, paths starting with `$msg.` from the message around it.
+    pub fn with_rows(mut self, rows: Option<&str>) -> Result<Self, MapError> {
+        let Some(rows) = rows else {
+            return Ok(self);
+        };
+        let path: Vec<String> = rows.trim().split('.').map(str::to_owned).collect();
+        if path.iter().any(String::is_empty) || path.first().is_some_and(|s| s.starts_with('$')) {
+            return Err(MapError::Convert {
+                column: "rows".into(),
+                reason: format!("{rows:?} is not a JSON path"),
+            });
+        }
+        if self
+            .selectors
+            .iter()
+            .any(|s| matches!(s, Selector::Index(_)))
+        {
+            return Err(MapError::Convert {
+                column: "rows".into(),
+                reason: "rows needs format = \"json\"".into(),
+            });
+        }
+        let (plan, col_src) = Self::compile(&self.selectors, Some(&path));
+        self.plan = plan;
+        self.col_src = col_src;
+        self.rows_path = Some(path);
+        Ok(self)
     }
 
     /// Messages carry their topic in front of the payload, separated by a NUL byte (an MQTT
@@ -202,18 +325,6 @@ impl RowMapper {
         &self.schema
     }
 
-    /// Partition key of the last mapped row (0 when the table has no partition column).
-    #[must_use]
-    pub fn partition_key(&self) -> u32 {
-        match self.partition_col {
-            Some(i) => match self.row[i] {
-                Value::U32(k) => k,
-                _ => 0,
-            },
-            None => 0,
-        }
-    }
-
     /// Cap the number of distinct values per dictionary column (default
     /// [`DEFAULT_MAX_DICT_ENTRIES`]); rows that would add a value beyond it are rejected.
     #[must_use]
@@ -222,9 +333,9 @@ impl RowMapper {
         self
     }
 
-    /// Map one message using the table's `dicts` (from [`Self::dictionaries_for`]). Returns the
-    /// partition key and the row (valid until the next call). Nothing is added to a dictionary
-    /// unless every column converted.
+    /// Map a message that carries one row using the table's `dicts` (from
+    /// [`Self::dictionaries_for`]). Returns the partition key and the row (valid until the next
+    /// call). Nothing is added to a dictionary unless the row is accepted.
     pub fn map(
         &mut self,
         msg: &[u8],
@@ -232,83 +343,121 @@ impl RowMapper {
         csv: bool,
         dicts: &mut [Option<SymbolDict>],
     ) -> Result<(u32, &[Value]), MapError> {
-        self.parse(msg, recv_ns, csv, dicts)?;
-        Ok(self.finish(dicts))
-    }
-
-    /// Second half of [`Self::parse`]: add the row's new dictionary values and return the
-    /// partition key and the row. Call it only once the row is going to be stored.
-    pub fn finish(&mut self, dicts: &mut [Option<SymbolDict>]) -> (u32, &[Value]) {
-        for i in 0..self.pending_set.len() {
-            if std::mem::take(&mut self.pending_set[i])
-                && let Some(d) = dicts.get_mut(i).and_then(Option::as_mut)
-            {
-                let SymbolId(id) = d.intern(&self.pending[i]);
-                self.row[i] = Value::U32(id);
-            }
+        let n = self.parse(msg, recv_ns, csv, dicts)?;
+        if n == 0 {
+            return Err(MapError::Missing("rows".into()));
         }
-        (self.partition_key(), &self.row)
+        self.parsed(0)?;
+        Ok(self.finish_row(0, dicts))
     }
 
-    /// Convert one message into the scratch row without touching the dictionaries: a message
-    /// that is rejected (here, or by the caller's own checks on the result) leaves no trace.
-    /// New dictionary values are kept aside until [`Self::finish`].
+    /// Convert one message into rows without touching the dictionaries: a row that is refused
+    /// (here, or by the caller's own checks on [`Self::parsed`]) leaves no trace. Returns the
+    /// number of rows; an error here refuses the whole message (malformed, or the `rows` array
+    /// missing). Rows are then read with [`Self::parsed`] and taken with [`Self::finish_row`].
     pub fn parse(
         &mut self,
         msg: &[u8],
         recv_ns: i64,
         csv: bool,
         dicts: &[Option<SymbolDict>],
-    ) -> Result<Parsed, MapError> {
-        self.pending_set.fill(false);
-        let (topic, msg) = if self.topic_prefixed {
-            let cut = msg
-                .iter()
-                .position(|&b| b == 0)
-                .ok_or(MapError::Malformed("message without its topic"))?;
+    ) -> Result<usize, MapError> {
+        let (topic, payload) = if self.topic_prefixed {
+            let cut =
+                memchr::memchr(0, msg).ok_or(MapError::Malformed("message without its topic"))?;
             let topic = std::str::from_utf8(&msg[..cut])
                 .map_err(|_| MapError::Malformed("topic is not utf-8"))?;
             (topic, &msg[cut + 1..])
         } else {
             ("", msg)
         };
-        let segment = |n: Option<usize>| match n {
-            None => Some(topic),
-            Some(n) => topic.split('/').nth(n),
-        };
+        let ncols = self.schema.fields().len();
         if csv {
-            let text =
-                std::str::from_utf8(msg).map_err(|_| MapError::Malformed("csv is not utf-8"))?;
+            let text = std::str::from_utf8(payload)
+                .map_err(|_| MapError::Malformed("csv is not utf-8"))?;
             let text = text.trim_end_matches(['\r', '\n']);
             split_csv(text, &mut self.csv_fields)?;
-            for i in 0..self.schema.fields().len() {
-                let raw = match &self.selectors[i] {
+            self.begin(1, ncols);
+            for c in 0..ncols {
+                let raw = match &self.selectors[c] {
                     Selector::Index(k) => self.csv_fields.get(*k).map(|&(a, b)| text[a..b].trim()),
-                    Selector::Topic(n) => segment(*n),
+                    Selector::Topic(n) => topic_segment(topic, *n),
                     Selector::Path(_) | Selector::Absent => None,
                 };
-                self.set(i, raw.map(Scalar::Text), recv_ns, dicts)?;
+                if let Err(e) = self.convert(0, c, raw.map(Scalar::Text), payload, recv_ns, dicts) {
+                    self.row_err[0] = Some(e);
+                    break;
+                }
             }
+            return Ok(1);
+        }
+        self.plan.scan(payload, &mut self.found)?;
+        let n_rows = if let Some(path) = &self.rows_path {
+            if !self.found.rows_seen {
+                return Err(MapError::Missing(path.join(".")));
+            }
+            self.found.rows
         } else {
-            let v: serde_json::Value =
-                serde_json::from_slice(msg).map_err(|_| MapError::Malformed("invalid json"))?;
-            for i in 0..self.schema.fields().len() {
-                let raw = match &self.selectors[i] {
-                    Selector::Path(p) => lookup(&v, p).map(Scalar::Json),
-                    Selector::Topic(n) => segment(*n).map(Scalar::Text),
-                    Selector::Index(_) | Selector::Absent => None,
+            1
+        };
+        self.begin(n_rows, ncols);
+        let elem_slots = self.plan.elem_slots();
+        for r in 0..n_rows {
+            for c in 0..ncols {
+                let raw = match self.col_src[c] {
+                    ColSrc::Msg(i) => self.found.msg[i].map(Scalar::Json),
+                    ColSrc::Elem(j) => self.found.elems[r * elem_slots + j].map(Scalar::Json),
+                    ColSrc::Other => match &self.selectors[c] {
+                        Selector::Topic(n) => topic_segment(topic, *n).map(Scalar::Text),
+                        _ => None,
+                    },
                 };
-                self.set(i, raw, recv_ns, dicts)?;
+                if let Err(e) = self.convert(r, c, raw, payload, recv_ns, dicts) {
+                    self.row_err[r] = Some(e);
+                    break;
+                }
             }
         }
-        let ts = match self.row[0] {
-            Value::I64(t) => t,
+        Ok(n_rows)
+    }
+
+    /// Size the reused output buffers for `n_rows` rows.
+    fn begin(&mut self, n_rows: usize, ncols: usize) {
+        let cells = n_rows * ncols;
+        self.n_rows = n_rows;
+        if self.rows.len() < cells {
+            self.rows.resize(cells, Value::Null);
+        }
+        if self.pending.len() < cells {
+            self.pending.resize_with(cells, String::new);
+        }
+        self.pending_set.clear();
+        self.pending_set.resize(cells, false);
+        self.row_err.clear();
+        self.row_err.resize(n_rows, None);
+        if self.new_names.len() < ncols {
+            self.new_names.resize_with(ncols, Default::default);
+        }
+        for set in &mut self.new_names {
+            set.clear();
+        }
+    }
+
+    /// Row `r` of the last message: its timestamp and partition key, or why it was refused.
+    pub fn parsed(&self, r: usize) -> Result<Parsed, MapError> {
+        if let Some(e) = self.row_err.get(r).and_then(Option::as_ref) {
+            return Err(e.clone());
+        }
+        let ncols = self.schema.fields().len();
+        let base = r * ncols;
+        let ts = match self.rows.get(base) {
+            Some(Value::I64(t)) => *t,
             _ => 0,
         };
         let key = match self.partition_col {
             None => Some(0),
-            Some(i) if self.pending_set[i] => None,
-            Some(i) => match self.row[i] {
+            Some(i) if self.pending_set[base + i] => None,
+            Some(i) => match self.rows[base + i] {
                 Value::U32(k) => Some(k),
                 _ => Some(0),
             },
@@ -316,142 +465,145 @@ impl RowMapper {
         Ok(Parsed { ts, key })
     }
 
-    fn set(
+    /// Take row `r` of the last message: add its new dictionary values and return its
+    /// partition key and values. Call it only once the row is going to be stored.
+    pub fn finish_row(&mut self, r: usize, dicts: &mut [Option<SymbolDict>]) -> (u32, &[Value]) {
+        let ncols = self.schema.fields().len();
+        let base = r * ncols;
+        for c in 0..ncols {
+            if std::mem::take(&mut self.pending_set[base + c])
+                && let Some(d) = dicts.get_mut(c).and_then(Option::as_mut)
+            {
+                let SymbolId(id) = d.intern(&self.pending[base + c]);
+                self.rows[base + c] = Value::U32(id);
+            }
+        }
+        let key = match self.partition_col {
+            Some(i) => match self.rows[base + i] {
+                Value::U32(k) => k,
+                _ => 0,
+            },
+            None => 0,
+        };
+        (key, &self.rows[base..base + ncols])
+    }
+
+    /// Convert one raw value into cell (`r`, `c`).
+    fn convert(
         &mut self,
-        i: usize,
+        r: usize,
+        c: usize,
         raw: Option<Scalar<'_>>,
+        msg: &[u8],
         recv_ns: i64,
         dicts: &[Option<SymbolDict>],
     ) -> Result<(), MapError> {
-        use serde_json::Value as J;
-        let f: &Field = &self.schema.fields()[i];
+        use json_scan::Kind as K;
+        let ncols = self.schema.fields().len();
+        let idx = r * ncols + c;
+        let f: &Field = &self.schema.fields()[c];
         // the column name is only cloned on the error path
         let conv = |reason: &str| MapError::Convert {
             column: f.name.clone(),
             reason: reason.to_owned(),
         };
         // a nullable column without a value (field absent, JSON null, empty CSV field)
-        let absent = match &raw {
+        let absent = match raw {
             None => true,
-            Some(Scalar::Json(serde_json::Value::Null)) => true,
+            Some(Scalar::Json(s)) => s.kind == K::Null,
             Some(Scalar::Text(s)) => s.is_empty(),
-            Some(Scalar::Json(_)) => false,
         };
-        if absent && f.nullable && i > 0 {
-            self.row[i] = Value::Null;
+        if absent && f.nullable && c > 0 {
+            self.rows[idx] = Value::Null;
             return Ok(());
         }
         let Some(raw) = raw else {
-            if i == 0 && self.ts_from_receive {
-                self.row[0] = Value::I64(recv_ns);
+            if c == 0 && self.ts_from_receive {
+                self.rows[idx] = Value::I64(recv_ns);
                 return Ok(());
             }
             return Err(MapError::Missing(f.name.clone()));
         };
-        let value = match f.ty {
-            ColumnType::TimestampNs => {
-                Value::I64(parse_ts(&raw, self.ts_unit).ok_or_else(|| conv("bad timestamp"))?)
+        // text of a string (decoded when escaped: the only allocating case)
+        let mut owned = String::new();
+        let text: Option<&str> = match raw {
+            Scalar::Text(s) => Some(s),
+            Scalar::Json(s) if s.kind == K::Str => Some(
+                std::str::from_utf8(s.bytes(msg))
+                    .map_err(|_| MapError::Malformed("invalid json"))?,
+            ),
+            Scalar::Json(s) if s.kind == K::StrEscaped => {
+                json_scan::unescape(s.bytes(msg), &mut owned)?;
+                Some(owned.as_str())
             }
-            ColumnType::FixedPoint { scale } => Value::I64(match &raw {
-                Scalar::Text(s) => {
-                    parse_fixed(s.as_bytes(), scale).map_err(|e| conv(&e.to_string()))?
-                }
-                Scalar::Json(J::String(s)) => {
-                    parse_fixed(s.trim().as_bytes(), scale).map_err(|e| conv(&e.to_string()))?
-                }
-                Scalar::Json(J::Number(n)) => {
-                    fixed_from_number(n, scale).ok_or_else(|| conv("number out of range"))?
-                }
-                Scalar::Json(_) => return Err(conv("expected a decimal")),
-            }),
-            ColumnType::Int64 => Value::I64(match &raw {
-                Scalar::Text(s) => s.parse().map_err(|_| conv("expected an integer"))?,
-                Scalar::Json(J::Number(n)) => {
-                    n.as_i64().ok_or_else(|| conv("expected an integer"))?
-                }
-                Scalar::Json(J::String(s)) => {
-                    s.trim().parse().map_err(|_| conv("expected an integer"))?
-                }
-                Scalar::Json(_) => return Err(conv("expected an integer")),
-            }),
-            ColumnType::U8 => Value::U8(match &raw {
-                Scalar::Text(s) => s.parse().map_err(|_| conv("expected 0..255"))?,
-                Scalar::Json(J::Number(n)) => {
-                    u8::try_from(n.as_u64().unwrap_or(256)).map_err(|_| conv("expected 0..255"))?
-                }
-                Scalar::Json(J::Bool(b)) => u8::from(*b),
-                Scalar::Json(_) => return Err(conv("expected 0..255")),
-            }),
-            ColumnType::Float64 => {
-                let x: f64 = match &raw {
-                    Scalar::Text(s) => s.parse().map_err(|_| conv("expected a number"))?,
-                    Scalar::Json(J::Number(n)) => {
-                        n.as_f64().ok_or_else(|| conv("expected a number"))?
-                    }
-                    Scalar::Json(J::String(s)) => {
-                        s.trim().parse().map_err(|_| conv("expected a number"))?
-                    }
-                    Scalar::Json(_) => return Err(conv("expected a number")),
-                };
-                if !x.is_finite() {
-                    return Err(conv("expected a finite number"));
-                }
-                Value::F64(x)
-            }
-            ColumnType::DictU32 => self.dict_value(i, &raw, dicts)?,
+            Scalar::Json(_) => None,
         };
-        self.row[i] = value;
+        let kind = match raw {
+            Scalar::Json(s) => Some(s.kind),
+            Scalar::Text(_) => None,
+        };
+        let num = match raw {
+            Scalar::Json(s) if s.kind == K::Num => Some(s.bytes(msg)),
+            _ => None,
+        };
+        if f.ty == ColumnType::DictU32 {
+            let mut buf = StackStr::default();
+            let name: &str = match (text, num, kind) {
+                (Some(s), _, _) => s,
+                (None, Some(n), _) => {
+                    canonical_number(n, &mut buf).ok_or_else(|| conv("number too long"))?
+                }
+                (_, _, Some(K::True)) => "true",
+                (_, _, Some(K::False)) => "false",
+                // objects, arrays and null are not keys: interning their text would let one
+                // producer grow the dictionary without bound
+                _ => return Err(conv("expected a string or a number")),
+            };
+            return self.dict_value(idx, c, name, dicts);
+        }
+        let value = typed_value(f.ty, raw, text, num, kind, self.ts_unit).map_err(|r| conv(&r))?;
+        self.rows[idx] = value;
         Ok(())
     }
 
-    /// The id of a `dict` value: known ids at once, a new value kept aside for `finish`.
+    /// The id of a `dict` value: known ids at once, a new value kept aside for `finish_row`.
     fn dict_value(
         &mut self,
-        i: usize,
-        raw: &Scalar<'_>,
+        idx: usize,
+        c: usize,
+        name: &str,
         dicts: &[Option<SymbolDict>],
-    ) -> Result<Value, MapError> {
-        use serde_json::Value as J;
-        let f: &Field = &self.schema.fields()[i];
+    ) -> Result<(), MapError> {
+        let f: &Field = &self.schema.fields()[c];
         let conv = |reason: &str| MapError::Convert {
             column: f.name.clone(),
             reason: reason.to_owned(),
-        };
-        let mut buf = StackStr::default();
-        let name: &str = match raw {
-            Scalar::Text(s) => s,
-            Scalar::Json(J::String(s)) => s.as_str(),
-            Scalar::Json(J::Number(n)) => {
-                use std::fmt::Write as _;
-                write!(buf, "{n}").map_err(|_| conv("number too long"))?;
-                buf.as_str()
-            }
-            Scalar::Json(J::Bool(true)) => "true",
-            Scalar::Json(J::Bool(false)) => "false",
-            // objects, arrays and null are not keys: interning their text would let one
-            // producer grow the dictionary without bound
-            Scalar::Json(_) => return Err(conv("expected a string or a number")),
         };
         if name.len() > MAX_DICT_VALUE_BYTES {
             return Err(conv("dictionary value longer than 256 bytes"));
         }
         let dict = dicts
-            .get(i)
+            .get(c)
             .and_then(Option::as_ref)
             .ok_or_else(|| conv("not a dict column"))?;
-        match dict.get(name) {
-            Some(SymbolId(id)) => Ok(Value::U32(id)),
-            None if dict.len() >= self.max_dict_entries => {
-                Err(conv("dictionary is full (max_dict_entries)"))
-            }
-            None => {
-                // interned by `finish`, once the whole row has been accepted
-                self.pending[i].clear();
-                self.pending[i].push_str(name);
-                self.pending_set[i] = true;
-                Ok(Value::U32(u32::MAX))
-            }
+        if let Some(SymbolId(id)) = dict.get(name) {
+            self.rows[idx] = Value::U32(id);
+            return Ok(());
         }
+        // values new to the dictionary in this message count against the cap together
+        let set = &mut self.new_names[c];
+        if !set.contains(name) {
+            if dict.len() + set.len() >= self.max_dict_entries {
+                return Err(conv("dictionary is full (max_dict_entries)"));
+            }
+            set.insert(name.into());
+        }
+        // interned by `finish_row`, once the row has been accepted
+        self.pending[idx].clear();
+        self.pending[idx].push_str(name);
+        self.pending_set[idx] = true;
+        self.rows[idx] = Value::U32(u32::MAX);
+        Ok(())
     }
 }
 
@@ -461,11 +613,6 @@ pub const MAX_DICT_VALUE_BYTES: usize = 256;
 /// Default cap on distinct values per `dict` column (each value of a `partition_by` column is
 /// one partition).
 pub const DEFAULT_MAX_DICT_ENTRIES: usize = 1_000_000;
-
-enum Scalar<'a> {
-    Text(&'a str),
-    Json(&'a serde_json::Value),
-}
 
 /// Small stack buffer for formatting a JSON number without allocating.
 struct StackStr {
@@ -501,27 +648,118 @@ impl std::fmt::Write for StackStr {
     }
 }
 
-/// A JSON number as a fixed-point integer with `scale` decimals. Exact when the number's text
-/// has at most `scale` decimals; numbers with more decimals or an exponent (float artefacts
-/// such as `21.700000000000003`, `1e-3`) are rounded to the nearest representable value.
-fn fixed_from_number(n: &serde_json::Number, scale: u8) -> Option<i64> {
+/// A raw value as a value of a non-dictionary column type, or why it does not fit.
+fn typed_value(
+    ty: ColumnType,
+    raw: Scalar<'_>,
+    text: Option<&str>,
+    num: Option<&[u8]>,
+    kind: Option<json_scan::Kind>,
+    unit: TsUnit,
+) -> Result<Value, std::borrow::Cow<'static, str>> {
+    use json_scan::Kind as K;
+    Ok(match ty {
+        ColumnType::TimestampNs => Value::I64(parse_ts(text, num, unit).ok_or("bad timestamp")?),
+        ColumnType::FixedPoint { scale } => Value::I64(match (text, num) {
+            (Some(s), _) => parse_fixed(s.trim().as_bytes(), scale).map_err(|e| e.to_string())?,
+            (None, Some(n)) => fixed_from_number(n, scale).ok_or("number out of range")?,
+            _ => return Err("expected a decimal".into()),
+        }),
+        ColumnType::Int64 => Value::I64(match (text, num) {
+            (Some(s), _) => s.trim().parse().map_err(|_| "expected an integer")?,
+            (None, Some(n)) => ascii(n).parse().map_err(|_| "expected an integer")?,
+            _ => return Err("expected an integer".into()),
+        }),
+        ColumnType::U8 => Value::U8(match (raw, num, kind) {
+            (Scalar::Text(s), _, _) => s.parse().map_err(|_| "expected 0..255")?,
+            (_, Some(n), _) => ascii(n)
+                .parse::<u64>()
+                .ok()
+                .and_then(|v| u8::try_from(v).ok())
+                .ok_or("expected 0..255")?,
+            (_, _, Some(K::True)) => 1,
+            (_, _, Some(K::False)) => 0,
+            // JSON strings are not accepted for a byte column
+            _ => return Err("expected 0..255".into()),
+        }),
+        ColumnType::Float64 => {
+            let x: f64 = match (text, num) {
+                (Some(s), _) => s.trim().parse().map_err(|_| "expected a number")?,
+                (None, Some(n)) => ascii(n).parse().map_err(|_| "expected a number")?,
+                _ => return Err("expected a number".into()),
+            };
+            if !x.is_finite() {
+                return Err("expected a finite number".into());
+            }
+            Value::F64(x)
+        }
+        ColumnType::DictU32 => return Err("not a scalar column".into()),
+    })
+}
+
+/// The bytes of a validated JSON number (ASCII by the grammar) as text.
+#[inline]
+fn ascii(n: &[u8]) -> &str {
+    std::str::from_utf8(n).unwrap_or("")
+}
+
+/// `$topic` (`None`) or its `n`-th `/` segment.
+fn topic_segment(topic: &str, n: Option<usize>) -> Option<&str> {
+    match n {
+        None => Some(topic),
+        Some(n) => topic.split('/').nth(n),
+    }
+}
+
+/// A JSON number used as a dictionary value, in canonical form: integers as integers (`-0` is
+/// `0`), other numbers as the shortest text that reads back as the same `f64`.
+fn canonical_number<'b>(n: &[u8], buf: &'b mut StackStr) -> Option<&'b str> {
     use std::fmt::Write as _;
-    if let Some(i) = n.as_i64() {
-        return i.checked_mul(10i64.checked_pow(u32::from(scale))?);
+    let t = ascii(n);
+    if let Ok(i) = t.parse::<i64>() {
+        write!(buf, "{i}").ok()?;
+    } else if let Ok(u) = t.parse::<u64>() {
+        write!(buf, "{u}").ok()?;
+    } else {
+        write!(buf, "{}", t.parse::<f64>().ok()?).ok()?;
     }
-    if n.is_u64() {
-        return None; // above i64::MAX
+    Some(buf.as_str())
+}
+
+/// A JSON number (its text) as a fixed-point integer with `scale` decimals. Exact when the
+/// text has at most `scale` decimals and no exponent; other numbers (float artefacts such as
+/// `21.700000000000003`, `1e-3`) are rounded to the nearest representable value. `None` when the
+/// value does not fit an `i64`.
+fn fixed_from_number(n: &[u8], scale: u8) -> Option<i64> {
+    let has_exp = n.iter().any(|&c| c == b'e' || c == b'E');
+    if !has_exp {
+        if let Ok(v) = parse_fixed(n, scale) {
+            return Some(v);
+        }
+        if !n.contains(&b'.') {
+            return None; // an integer that does not fit
+        }
     }
-    let mut buf = StackStr::default();
-    if write!(buf, "{n}").is_ok()
-        && let Ok(v) = parse_fixed(buf.as_str().as_bytes(), scale)
-    {
-        return Some(v);
-    }
-    let scaled = (n.as_f64()? * 10f64.powi(i32::from(scale))).round();
+    let scaled = (ascii(n).parse::<f64>().ok()? * 10f64.powi(i32::from(scale))).round();
     // 2^63 is exactly representable; anything at or beyond it does not fit
     #[allow(clippy::cast_possible_truncation)]
     (scaled.is_finite() && scaled.abs() < 9_223_372_036_854_775_808.0).then_some(scaled as i64)
+}
+
+/// A timestamp from a string (`text`) or a JSON number (`num`) in `unit`.
+fn parse_ts(text: Option<&str>, num: Option<&[u8]>, unit: TsUnit) -> Option<i64> {
+    let scale = match unit {
+        TsUnit::Nanos => 0,
+        TsUnit::Micros => 3,
+        TsUnit::Millis => 6,
+        TsUnit::Seconds => 9,
+        TsUnit::Rfc3339 => return parse_rfc3339_ns(text?.trim()),
+    };
+    match (text, num) {
+        (Some(s), _) => parse_fixed(s.trim().as_bytes(), scale).ok(),
+        (None, Some(n)) => fixed_from_number(n, scale),
+        _ => None,
+    }
 }
 
 /// Split one CSV record into field byte ranges (no allocation after warm-up). A field may be
@@ -567,40 +805,6 @@ fn split_csv(text: &str, out: &mut Vec<(usize, usize)>) -> Result<(), MapError> 
             }
             i = end + 1;
         }
-    }
-}
-
-fn lookup<'a>(v: &'a serde_json::Value, path: &[String]) -> Option<&'a serde_json::Value> {
-    let mut cur = v;
-    for p in path {
-        cur = match cur {
-            serde_json::Value::Object(m) => m.get(p)?,
-            serde_json::Value::Array(a) => a.get(p.parse::<usize>().ok()?)?,
-            _ => return None,
-        };
-    }
-    Some(cur)
-}
-
-fn parse_ts(raw: &Scalar<'_>, unit: TsUnit) -> Option<i64> {
-    let scale = match unit {
-        TsUnit::Nanos => 0,
-        TsUnit::Micros => 3,
-        TsUnit::Millis => 6,
-        TsUnit::Seconds => 9,
-        TsUnit::Rfc3339 => {
-            return match raw {
-                Scalar::Text(s) => parse_rfc3339_ns(s.trim()),
-                Scalar::Json(serde_json::Value::String(s)) => parse_rfc3339_ns(s.trim()),
-                Scalar::Json(_) => None,
-            };
-        }
-    };
-    match raw {
-        Scalar::Text(s) => parse_fixed(s.trim().as_bytes(), scale).ok(),
-        Scalar::Json(serde_json::Value::String(s)) => parse_fixed(s.trim().as_bytes(), scale).ok(),
-        Scalar::Json(serde_json::Value::Number(n)) => fixed_from_number(n, scale),
-        Scalar::Json(_) => None,
     }
 }
 
@@ -876,6 +1080,149 @@ mod tests {
         );
     }
 
+    fn rows_schema() -> Schema {
+        Schema::new(vec![
+            Field::new("ts", ColumnType::TimestampNs),
+            Field::new("dev", ColumnType::DictU32),
+            Field::nullable("temp", ColumnType::Float64),
+            Field::new("site", ColumnType::DictU32),
+        ])
+        .unwrap()
+    }
+
+    fn rows_mapper(map: &[(&str, &str)]) -> RowMapper {
+        let map: HashMap<String, String> = map
+            .iter()
+            .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+            .collect();
+        RowMapper::new(
+            rows_schema(),
+            &map,
+            false,
+            TsUnit::Millis,
+            false,
+            Some("dev"),
+        )
+        .unwrap()
+        .with_rows(Some("samples"))
+        .unwrap()
+    }
+
+    #[test]
+    fn rows_one_per_array_element() {
+        let mut m = rows_mapper(&[
+            ("ts", "t"),
+            ("dev", "$msg.dev"),
+            ("temp", "v"),
+            ("site", "$msg.meta.site"),
+        ]);
+        let mut d = RowMapper::dictionaries_for(&rows_schema());
+        // message fields before and after the array; a missing value is NULL in its row only
+        let msg = br#"{"dev":"m1","samples":[{"t":1000,"v":20.5},{"t":1001},{"t":1002,"v":null}],"meta":{"site":"p1"}}"#;
+        assert_eq!(m.parse(msg, 0, false, &d).unwrap(), 3);
+        for r in 0..3 {
+            let p = m.parsed(r).unwrap();
+            assert_eq!(p.ts, (1000 + i64::try_from(r).unwrap()) * 1_000_000);
+            let (key, row) = m.finish_row(r, &mut d);
+            assert_eq!(key, 0);
+            assert_eq!(row[1], Value::U32(0));
+            assert_eq!(row[3], Value::U32(0));
+            assert_eq!(
+                row[2],
+                if r == 0 {
+                    Value::F64(20.5)
+                } else {
+                    Value::Null
+                }
+            );
+        }
+        assert_eq!(d[1].as_ref().unwrap().name(SymbolId(0)), Some("m1"));
+        // empty array: no row, not an error; no array: the message is refused
+        assert_eq!(
+            m.parse(br#"{"dev":"m1","samples":[]}"#, 0, false, &d)
+                .unwrap(),
+            0
+        );
+        assert!(matches!(
+            m.parse(br#"{"dev":"m1"}"#, 0, false, &d),
+            Err(MapError::Missing(_))
+        ));
+    }
+
+    #[test]
+    fn a_bad_element_refuses_only_its_row() {
+        let mut m = rows_mapper(&[
+            ("ts", "t"),
+            ("dev", "d"),
+            ("temp", "v"),
+            ("site", "$msg.site"),
+        ]);
+        let mut d = RowMapper::dictionaries_for(&rows_schema());
+        // each element names its own device; the second has a bad timestamp
+        let msg = br#"{"site":"s","samples":[{"t":1,"d":"a","v":1},{"t":"x","d":"b","v":2},{"t":3,"d":"c","v":3}]}"#;
+        assert_eq!(m.parse(msg, 0, false, &d).unwrap(), 3);
+        assert!(
+            m.parsed(0).unwrap().key.is_none(),
+            "a new device: no key yet"
+        );
+        assert!(m.parsed(1).is_err());
+        let (k0, _) = m.finish_row(0, &mut d);
+        let (k2, row2) = m.finish_row(2, &mut d);
+        assert_eq!((k0, k2), (0, 1), "the refused row added no device");
+        assert_eq!(row2[2], Value::F64(3.0));
+        assert_eq!(d[1].as_ref().unwrap().len(), 2);
+    }
+
+    /// One message of many rows cannot overshoot the dictionary cap: new values of the message
+    /// count against it together (a repeated new value once).
+    #[test]
+    fn rows_respect_the_dictionary_cap_within_one_message() {
+        let mut m = rows_mapper(&[
+            ("ts", "t"),
+            ("dev", "d"),
+            ("temp", "v"),
+            ("site", "$msg.site"),
+        ])
+        .with_max_dict_entries(4);
+        let mut d = RowMapper::dictionaries_for(&rows_schema());
+        let elems: Vec<String> = (0..10)
+            .map(|i| {
+                format!(
+                    r#"{{"t":{i},"d":"dev{}","v":1}}"#,
+                    if i == 1 { 0 } else { i }
+                )
+            })
+            .collect();
+        let msg = format!(r#"{{"site":"s","samples":[{}]}}"#, elems.join(","));
+        let n = m.parse(msg.as_bytes(), 0, false, &d).unwrap();
+        assert_eq!(n, 10);
+        let mut stored = 0;
+        for r in 0..n {
+            if m.parsed(r).is_ok() {
+                m.finish_row(r, &mut d);
+                stored += 1;
+            }
+        }
+        // site "s" takes one entry of its own dictionary; devices: dev0 (twice), dev2, dev3, dev4
+        assert_eq!(stored, 5, "dev0 twice plus three more new devices");
+        assert_eq!(d[1].as_ref().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn rows_needs_json_and_a_path() {
+        let schema = rows_schema();
+        let map: HashMap<String, String> =
+            [("ts", "0"), ("dev", "1"), ("temp", "2"), ("site", "3")]
+                .into_iter()
+                .map(|(a, b)| (a.to_owned(), b.to_owned()))
+                .collect();
+        let csv = RowMapper::new(schema.clone(), &map, true, TsUnit::Millis, false, None).unwrap();
+        assert!(csv.with_rows(Some("samples")).is_err());
+        let json =
+            RowMapper::new(schema, &HashMap::new(), false, TsUnit::Millis, true, None).unwrap();
+        assert!(json.with_rows(Some("a..b")).is_err());
+    }
+
     #[test]
     fn csv_mapping_and_receive_time() {
         let map: HashMap<String, String> = [
@@ -1060,19 +1407,19 @@ mod tests {
         );
         assert_eq!(d[1].as_ref().unwrap().len(), 0);
         // the caller rejects after parsing (ordering, future timestamps): still nothing
-        let p = m
+        let n = m
             .parse(br#"{"s":"ghost-3","t":1,"n":1,"ok":1,"l":2}"#, 7, false, &d)
             .unwrap();
-        assert_eq!(p, Parsed { ts: 7, key: None });
+        assert_eq!(n, 1);
+        assert_eq!(m.parsed(0).unwrap(), Parsed { ts: 7, key: None });
         assert_eq!(d[1].as_ref().unwrap().len(), 0);
-        // accepted: interned by finish, and known on the next parse
-        let (key, row) = m.finish(&mut d);
+        // accepted: interned by finish_row, and known on the next parse
+        let (key, row) = m.finish_row(0, &mut d);
         assert_eq!((key, row[1]), (0, Value::U32(0)));
-        let p = m
-            .parse(br#"{"s":"ghost-3","t":1,"n":1,"ok":1,"l":2}"#, 8, false, &d)
+        m.parse(br#"{"s":"ghost-3","t":1,"n":1,"ok":1,"l":2}"#, 8, false, &d)
             .unwrap();
         assert_eq!(
-            p,
+            m.parsed(0).unwrap(),
             Parsed {
                 ts: 8,
                 key: Some(0)

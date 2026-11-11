@@ -179,14 +179,21 @@ impl Ingest {
                     self.metrics.frames_bad.fetch_add(1, Ordering::Relaxed);
                     return;
                 };
-                match self.tables.ingest_user(source_id, msg, frame.recv_ns) {
-                    Ok(()) => {
-                        self.metrics.user_rows.fetch_add(1, Ordering::Relaxed);
-                        self.metrics.events.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) => {
-                        self.metrics.user_rejected.fetch_add(1, Ordering::Relaxed);
-                        tracing::debug!(source_id, error = %e, "user message rejected");
+                let done = self.tables.ingest_user(source_id, msg, frame.recv_ns);
+                if done.rows > 0 {
+                    self.metrics
+                        .user_rows
+                        .fetch_add(done.rows as u64, Ordering::Relaxed);
+                    self.metrics
+                        .events
+                        .fetch_add(done.rows as u64, Ordering::Relaxed);
+                }
+                if done.rejected > 0 {
+                    self.metrics
+                        .user_rejected
+                        .fetch_add(done.rejected as u64, Ordering::Relaxed);
+                    if let Some(e) = done.error {
+                        tracing::debug!(source_id, rejected = done.rejected, error = %e, "user rows rejected");
                     }
                 }
             }
@@ -374,7 +381,9 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("source {}: {e}", s.name))?
         .with_max_dict_entries(t.max_dict_entries)
-        .with_topic_prefix(s.kind == SourceKind::Mqtt);
+        .with_topic_prefix(s.kind == SourceKind::Mqtt)
+        .with_rows(s.rows.as_deref())
+        .map_err(|e| anyhow::anyhow!("source {}: {e}", s.name))?;
         // ids are stable across restarts and config edits: WAL frames name their source by id
         let id = ingest.states.id_for(&s.name)?;
         ingest.tables.add_source(id, &s.name, ti, mapper, csv);

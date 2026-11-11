@@ -215,6 +215,10 @@ pub struct SourceConfig {
     /// Use the host receive time when the message has no timestamp field.
     #[serde(default)]
     pub ts_from_receive: bool,
+    /// JSON path of an array in each message: one row per element; column paths are read inside
+    /// the element, `$msg.<path>` from the message around it. Unset: one row per message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<String>,
     /// `mqtts://` only: PEM file of the CA(s) to trust instead of the public roots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<PathBuf>,
@@ -882,6 +886,20 @@ impl Config {
                 }
                 _ => {}
             }
+            if let Some(rows) = &s.rows {
+                if s.format != SourceFormat::Json {
+                    return inv(format!("sources.{}: rows needs format = \"json\"", s.name));
+                }
+                if rows.trim().is_empty()
+                    || rows.split('.').any(str::is_empty)
+                    || rows.starts_with('$')
+                {
+                    return inv(format!(
+                        "sources.{}: rows = {rows:?} is not a JSON path (e.g. \"samples\" or \"data.points\")",
+                        s.name
+                    ));
+                }
+            }
             let has_tls = s.tls_ca.is_some() || s.tls_cert.is_some() || s.tls_key.is_some();
             if has_tls && !(s.kind == SourceKind::Mqtt && s.url.starts_with("mqtts://")) {
                 return inv(format!(
@@ -1363,6 +1381,7 @@ standby_of = "10.0.0.1:50051"
             map: std::collections::BTreeMap::new(),
             ts_unit: TimeUnit::Nanos,
             ts_from_receive: true,
+            rows: None,
             tls_ca: None,
             tls_cert: None,
             tls_key: None,

@@ -65,7 +65,8 @@ Profiling passes are recorded under `docs/benchmarks/`. Pass 1 (2026-11-09): dec
 | Generic ingest: user-defined tables, MQTT / NATS / Kafka / file sources, JSON and CSV mapping, MQTT topic selectors (`docs/generic-ingest.md`) | done; verified against real Mosquitto, NATS and Kafka (local containers + CI) |
 | Telemetry base: nullable columns, bounded lateness with in-order insertion, retention per table, 100k-device scale test | done (2026-11-11) |
 | MQTT over TLS: certificate verification against public roots or a private CA, client certificates; tested against Mosquitto with TLS and mutual TLS in CI | done (2026-11-11) |
-| Next for telemetry: Sparkplug B payloads, gap filling and interpolation in SQL (`time_bucket_gapfill`-style), downsampled continuous-query outputs that outlive raw retention, arrays of samples per message | planned |
+| Several readings per message (`rows`) and a single-pass JSON scanner (no document tree, no allocation per message) | done (2026-11-11) |
+| Next for telemetry: Sparkplug B payloads, gap filling and interpolation in SQL (`time_bucket_gapfill`-style), downsampled continuous-query outputs that outlive raw retention | planned |
 | Continuous queries: incremental OHLCV, quantiles, rolling windows, ASOF as `cq_*` tables (`docs/continuous-queries.md`) | done; event time with the table's lateness window; no retraction of closed results (rows later than that are counted) |
 | Replication: WAL shipping over Flight to a read-only standby, manual promotion (`docs/replication.md`) | done; asynchronous, no election, no split-brain protection |
 | Distributed queries across nodes | design note only: scale up on one Arm socket first |

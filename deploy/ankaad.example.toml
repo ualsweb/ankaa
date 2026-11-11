@@ -127,6 +127,8 @@ token_env = "ANKAA_TOKEN"
 # table = "telemetry"
 # ts_unit = "millis"
 # map = { ts = "t", line = "$topic.1", machine = "$topic.2", temp = "temp" }
+# rows = "samples"                 # optional: one row per element of this array ($msg.<path>
+#                                  # in map reads the message around it)
 #
 # [[continuous]]                   # incrementally maintained: cq_btc_1s and cq_btc_1s_live
 # name = "btc_1s"
