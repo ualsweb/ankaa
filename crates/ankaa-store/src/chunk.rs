@@ -595,7 +595,14 @@ mod tests {
             x ^= x << 17;
             x
         };
-        for len in [0usize, 1, 1023, 1024, 1025, 5000, 65_536] {
+        // under Miri (an interpreter) the short lengths cover every boundary case and the
+        // kernels; the long ones and the many random ranges are for the native run
+        let (lens, rounds): (&[usize], usize) = if cfg!(miri) {
+            (&[0, 1, 1023, 1024, 1025], 10)
+        } else {
+            (&[0, 1, 1023, 1024, 1025, 5000, 65_536], 300)
+        };
+        for &len in lens {
             let values: Vec<i64> = (0..len)
                 .map(|_| (next() % 2_000_001).cast_signed() - 1_000_000)
                 .collect();
@@ -615,7 +622,7 @@ mod tests {
                 0..len.min(1),
                 len.saturating_sub(1)..len,
             ];
-            for _ in 0..300 {
+            for _ in 0..rounds {
                 let a = (next() as usize) % (len + 1);
                 let b = a + (next() as usize) % (len - a + 1);
                 ranges.push(a..b);
