@@ -30,7 +30,7 @@ pub struct SourceBinding {
     pub table: usize,
     /// Message → row.
     pub mapper: RowMapper,
-    /// CSV (true) or JSON (false) messages.
+    /// CSV messages (true); JSON, Sparkplug and line protocol sources say false.
     pub csv: bool,
     /// Messages mapped.
     pub mapped: u64,
@@ -324,9 +324,10 @@ impl Tables {
         out
     }
 
-    /// A mapping worker's copy of every JSON and CSV source's mapper (index = source id), and
-    /// whether it reads CSV. Sparkplug sources are not in it: their BIRTH definitions make each
-    /// message depend on the ones before, so they are mapped in the ingest loop, in log order.
+    /// A mapping worker's copy of every JSON, CSV and line protocol source's mapper (index =
+    /// source id), and whether it reads CSV: nothing in those mappers carries from one message to
+    /// the next. Sparkplug sources are not in it: their BIRTH definitions make each message
+    /// depend on the ones before, so they are mapped in the ingest loop, in log order.
     pub fn worker_mappers(&self) -> Vec<Option<(RowMapper, bool)>> {
         self.sources
             .iter()

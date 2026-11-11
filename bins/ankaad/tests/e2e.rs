@@ -1274,3 +1274,112 @@ map = {{ ts = "t", v = "v" }}
         "{out}"
     );
 }
+
+/// `InfluxDB` line protocol from a file (what Telegraf's file output writes): columns are filled
+/// by tag and field key, keys the table does not have are ignored, a line without a field leaves
+/// `NULL`, lines of another measurement are skipped and broken lines are refused one by one.
+#[test]
+fn line_protocol_from_a_file_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("metrics.lp");
+    let mut f = std::fs::File::create(&data).unwrap();
+    let base = 1_762_700_000_000_000_000i64; // ns
+    writeln!(f, "# written by telegraf").unwrap();
+    for i in 0..200i64 {
+        // a tag value with a space is escaped; `region` and `usage_system` have no column
+        for (h, host) in ["web-01", "web-02", "db\\ 01"].iter().enumerate() {
+            let ts = base + i * 1_000_000_000 + i64::try_from(h).unwrap();
+            let user = if i % 5 == 0 {
+                String::new() // no usage_user in this reading: NULL
+            } else {
+                format!("usage_user={}.25,", i % 50)
+            };
+            writeln!(
+                f,
+                "cpu,cpu=cpu-total,host={host},region=eu usage_idle={}.5,{user}usage_system=1,interrupts={i}i,note=\"a, b\" {ts}",
+                90 - i % 7
+            )
+            .unwrap();
+        }
+        // another measurement in the same file: not this table's, skipped
+        writeln!(f, "mem,host=web-01 used=5i {}", base + i * 1_000_000_000).unwrap();
+    }
+    // refused: a value that is not one, a line without its key column, a field of the wrong type
+    let late = base + 300 * 1_000_000_000;
+    writeln!(f, "cpu,host=web-01 usage_idle= {late}").unwrap();
+    writeln!(f, "cpu,cpu=cpu-total usage_idle=1 {late}").unwrap();
+    writeln!(f, "cpu,host=web-01 usage_idle=\"high\" {late}").unwrap();
+    drop(f);
+    let (flight, metrics) = (free_port(), free_port());
+    let config = format!(
+        r#"
+[feed]
+enabled = false
+streams = []
+[server]
+flight_addr = "127.0.0.1:{flight}"
+metrics_addr = "127.0.0.1:{metrics}"
+[storage]
+snapshot_ms = 100
+
+[[tables]]
+name = "cpu"
+partition_by = "host"
+columns = [
+  {{ name = "ts", type = "timestamp_ns" }},
+  {{ name = "host", type = "dict" }},
+  {{ name = "cpu", type = "dict" }},
+  {{ name = "usage_idle", type = "float64" }},
+  {{ name = "usage_user", type = "float64", nullable = true }},
+  {{ name = "irq", type = "int64", nullable = true }},
+]
+
+[[sources]]
+name = "telegraf"
+kind = "file"
+url = "{data}"
+format = "line_protocol"
+table = "cpu"
+measurement = "cpu"
+map = {{ irq = "interrupts" }}
+"#,
+        data = data.display(),
+    );
+    let long = Duration::from_secs(60);
+    let s = start(&config, dir.path(), "lp", &[]);
+    wait_for(&s.1, "flight listening", long);
+    wait_for(&s.1, "file source consumed", long);
+    let addr = format!("127.0.0.1:{flight}");
+    until(&addr, "SELECT count(*) FROM cpu", "600", long);
+    let cell = |sql: &str| first_cell(&query(&addr, sql));
+    // every fifth reading has no usage_user
+    assert_eq!(cell("SELECT count(usage_user) FROM cpu"), "480");
+    assert_eq!(
+        cell("SELECT count(*) FROM cpu WHERE usage_user IS NULL"),
+        "120"
+    );
+    // integer fields (`12i`) are integers, read from another key than the column's name
+    assert_eq!(
+        cell("SELECT sum(irq) FROM cpu"),
+        (3 * (0..200i64).sum::<i64>()).to_string()
+    );
+    // a tag is a dictionary value, stored without its escape and queried by name
+    assert_eq!(cell("SELECT count(*) FROM cpu WHERE host = 'db 01'"), "200");
+    assert_eq!(
+        cell("SELECT count(*) FROM dictionaries WHERE \"table\" = 'cpu' AND \"column\" = 'host'"),
+        "3"
+    );
+    assert_eq!(
+        cell("SELECT name FROM dictionaries WHERE \"table\" = 'cpu' AND \"column\" = 'cpu'"),
+        "cpu-total"
+    );
+    // timestamps keep their nanoseconds: the last reading of `db 01` is 2 ns after its second
+    assert_eq!(
+        cell("SELECT max(ts) FROM cpu"),
+        "2025-11-09T14:56:39.000000002Z"
+    );
+    let m = ureq_get(&format!("http://127.0.0.1:{metrics}/metrics"));
+    assert!(m.contains("ankaa_user_rows_total 600"), "{m}");
+    assert!(m.contains("ankaa_user_rejected_total 3"), "{m}");
+    stop(s);
+}

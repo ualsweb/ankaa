@@ -13,13 +13,14 @@ pub mod fixed;
 pub mod framing;
 pub mod generic;
 pub mod json_scan;
+pub mod line_protocol;
 pub mod sparkplug;
 pub mod symbols;
 
 pub use batch::{BookDelta, BookSnapshot, EventBatch, Side, Trade};
 pub use fixed::{ParseError, parse_fixed};
 pub use framing::{FrameError, Framer, LengthPrefixed, Prefix};
-pub use generic::{MapError, Mapped, RowMapper, TsUnit};
+pub use generic::{LineProtocol, MapError, Mapped, RowMapper, TsUnit};
 pub use symbols::{SymbolDict, SymbolId};
 
 /// Crate version string (from Cargo).

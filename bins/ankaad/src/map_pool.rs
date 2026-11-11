@@ -4,9 +4,9 @@
 //!
 //! - The ingest loop logs a run of frames, then hands it over as a job numbered in order; job `s`
 //!   goes to worker `s mod N` through that worker's own queue (no queue or lock shared by workers).
-//! - A worker maps the user messages of JSON/CSV sources with its own clones of their mappers and
-//!   without the dictionaries ([`ankaa_ingest::Mapped`] keeps dictionary values as names). It
-//!   touches no shared state: nothing per row is atomic or contended.
+//! - A worker maps the user messages of JSON, CSV and line protocol sources with its own clones of
+//!   their mappers and without the dictionaries ([`ankaa_ingest::Mapped`] keeps dictionary values
+//!   as names). It touches no shared state: nothing per row is atomic or contended.
 //! - Results come back in any order and wait in a reorder buffer until their number is next.
 //! - Used result buffers go back to the worker that filled them: no allocation per message in
 //!   steady state, and each worker keeps reusing memory in its own caches. On the way back a

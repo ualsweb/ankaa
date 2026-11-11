@@ -87,3 +87,10 @@ name = "sparkplug"
 path = "fuzz_targets/sparkplug.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "line_protocol"
+path = "fuzz_targets/line_protocol.rs"
+test = false
+doc = false
+bench = false

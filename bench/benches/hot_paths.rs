@@ -426,7 +426,8 @@ fn framing(c: &mut Criterion) {
 }
 
 /// Generic ingest: one JSON or CSV message → one row (the path every NATS/Kafka/file message
-/// takes), and the incremental operators behind continuous queries.
+/// takes), batches (`rows`), Sparkplug B and line protocol messages → many rows, and the
+/// incremental operators behind continuous queries.
 fn generic(c: &mut Criterion) {
     use ankaa_ingest::generic::{RowMapper, TsUnit};
     use ankaa_store::{ColumnType, Field};
@@ -712,6 +713,121 @@ fn generic(c: &mut Criterion) {
                     let (key, _) = m.finish_row(r, &mut dicts);
                     acc = acc.wrapping_add(key);
                 }
+            }
+            acc
+        });
+    });
+    g.finish();
+
+    // InfluxDB line protocol as Telegraf writes it: a measurement, 3 tags, 10 float fields and a
+    // timestamp in nanoseconds (about 240 bytes). 1,024 lines, as one message per line (MQTT with
+    // `batch = false`) and as one message of 1,024 lines (a Kafka record, an HTTP write). `full`
+    // stores every tag and field (13 values converted per line); `subset` is a table that wants
+    // one tag and three fields, the other nine keys being looked up and dropped.
+    let lp_fields = [
+        "usage_user",
+        "usage_system",
+        "usage_idle",
+        "usage_nice",
+        "usage_iowait",
+        "usage_irq",
+        "usage_softirq",
+        "usage_steal",
+        "usage_guest",
+        "usage_guest_nice",
+    ];
+    let lp_lines: Vec<Vec<u8>> = (0..1024u64)
+        .map(|i| {
+            let fields: Vec<String> = lp_fields
+                .iter()
+                .enumerate()
+                .map(|(k, f)| {
+                    format!(
+                        "{f}={}.{:02}",
+                        (i + k as u64 * 7) % 100,
+                        (i * 3 + k as u64) % 100
+                    )
+                })
+                .collect();
+            format!(
+                "cpu,cpu=cpu{},host=web-{:02},region=eu-west-{} {} {}",
+                i % 8,
+                i % 16,
+                i % 3,
+                fields.join(","),
+                1_762_700_000_000_000_000 + i * 1_000_000
+            )
+            .into_bytes()
+        })
+        .collect();
+    let lp_batch: Vec<u8> = lp_lines.join(&b'\n');
+    let lp_schema = |tags: &[&str], fields: &[&str]| {
+        let mut cols = vec![Field::new("ts", ColumnType::TimestampNs)];
+        cols.extend(tags.iter().map(|t| Field::new(*t, ColumnType::DictU32)));
+        cols.extend(
+            fields
+                .iter()
+                .map(|f| Field::nullable(*f, ColumnType::Float64)),
+        );
+        Schema::new(cols).unwrap()
+    };
+    let lp_full = lp_schema(&["cpu", "host", "region"], &lp_fields);
+    let lp_subset = lp_schema(&["host"], &lp_fields[..3]);
+    let lp_mapper = |schema: &Schema| {
+        RowMapper::new(
+            schema.clone(),
+            &HashMap::new(),
+            false,
+            TsUnit::Nanos,
+            false,
+            Some("host"),
+        )
+        .unwrap()
+        .with_line_protocol(Some(&ankaa_ingest::generic::LineProtocol::default()))
+        .unwrap()
+    };
+    let mut g = c.benchmark_group("generic_ingest_line_protocol");
+    g.throughput(Throughput::Elements(1024));
+    for (name, schema) in [("full", &lp_full), ("subset", &lp_subset)] {
+        g.bench_function(format!("map_lines_{name}_1024"), |b| {
+            let mut m = lp_mapper(schema);
+            let mut dicts = RowMapper::dictionaries_for(schema);
+            b.iter(|| {
+                let mut acc = 0u32;
+                for msg in &lp_lines {
+                    let n = m.parse(black_box(msg), 0, false, &dicts).unwrap();
+                    for r in 0..n {
+                        let (key, _) = m.finish_row(r, &mut dicts);
+                        acc = acc.wrapping_add(key);
+                    }
+                }
+                acc
+            });
+        });
+        g.bench_function(format!("map_batch_{name}_1024"), |b| {
+            let mut m = lp_mapper(schema);
+            let mut dicts = RowMapper::dictionaries_for(schema);
+            b.iter(|| {
+                let mut acc = 0u32;
+                let n = m.parse(black_box(&lp_batch), 0, false, &dicts).unwrap();
+                for r in 0..n {
+                    let (key, _) = m.finish_row(r, &mut dicts);
+                    acc = acc.wrapping_add(key);
+                }
+                acc
+            });
+        });
+    }
+    // the parser alone: every line cut and read into spans, nothing converted
+    g.bench_function("parse_batch_1024", |b| {
+        use ankaa_ingest::line_protocol::{Line, Lines, parse};
+        let mut line = Line::default();
+        b.iter(|| {
+            let msg = black_box(&lp_batch);
+            let mut acc = 0usize;
+            for chunk in Lines::new(msg) {
+                parse(msg, chunk, &mut line).unwrap();
+                acc += line.tags.len() + line.fields.len();
             }
             acc
         });

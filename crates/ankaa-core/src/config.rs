@@ -150,6 +150,10 @@ pub enum SourceFormat {
     /// `$metric`, `$value`, `$string`, `$timestamp`, `$datatype`, `$historical`, `$seq`,
     /// `$group`, `$node`, `$device`, `$type` and `$topic`.
     Sparkplug,
+    /// `InfluxDB` line protocol (what Telegraf and the `InfluxDB` client libraries emit): one row
+    /// per line. Columns are filled by tag or field key (the column's name unless `map` names
+    /// another key, `$measurement` or `$topic`); the first column takes the timestamp of the line.
+    LineProtocol,
 }
 
 /// Transport of a source.
@@ -160,7 +164,7 @@ pub enum SourceKind {
     Nats,
     /// Kafka topic (feature `kafka`).
     Kafka,
-    /// A file replayed line by line (NDJSON or CSV); for tests and backfills.
+    /// A file replayed line by line (NDJSON, CSV or line protocol); for tests and backfills.
     File,
     /// MQTT topic filter (feature `mqtt`), at-least-once delivery with a persistent session.
     Mqtt,
@@ -240,7 +244,10 @@ pub struct SourceConfig {
     pub format: SourceFormat,
     /// Destination table (one of `[[tables]]`).
     pub table: String,
-    /// Column → field path (JSON) or column index (CSV, as text).
+    /// Column → field path (JSON), column index (CSV, as text) or selector. Line protocol fills
+    /// columns by name: `map` is only needed there to read another key, `$measurement` or
+    /// `$topic`.
+    #[serde(default)]
     pub map: std::collections::BTreeMap<String, String>,
     /// Unit of the timestamp field.
     #[serde(default)]
@@ -252,6 +259,10 @@ pub struct SourceConfig {
     /// the element, `$msg.<path>` from the message around it. Unset: one row per message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<String>,
+    /// Line protocol: keep only the lines of this measurement (the others are skipped, not
+    /// rejected). Unset: every line is a row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement: Option<String>,
     /// Kafka: connect with TLS. (The Kafka `url` is a server list without a scheme; an MQTT
     /// source asks for TLS with an `mqtts://` url instead.)
     #[serde(default)]
@@ -573,8 +584,8 @@ pub struct StorageConfig {
     /// wake-up takes many frames instead of one each. Rows become queryable at the next
     /// snapshot anyway, so the wait is not visible to queries. 0 turns it off. At most 10,000.
     pub ingest_coalesce_us: u64,
-    /// Threads that map JSON and CSV messages to rows while the ingest loop applies them in log
-    /// order (RFC-0001). Unset: the number of cores minus two (the ingest loop and the log
+    /// Threads that map JSON, CSV and line protocol messages to rows while the ingest loop applies
+    /// them in log order (RFC-0001). Unset: the number of cores minus two (the ingest loop and the log
     /// thread), at most 32; 0: map in the ingest loop. At most 256.
     pub ingest_workers: Option<usize>,
     /// Memory budget for warm (encoded, in-memory) chunks in MiB; beyond it the oldest warm
@@ -1177,6 +1188,58 @@ impl Config {
                 }
             }
             let ts_col = &t.columns[0].name;
+            if s.measurement.is_some() && s.format != SourceFormat::LineProtocol {
+                return inv(format!(
+                    "sources.{}: measurement needs format = \"line_protocol\"",
+                    s.name
+                ));
+            }
+            if s.format == SourceFormat::LineProtocol {
+                // columns are filled by key: `map` only renames, and the first column takes the
+                // timestamp of the line
+                if s.ts_unit == TimeUnit::Rfc3339 {
+                    return inv(format!(
+                        "sources.{}: format = \"line_protocol\" takes ts_unit = seconds, millis, micros or nanos (line protocol timestamps are integers)",
+                        s.name
+                    ));
+                }
+                if s.map.contains_key(ts_col) {
+                    return inv(format!(
+                        "sources.{}: the timestamp column {ts_col:?} takes the timestamp of the line; remove it from map",
+                        s.name
+                    ));
+                }
+                if s.measurement.as_deref().is_some_and(str::is_empty) {
+                    return inv(format!("sources.{}: measurement must not be empty", s.name));
+                }
+                for (col, v) in &s.map {
+                    let key = v.trim();
+                    let is_dict = t
+                        .columns
+                        .iter()
+                        .any(|c| &c.name == col && c.kind == ColumnKind::Dict);
+                    let topic = key == "$topic"
+                        || key
+                            .strip_prefix("$topic.")
+                            .is_some_and(|n| n.parse::<usize>().is_ok());
+                    if key.is_empty()
+                        || key.split('.').any(str::is_empty)
+                        || (key.starts_with('$') && key != "$measurement" && !topic)
+                    {
+                        return inv(format!(
+                            "sources.{}: map for {col:?} must be a tag or field key (no empty part between dots), $measurement, $topic or $topic.<segment number>, got {v:?}",
+                            s.name
+                        ));
+                    }
+                    if key == "$measurement" && !is_dict {
+                        return inv(format!(
+                            "sources.{}: $measurement needs a dict column, {col:?} is not one",
+                            s.name
+                        ));
+                    }
+                }
+                continue;
+            }
             if !s.map.contains_key(ts_col) && !s.ts_from_receive {
                 return inv(format!(
                     "sources.{}: map the timestamp column {ts_col:?} or set ts_from_receive",
@@ -1631,6 +1694,7 @@ standby_of = "10.0.0.1:50051"
             ts_from_receive: true,
             rows: None,
             tls: false,
+            measurement: None,
             tls_ca: None,
             tls_cert: None,
             tls_key: None,
@@ -1916,6 +1980,100 @@ map = {{ ts = "$timestamp", v = "$value" }}
                 .contains("needs format = \"sparkplug\"")
         );
         assert!(err(cfg("mqtt", "mqtt://b", "sparkplug", "rows = \"m\"")).contains("rows"));
+    }
+
+    #[test]
+    fn line_protocol_sources() {
+        let cfg = |kind: &str, source: &str| {
+            let (url, subject) = match kind {
+                "mqtt" => ("mqtt://b", "subject = \"telegraf/#\""),
+                "kafka" => ("b:9092", "subject = \"telegraf\""),
+                "nats" => ("nats://b", "subject = \"telegraf.>\""),
+                _ => ("/tmp/x.lp", ""),
+            };
+            format!(
+                r#"
+[feed]
+enabled = false
+streams = []
+[[tables]]
+name = "cpu"
+partition_by = "host"
+columns = [
+  {{ name = "ts", type = "timestamp_ns" }},
+  {{ name = "host", type = "dict" }},
+  {{ name = "kind", type = "dict" }},
+  {{ name = "usage_idle", type = "float64", nullable = true }},
+]
+[[sources]]
+name = "telegraf"
+kind = "{kind}"
+url = "{url}"
+{subject}
+format = "line_protocol"
+table = "cpu"
+{source}
+"#
+            )
+        };
+        // no map at all: every column is filled by the key of its name; nanoseconds by default
+        for kind in ["mqtt", "kafka", "nats", "file"] {
+            let c = Config::from_toml(&cfg(kind, "")).unwrap();
+            assert_eq!(c.sources[0].format, SourceFormat::LineProtocol);
+            assert!(c.sources[0].map.is_empty());
+            assert_eq!(c.sources[0].ts_unit, TimeUnit::Nanos);
+        }
+        // renames, the measurement as a column, a measurement filter, a precision
+        let c = Config::from_toml(&cfg(
+            "mqtt",
+            "map = { kind = \"$measurement\", usage_idle = \"usage.idle\", host = \"$topic.1\" }\nmeasurement = \"cpu\"\nts_unit = \"millis\"\nts_from_receive = true",
+        ))
+        .unwrap();
+        assert_eq!(c.sources[0].measurement.as_deref(), Some("cpu"));
+        assert_eq!(c.sources[0].map["usage_idle"], "usage.idle");
+        // the round trip keeps the settings
+        let again = Config::from_toml(&c.to_toml()).unwrap();
+        assert_eq!(again.sources, c.sources);
+        let err = |kind: &str, source: &str| {
+            Config::from_toml(&cfg(kind, source))
+                .unwrap_err()
+                .to_string()
+        };
+        assert!(err("file", "ts_unit = \"rfc3339\"").contains("line protocol timestamps"));
+        assert!(err("file", "map = { ts = \"time\" }").contains("takes the timestamp of the line"));
+        assert!(err("file", "map = { nope = \"x\" }").contains("unknown column"));
+        assert!(err("file", "map = { host = \"\" }").contains("must be a tag or field key"));
+        assert!(err("file", "map = { host = \"$value\" }").contains("must be a tag or field key"));
+        assert!(err("file", "map = { host = \"a..b\" }").contains("must be a tag or field key"));
+        assert!(err("file", "map = { host = \"$topic.1\" }").contains("need an mqtt source"));
+        assert!(
+            err("mqtt", "map = { host = \"$topic.x\" }").contains("must be a tag or field key")
+        );
+        assert!(
+            err("file", "map = { usage_idle = \"$measurement\" }").contains("needs a dict column")
+        );
+        assert!(err("file", "measurement = \"\"").contains("must not be empty"));
+        assert!(err("file", "rows = \"samples\"").contains("rows needs format"));
+        assert!(err("file", "sparkplug_rebirth = true").contains("needs format = \"sparkplug\""));
+        // the setting belongs to this format, and the other formats still need their map
+        let json = cfg("file", "").replace("line_protocol", "json");
+        assert!(
+            Config::from_toml(&json)
+                .unwrap_err()
+                .to_string()
+                .contains("map the timestamp column")
+        );
+        let json = cfg(
+            "file",
+            "measurement = \"cpu\"\nmap = { ts = \"t\", host = \"h\", kind = \"k\", usage_idle = \"u\" }",
+        )
+        .replace("line_protocol", "json");
+        assert!(
+            Config::from_toml(&json)
+                .unwrap_err()
+                .to_string()
+                .contains("measurement needs format")
+        );
     }
 
     #[test]

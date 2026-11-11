@@ -3,11 +3,13 @@
 //! the dictionaries at hand gives: the same rows, the same refusals (also at the dictionary cap,
 //! counted per message in row order), the same dictionary values and ids. This is what lets
 //! `ankaad` map messages on many cores and still apply them as one thread would (RFC-0001).
+//! Checked for every format a worker maps: one JSON object per message, `rows`, and `InfluxDB`
+//! line protocol (several lines per message).
 
 use std::collections::HashMap;
 
 use ankaa_ingest::SymbolDict;
-use ankaa_ingest::generic::{Mapped, RowMapper, TsUnit};
+use ankaa_ingest::generic::{LineProtocol, Mapped, RowMapper, TsUnit};
 use ankaa_store::{ColumnType, Field, Schema, Value};
 use proptest::prelude::*;
 
@@ -21,19 +23,36 @@ fn schema() -> Schema {
     .unwrap()
 }
 
-fn mapper(rows: bool, cap: usize) -> RowMapper {
-    let map: HashMap<String, String> = if rows {
-        [("ts", "t"), ("dev", "$msg.dev"), ("tag", "g"), ("v", "v")]
-    } else {
-        [("ts", "t"), ("dev", "dev"), ("tag", "g"), ("v", "v")]
+/// What the messages of a stream look like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Format {
+    /// One JSON object, one row.
+    Json,
+    /// One JSON object with an array of readings (`rows`).
+    Rows,
+    /// `InfluxDB` line protocol, one line per reading.
+    Lines,
+}
+
+fn mapper(format: Format, cap: usize) -> RowMapper {
+    let map: HashMap<String, String> = match format {
+        Format::Rows => vec![("ts", "t"), ("dev", "$msg.dev"), ("tag", "g"), ("v", "v")],
+        Format::Json => vec![("ts", "t"), ("dev", "dev"), ("tag", "g"), ("v", "v")],
+        // `dev` and `v` by the name of their column
+        Format::Lines => vec![("tag", "g")],
     }
     .into_iter()
     .map(|(a, b)| (a.to_owned(), b.to_owned()))
     .collect();
+    let lines = LineProtocol {
+        measurement: Some("r".into()),
+    };
     RowMapper::new(schema(), &map, false, TsUnit::Millis, false, Some("dev"))
         .unwrap()
         .with_max_dict_entries(cap)
-        .with_rows(rows.then_some("s"))
+        .with_rows((format == Format::Rows).then_some("s"))
+        .unwrap()
+        .with_line_protocol((format == Format::Lines).then_some(&lines))
         .unwrap()
 }
 
@@ -58,11 +77,28 @@ fn reading_json(r: Reading, with_dev: Option<u8>) -> String {
     s
 }
 
+/// The same reading as a line: the tag `g` and the field `v` may be missing, another field
+/// always follows (a line needs one), and every third line is of a measurement the source skips.
+fn reading_line(r: Reading, dev: u8) -> String {
+    use std::fmt::Write as _;
+    let measurement = if r.0.is_multiple_of(3) { "other" } else { "r" };
+    let mut s = format!("{measurement},dev=d{dev}");
+    if let Some(g) = r.1 {
+        let _ = write!(s, ",g=g{g}");
+    }
+    s.push(' ');
+    if let Some(v) = r.2 {
+        let _ = write!(s, "v={v}.5,");
+    }
+    let _ = write!(s, "n=1i {}", r.0);
+    s
+}
+
 /// What a stream produced: per message, per row, the stored values or a refusal.
 type Outcome = Vec<Vec<Option<Vec<Value>>>>;
 
-fn sequential(msgs: &[Vec<u8>], rows: bool, cap: usize) -> (Outcome, Vec<Option<SymbolDict>>) {
-    let mut m = mapper(rows, cap);
+fn sequential(msgs: &[Vec<u8>], format: Format, cap: usize) -> (Outcome, Vec<Option<SymbolDict>>) {
+    let mut m = mapper(format, cap);
     let mut dicts = RowMapper::dictionaries_for(&schema());
     let mut out = Vec::new();
     for msg in msgs {
@@ -83,14 +119,14 @@ fn sequential(msgs: &[Vec<u8>], rows: bool, cap: usize) -> (Outcome, Vec<Option<
 
 fn via_workers(
     msgs: &[Vec<u8>],
-    rows: bool,
+    format: Format,
     cap: usize,
     workers: usize,
 ) -> (Outcome, Vec<Option<SymbolDict>>) {
     // each worker has its own mapper; messages are dealt round-robin and mapped `lag` messages
     // ahead of the applier (as jobs in flight are); each applied result goes back to its worker,
     // which learns the ids in it and resolves those values itself afterwards
-    let mut pool: Vec<RowMapper> = (0..workers).map(|_| mapper(rows, cap)).collect();
+    let mut pool: Vec<RowMapper> = (0..workers).map(|_| mapper(format, cap)).collect();
     let lag = workers * 2;
     let mut ready: std::collections::VecDeque<(usize, Option<Mapped>)> =
         std::collections::VecDeque::new();
@@ -148,26 +184,60 @@ proptest! {
             (0u8..12, proptest::collection::vec((any::<u16>(), proptest::option::weighted(0.9, 0u8..9), any::<Option<i16>>()), 1..6), any::<bool>()),
             1..40,
         ),
-        rows in any::<bool>(),
+        format in proptest::sample::select(vec![Format::Json, Format::Rows, Format::Lines]),
         cap in 2usize..12,
         workers in 1usize..8,
     ) {
         let encoded: Vec<Vec<u8>> = msgs
             .iter()
             .map(|(dev, readings, broken)| {
-                let body = if rows {
-                    let elems: Vec<String> = readings.iter().map(|r| reading_json(*r, None)).collect();
-                    format!("{{\"dev\":\"d{dev}\",\"s\":[{}]}}", elems.join(","))
-                } else {
-                    reading_json(readings[0], Some(*dev))
+                let body = match format {
+                    Format::Rows => {
+                        let elems: Vec<String> = readings.iter().map(|r| reading_json(*r, None)).collect();
+                        format!("{{\"dev\":\"d{dev}\",\"s\":[{}]}}", elems.join(","))
+                    }
+                    Format::Json => reading_json(readings[0], Some(*dev)),
+                    Format::Lines => {
+                        let lines: Vec<String> = readings.iter().map(|r| reading_line(*r, *dev)).collect();
+                        // now and then a line that is not line protocol among the others
+                        let sep = if *broken && dev % 3 == 0 { "\nr,dev= v=1\n" } else { "\n" };
+                        lines.join(sep)
+                    }
                 };
-                // now and then a message that is not JSON at all
+                // now and then a message that is not JSON at all (a refused line, as line
+                // protocol)
                 if *broken && dev % 5 == 0 { b"{not json".to_vec() } else { body.into_bytes() }
             })
             .collect();
-        let (a, da) = sequential(&encoded, rows, cap);
-        let (b, db) = via_workers(&encoded, rows, cap, workers);
+        let (a, da) = sequential(&encoded, format, cap);
+        let (b, db) = via_workers(&encoded, format, cap, workers);
         prop_assert_eq!(a, b);
         prop_assert_eq!(names(&da), names(&db));
     }
+}
+
+/// The property above would hold for a mapper that refuses everything: line protocol streams do
+/// store rows, skip the other measurement, leave `NULL`s and refuse lines.
+#[test]
+fn line_protocol_streams_store_skip_and_refuse() {
+    let readings: [Reading; 5] = [
+        (1, Some(1), Some(3)),
+        (2, Some(2), None),
+        (3, Some(1), Some(4)), // t % 3 == 0: another measurement
+        (4, None, Some(5)),    // no tag: refused
+        (5, Some(1), Some(6)),
+    ];
+    let lines: Vec<String> = readings.iter().map(|r| reading_line(*r, 7)).collect();
+    let msgs = vec![lines.join("\n").into_bytes(), b"r,dev= v=1 9".to_vec()];
+    let (a, da) = sequential(&msgs, Format::Lines, 8);
+    let (b, db) = via_workers(&msgs, Format::Lines, 8, 3);
+    assert_eq!(a, b);
+    assert_eq!(names(&da), names(&db));
+    let stored: Vec<bool> = a[0].iter().map(Option::is_some).collect();
+    assert_eq!(stored, [true, true, false, true]);
+    assert_eq!(a[0][1].as_ref().unwrap()[3], Value::Null);
+    assert_eq!(a[0][3].as_ref().unwrap()[3], Value::F64(6.5));
+    assert_eq!(a[1], [None]);
+    assert_eq!(names(&da)[1], ["d7"]);
+    assert_eq!(names(&da)[2], ["g1", "g2"]);
 }

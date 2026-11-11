@@ -22,6 +22,8 @@ proptest.workspace = true
 serde_json.workspace = true
 # reference protobuf codec for the Sparkplug decoder's differential test only
 prost = "0.14"
+# reference parser for the line protocol differential test only (the parser InfluxDB 3 uses)
+influxdb-line-protocol = "2"
 
 
 [lints]

@@ -1,5 +1,6 @@
-//! Generic ingest ("bring your own feed"): map JSON or CSV messages onto a user-defined
-//! schema (`[[tables]]` + `[[sources]]` in the server config) and produce store rows.
+//! Generic ingest ("bring your own feed"): map JSON, CSV, Sparkplug B or line protocol messages
+//! onto a user-defined schema (`[[tables]]` + `[[sources]]` in the server config) and produce
+//! store rows.
 //!
 //! The mapper allocates nothing per message after warm-up: JSON goes through a path-directed
 //! single-pass scanner ([`crate::json_scan`]: no document tree, unmapped fields skipped at memory
@@ -7,7 +8,9 @@
 //! [`parse_fixed`] (no floats for `fixed8`), strings go through a per-column [`SymbolDict`], and the
 //! output rows live in a buffer that is reused. With `rows`, one message yields one row per
 //! element of an array. Sparkplug B payloads ([`RowMapper::with_sparkplug`]) yield one row per
-//! metric, decoded in place by [`crate::sparkplug`].
+//! metric, decoded in place by [`crate::sparkplug`]. `InfluxDB` line protocol
+//! ([`RowMapper::with_line_protocol`]) yields one row per line, read in place by
+//! [`crate::line_protocol`], with columns filled by tag and field key.
 #![allow(
     clippy::many_single_char_names,
     clippy::unnested_or_patterns,
@@ -23,6 +26,7 @@ use std::collections::HashMap;
 use ankaa_store::{ColumnType, Field, Schema, Value};
 
 use crate::json_scan;
+use crate::line_protocol;
 use crate::sparkplug::{self, Definitions};
 use crate::symbols::{SymbolDict, SymbolId};
 use crate::{DecodeError, parse_fixed};
@@ -131,8 +135,129 @@ enum SpRaw<'a> {
     Ms(u64),
 }
 
-/// Most rows one message may carry with `rows`: bounds the work and memory one message can
-/// cause.
+/// Settings of a line protocol source ([`RowMapper::with_line_protocol`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LineProtocol {
+    /// Keep only the lines of this measurement: the others are skipped, not refused (one topic
+    /// can carry several measurements while a source feeds one table).
+    pub measurement: Option<String>,
+}
+
+/// Where a column's value comes from in a line of line protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LpSrc {
+    /// The timestamp of the line (the first column).
+    Timestamp,
+    /// The tag or field whose key the column is mapped to (see [`KeyTable`]).
+    Key,
+    /// `$measurement`.
+    Measurement,
+    /// `$topic` or `$topic.N`.
+    Topic(Option<usize>),
+}
+
+/// The value a line gave a column.
+#[derive(Debug, Clone, Copy)]
+enum Got {
+    Tag(line_protocol::Text),
+    Field(line_protocol::Value),
+}
+
+/// Line protocol state of a mapper: the compiled mapping and buffers reused from line to line.
+/// Nothing in it carries from one message to the next.
+#[derive(Debug, Clone)]
+struct LpState {
+    measurement: Option<String>,
+    /// Per column.
+    src: Vec<LpSrc>,
+    /// Key of a tag or field → the columns it fills.
+    keys: KeyTable,
+    /// Nanoseconds per unit of the timestamps (`ts_unit`).
+    ts_scale: i64,
+    /// The line being mapped (spans into the message).
+    line: line_protocol::Line,
+    /// Per column: what the line being mapped holds for it.
+    got: Vec<Option<Got>>,
+    /// A key or a value with its escapes decoded (the slow path).
+    text: String,
+}
+
+/// Which columns a tag or field key fills, for the handful of keys a source maps: a line names
+/// its keys in full (a Telegraf line carries ten to a hundred), so the lookup runs once per key
+/// of every line and must cost a few nanoseconds, hit or miss.
+///
+/// No hash of the key bytes is computed: a key is placed by its length and three of its bytes
+/// (first, middle, last) mixed by one multiplication into a table of at least four buckets per
+/// mapped key. A key the source does not map almost always lands in an empty bucket and is
+/// dismissed without a comparison; a mapped key is confirmed by one comparison of its bytes.
+/// Keys that share a bucket are stored next to each other and compared in turn.
+#[derive(Debug, Clone, Default)]
+struct KeyTable {
+    /// Per bucket: its first entry and how many it holds.
+    buckets: Vec<(u32, u32)>,
+    shift: u32,
+    /// Keys grouped by bucket, each with the column it fills (a key may fill several).
+    entries: Vec<(Box<[u8]>, u32)>,
+}
+
+impl KeyTable {
+    fn new(keys: &[(Vec<u8>, usize)]) -> Self {
+        let bits = (keys.len() * 4)
+            .next_power_of_two()
+            .trailing_zeros()
+            .clamp(4, 24);
+        let shift = 32 - bits;
+        let mut order: Vec<(usize, &(Vec<u8>, usize))> = keys
+            .iter()
+            .map(|k| (Self::bucket(&k.0, shift), k))
+            .collect();
+        order.sort_by_key(|(b, _)| *b);
+        let mut buckets = vec![(0u32, 0u32); 1 << bits];
+        let mut entries = Vec::with_capacity(keys.len());
+        for (b, (key, col)) in order {
+            if let Some(slot) = buckets.get_mut(b) {
+                if slot.1 == 0 {
+                    slot.0 = entries.len() as u32;
+                }
+                slot.1 += 1;
+            }
+            entries.push((key.clone().into_boxed_slice(), *col as u32));
+        }
+        Self {
+            buckets,
+            shift,
+            entries,
+        }
+    }
+
+    #[inline]
+    fn bucket(key: &[u8], shift: u32) -> usize {
+        let n = key.len();
+        let at = |i: usize| u32::from(key.get(i).copied().unwrap_or(0));
+        let h = (n as u32) ^ (at(0) << 8) ^ (at(n / 2) << 16) ^ (at(n.wrapping_sub(1)) << 24);
+        (h.wrapping_mul(0x9E37_79B1) >> shift) as usize
+    }
+
+    /// Call `hit` with every column `key` fills.
+    #[inline]
+    fn each(&self, key: &[u8], mut hit: impl FnMut(usize)) {
+        let Some(&(first, n)) = self.buckets.get(Self::bucket(key, self.shift)) else {
+            return;
+        };
+        if n == 0 {
+            return;
+        }
+        let (first, n) = (first as usize, n as usize);
+        for (k, col) in self.entries.get(first..first + n).unwrap_or(&[]) {
+            if **k == *key {
+                hit(*col as usize);
+            }
+        }
+    }
+}
+
+/// Most rows one message may carry (elements of the `rows` array, lines of line protocol):
+/// bounds the work and memory one message can cause.
 pub const MAX_ROWS_PER_MESSAGE: usize = 65_536;
 
 /// Where a column's value comes from once the JSON paths are compiled.
@@ -177,6 +302,8 @@ pub struct RowMapper {
     learned: Vec<HashMap<Box<str>, u32, foldhash::fast::RandomState>>,
     /// `format = "sparkplug"`: payloads are Sparkplug B, one row per metric.
     sparkplug: Option<Box<SpState>>,
+    /// `format = "line_protocol"`: payloads are `InfluxDB` line protocol, one row per line.
+    line_protocol: Option<Box<LpState>>,
 }
 
 /// What [`RowMapper::parsed`] found for one row, before anything was added to a dictionary.
@@ -228,11 +355,13 @@ impl From<json_scan::ScanError> for MapError {
     }
 }
 
-/// A raw value before conversion: text (CSV field, topic segment) or a JSON span.
+/// A raw value before conversion: text (CSV field, topic segment), a JSON span, or a string
+/// value already decoded (line protocol: converted as a JSON string is).
 #[derive(Debug, Clone, Copy)]
 enum Scalar<'a> {
     Text(&'a str),
     Json(json_scan::Span),
+    Str(&'a str),
 }
 
 impl RowMapper {
@@ -313,6 +442,7 @@ impl RowMapper {
             new_names: Vec::new(),
             learned: Vec::new(),
             sparkplug: None,
+            line_protocol: None,
         })
     }
 
@@ -378,6 +508,118 @@ impl RowMapper {
         if let Some(s) = &mut self.sparkplug {
             s.defs = defs;
         }
+    }
+
+    /// Payloads are `InfluxDB` line protocol (`format = "line_protocol"`): one row per line
+    /// ([`crate::line_protocol`] has the grammar). `None` leaves the mapper as it is.
+    ///
+    /// - The first column takes the timestamp of the line, in the mapper's `ts_unit` (seconds,
+    ///   millis, micros or nanos), or the receive time when the line has none and
+    ///   `ts_from_receive` is set; it is not mapped.
+    /// - Every other column is filled **by key**: a column that `map` leaves out reads the tag or
+    ///   field whose key is the column's name; `column = "key"` reads another key (taken as
+    ///   written, a dot is part of the key); `column = "$measurement"` stores the measurement (a
+    ///   `dict` column); `$topic` and `$topic.N` work as for any MQTT source. The keys come
+    ///   through [`Self::new`], which reads `map` for every format: white space around a key is
+    ///   dropped, and a key that starts with `$` or has an empty part between dots (`a..b`)
+    ///   cannot be named.
+    /// - Tags and string fields are text, numbers and booleans are what they are in JSON: every
+    ///   value is converted by the rules of the JSON path (an integer field `12i` and an unsigned
+    ///   one `12u` are the number 12).
+    /// - A line without a key leaves a nullable column `NULL` and is refused by any other. Keys
+    ///   of the line that no column reads are ignored. When a key comes twice in a line (two
+    ///   fields, or a tag and a field), the last one counts.
+    /// - A malformed line is refused alone; a message of more than [`MAX_ROWS_PER_MESSAGE`]
+    ///   lines is refused whole.
+    pub fn with_line_protocol(mut self, lp: Option<&LineProtocol>) -> Result<Self, MapError> {
+        let Some(lp) = lp else {
+            return Ok(self);
+        };
+        let bad = |column: &str, reason: &str| MapError::Convert {
+            column: column.to_owned(),
+            reason: reason.to_owned(),
+        };
+        if self.rows_path.is_some() {
+            return Err(bad("rows", "rows needs format = \"json\""));
+        }
+        if self.sparkplug.is_some() {
+            return Err(bad("format", "a source has one format"));
+        }
+        let ts_scale = match self.ts_unit {
+            TsUnit::Nanos => 1,
+            TsUnit::Micros => 1_000,
+            TsUnit::Millis => 1_000_000,
+            TsUnit::Seconds => 1_000_000_000,
+            TsUnit::Rfc3339 => {
+                return Err(bad(
+                    "ts_unit",
+                    "format = \"line_protocol\" takes ts_unit = seconds, millis, micros or nanos",
+                ));
+            }
+        };
+        if lp.measurement.as_deref() == Some("") {
+            return Err(bad("measurement", "measurement must not be empty"));
+        }
+        let mut src = Vec::with_capacity(self.selectors.len());
+        let mut keys: Vec<(Vec<u8>, usize)> = Vec::new();
+        for (c, (sel, f)) in self.selectors.iter().zip(self.schema.fields()).enumerate() {
+            src.push(match sel {
+                Selector::Absent if c == 0 => LpSrc::Timestamp,
+                _ if c == 0 => {
+                    return Err(bad(
+                        &f.name,
+                        "the timestamp column takes the timestamp of the line: leave it out of map",
+                    ));
+                }
+                Selector::Absent => {
+                    keys.push((f.name.as_bytes().to_vec(), c));
+                    LpSrc::Key
+                }
+                Selector::Topic(n) => LpSrc::Topic(*n),
+                Selector::Path(p) => {
+                    // a key is taken as written: the dots `new` split it on belong to it
+                    let key = p.join(".");
+                    if key == "$measurement" {
+                        if f.ty != ColumnType::DictU32 {
+                            return Err(bad(&f.name, "$measurement needs a dict column"));
+                        }
+                        LpSrc::Measurement
+                    } else if key.starts_with('$') {
+                        return Err(bad(
+                            &f.name,
+                            &format!(
+                                "{key:?}: expected a tag or field key, $measurement, $topic or $topic.<segment number>"
+                            ),
+                        ));
+                    } else {
+                        keys.push((key.into_bytes(), c));
+                        LpSrc::Key
+                    }
+                }
+                Selector::Index(_) => {
+                    return Err(bad(
+                        &f.name,
+                        "format = \"line_protocol\" maps columns by tag or field key (not CSV indexes)",
+                    ));
+                }
+                Selector::Sparkplug(_) => {
+                    return Err(bad(
+                        &f.name,
+                        "Sparkplug selectors need format = \"sparkplug\"",
+                    ));
+                }
+            });
+        }
+        self.line_protocol = Some(Box::new(LpState {
+            measurement: lp.measurement.clone(),
+            src,
+            keys: KeyTable::new(&keys),
+            ts_scale,
+            line: line_protocol::Line::default(),
+            got: Vec::new(),
+            text: String::new(),
+        }));
+        Ok(self)
     }
 
     /// Compile the JSON selectors: message paths, and with `rows` the element paths (a path
@@ -519,6 +761,11 @@ impl RowMapper {
             self.sparkplug = Some(sp);
             return r;
         }
+        if let Some(mut lp) = self.line_protocol.take() {
+            let r = self.parse_line_protocol(topic, payload, recv_ns, dicts, &mut lp);
+            self.line_protocol = Some(lp);
+            return r;
+        }
         let ncols = self.schema.fields().len();
         if csv {
             let text = std::str::from_utf8(payload)
@@ -643,6 +890,178 @@ impl RowMapper {
         self.out.n_rows = r;
         self.out.row_err.truncate(r);
         Ok(r)
+    }
+
+    /// One row per line of an `InfluxDB` line protocol message; comments, blank lines and, with a
+    /// `measurement` setting, the lines of other measurements give none. A line that does not
+    /// parse or does not map is a refused row; the lines around it are not affected.
+    fn parse_line_protocol(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        recv_ns: i64,
+        dicts: &[Option<SymbolDict>],
+        lp: &mut LpState,
+    ) -> Result<usize, MapError> {
+        let ncols = self.schema.fields().len();
+        // the number of lines is not known up front: rows are added one by one
+        self.begin(0, ncols);
+        let mut r = 0usize;
+        for chunk in line_protocol::Lines::new(payload) {
+            // a line whose measurement cannot be read falls through and is refused below
+            if let Some(only) = &lp.measurement
+                && let Ok(m) = line_protocol::measurement(payload, chunk)
+                && lp_text(
+                    m,
+                    payload,
+                    line_protocol::Escapes::Measurement,
+                    &mut lp.text,
+                ) != only
+            {
+                continue;
+            }
+            if r == MAX_ROWS_PER_MESSAGE {
+                self.out.n_rows = 0;
+                self.out.row_err.clear();
+                return Err(MapError::Malformed("too many rows in one message"));
+            }
+            self.reserve_row(r, ncols);
+            if let Err(e) = self.line_row(r, topic, payload, chunk, recv_ns, dicts, lp)
+                && let Some(slot) = self.out.row_err.get_mut(r)
+            {
+                *slot = Some(e);
+            }
+            r += 1;
+        }
+        self.out.n_rows = r;
+        self.out.row_err.truncate(r);
+        Ok(r)
+    }
+
+    /// Map the line at `chunk` into row `r`. Kept out of line on a measurement: inlined into
+    /// `parse`, messages of one line mapped 40% slower (`map_lines_full_1024` in the
+    /// `generic_ingest_line_protocol` benchmarks, 0.63 against 0.46 µs per line).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn line_row(
+        &mut self,
+        r: usize,
+        topic: &str,
+        payload: &[u8],
+        chunk: line_protocol::Chunk,
+        recv_ns: i64,
+        dicts: &[Option<SymbolDict>],
+        lp: &mut LpState,
+    ) -> Result<(), MapError> {
+        use json_scan::{Kind as K, Span};
+        use line_protocol::{Escapes, Kind as L};
+        line_protocol::parse(payload, chunk, &mut lp.line).map_err(|e| MapError::Malformed(e.0))?;
+        let ncols = self.schema.fields().len();
+        lp.got.clear();
+        lp.got.resize(ncols, None);
+        // each key of the line → the columns it fills (a later key replaces an earlier one)
+        for &(key, value) in &lp.line.tags {
+            let got = &mut lp.got;
+            lp.keys.each(lp_key(key, payload, &mut lp.text), |c| {
+                if let Some(slot) = got.get_mut(c) {
+                    *slot = Some(Got::Tag(value));
+                }
+            });
+        }
+        for &(key, value) in &lp.line.fields {
+            let got = &mut lp.got;
+            lp.keys.each(lp_key(key, payload, &mut lp.text), |c| {
+                if let Some(slot) = got.get_mut(c) {
+                    *slot = Some(Got::Field(value));
+                }
+            });
+        }
+        for c in 0..ncols {
+            let span = |kind, v: line_protocol::Value| {
+                Scalar::Json(Span {
+                    kind,
+                    start: v.start(),
+                    end: v.end(),
+                })
+            };
+            let raw = match lp.src[c] {
+                LpSrc::Timestamp => {
+                    self.lp_timestamp(r, lp.line.timestamp, lp.ts_scale, recv_ns)?;
+                    continue;
+                }
+                LpSrc::Topic(n) => topic_segment(topic, n).map(Scalar::Text),
+                LpSrc::Measurement => Some(Scalar::Str(lp_text(
+                    lp.line.measurement,
+                    payload,
+                    Escapes::Measurement,
+                    &mut lp.text,
+                ))),
+                LpSrc::Key => match lp.got[c] {
+                    None => None,
+                    Some(Got::Tag(t)) => {
+                        Some(Scalar::Str(lp_text(t, payload, Escapes::Key, &mut lp.text)))
+                    }
+                    Some(Got::Field(v)) => Some(match v.kind {
+                        // the span of `12i` and `12u` is the number without its suffix
+                        L::Float | L::Int | L::UInt => span(K::Num, v),
+                        L::True => span(K::True, v),
+                        L::False => span(K::False, v),
+                        L::Str => Scalar::Str(v.as_str(payload)),
+                        L::StrEscaped => {
+                            line_protocol::unescape(
+                                v.as_str(payload),
+                                Escapes::String,
+                                &mut lp.text,
+                            );
+                            Scalar::Str(&lp.text)
+                        }
+                    }),
+                },
+            };
+            self.convert(r, c, raw, payload, recv_ns, dicts)?;
+        }
+        Ok(())
+    }
+
+    /// The timestamp of a line (`scale` ns per unit) into row `r`, or the receive time.
+    fn lp_timestamp(
+        &mut self,
+        r: usize,
+        ts: Option<i64>,
+        scale: i64,
+        recv_ns: i64,
+    ) -> Result<(), MapError> {
+        let ncols = self.schema.fields().len();
+        let f: &Field = &self.schema.fields()[0];
+        let ns = match ts {
+            Some(t) => t.checked_mul(scale).ok_or_else(|| MapError::Convert {
+                column: f.name.clone(),
+                reason: "bad timestamp".to_owned(),
+            })?,
+            None if self.ts_from_receive => recv_ns,
+            None => return Err(MapError::Missing(f.name.clone())),
+        };
+        self.out.rows[r * ncols] = Value::I64(ns);
+        Ok(())
+    }
+
+    /// Make room for row `r` of a message whose rows are added one by one (after `begin(0, …)`):
+    /// the buffers double, up to [`MAX_ROWS_PER_MESSAGE`] rows.
+    fn reserve_row(&mut self, r: usize, ncols: usize) {
+        if r < self.out.n_rows {
+            return;
+        }
+        let n = (self.out.n_rows * 2).min(MAX_ROWS_PER_MESSAGE).max(r + 1);
+        let cells = n * ncols;
+        if self.out.rows.len() < cells {
+            self.out.rows.resize(cells, Value::Null);
+        }
+        if self.out.pending.len() < cells {
+            self.out.pending.resize_with(cells, String::new);
+        }
+        self.out.pending_set.resize(cells, false);
+        self.out.row_err.resize(n, None);
+        self.out.n_rows = n;
     }
 
     /// Copy cell (`from`, `c`) into (`to`, `c`), with its pending dictionary value.
@@ -822,6 +1241,14 @@ impl RowMapper {
     }
 
     /// Convert one raw value into cell (`r`, `c`).
+    ///
+    /// Always inlined: each format calls it from its own loop with one kind of raw value (CSV
+    /// text, a JSON span, a line protocol value), and inlined there the branches of the other
+    /// kinds fold away. Left to the compiler's choice, the CSV path went from 131 to 236 ns per
+    /// message when line protocol became a third caller (`generic_ingest/map_csv_1024`);
+    /// forced, no path is slower than before.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn convert(
         &mut self,
         r: usize,
@@ -845,6 +1272,7 @@ impl RowMapper {
             None => true,
             Some(Scalar::Json(s)) => s.kind == K::Null,
             Some(Scalar::Text(s)) => s.is_empty(),
+            Some(Scalar::Str(_)) => false,
         };
         if absent && f.nullable && c > 0 {
             self.out.rows[idx] = Value::Null;
@@ -860,7 +1288,7 @@ impl RowMapper {
         // text of a string (decoded when escaped: the only allocating case)
         let mut owned = String::new();
         let text: Option<&str> = match raw {
-            Scalar::Text(s) => Some(s),
+            Scalar::Text(s) | Scalar::Str(s) => Some(s),
             Scalar::Json(s) if s.kind == K::Str => Some(
                 std::str::from_utf8(s.bytes(msg))
                     .map_err(|_| MapError::Malformed("invalid json"))?,
@@ -873,6 +1301,7 @@ impl RowMapper {
         };
         let kind = match raw {
             Scalar::Json(s) => Some(s.kind),
+            Scalar::Str(_) => Some(K::Str),
             Scalar::Text(_) => None,
         };
         let num = match raw {
@@ -1358,6 +1787,35 @@ fn typed_value(
         }
         ColumnType::DictU32 => return Err("not a scalar column".into()),
     })
+}
+
+/// A name of a line protocol line as text: as written, or decoded into `scratch` when it holds
+/// escapes.
+#[inline]
+fn lp_text<'a>(
+    t: line_protocol::Text,
+    msg: &'a [u8],
+    escapes: line_protocol::Escapes,
+    scratch: &'a mut String,
+) -> &'a str {
+    if t.is_escaped() {
+        line_protocol::unescape(t.as_str(msg), escapes, scratch);
+        scratch
+    } else {
+        t.as_str(msg)
+    }
+}
+
+/// The bytes of a key of a line to look up: as written (the common case: nothing is decoded,
+/// checked or copied), or decoded into `scratch` when the key holds escapes.
+#[inline]
+fn lp_key<'a>(key: line_protocol::Text, msg: &'a [u8], scratch: &'a mut String) -> &'a [u8] {
+    if key.is_escaped() {
+        line_protocol::unescape(key.as_str(msg), line_protocol::Escapes::Key, scratch);
+        scratch.as_bytes()
+    } else {
+        key.raw(msg)
+    }
 }
 
 /// The bytes of a validated JSON number (ASCII by the grammar) as text.
