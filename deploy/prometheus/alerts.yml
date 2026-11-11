@@ -95,6 +95,14 @@ groups:
           summary: "WAL append/commit errors on {{ $labels.instance }}"
           description: "{{ $value }} WAL errors in 5 minutes. Check free space and the 'wal commit failed' / 'wal append failed' warnings. Frames since the last good commit are not durable."
 
+      - alert: AnkaaTierErrors
+        expr: increase(ankaa_tier_errors_total{job="ankaad"}[10m]) > 0
+        for: 0m
+        labels: {severity: warning}
+        annotations:
+          summary: "Compression or segment writes failing on {{ $labels.instance }}"
+          description: "{{ $value }} chunks could not be compressed, written as a segment or merged in 10 minutes (see the 'encode or segment write failed' warnings; a full or read-only checkpoint_dir is the usual cause). The rows stay in memory and in the WAL, which then cannot be cut."
+
       - alert: AnkaaWalQueueDrops
         expr: increase(ankaa_wal_dropped_total{job="ankaad"}[5m]) > 0
         for: 0m
