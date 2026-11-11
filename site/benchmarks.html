@@ -175,7 +175,7 @@
         </tbody>
       </table>
     </div>
-    <p class="note"><b>Where ANKAA loses.</b> Two one-host, one-hour queries, which TimescaleDB answers from an index in a few hundred microseconds while ANKAA pays 0.3 ms of Arrow Flight round trip and 0.3 ms of query planning for 30 µs of work; the newest five minutes against TimescaleDB's rowstore; and memory, where ANKAA peaked at 5.1 GiB during the load and kept it. InfluxDB 3 Core 3.12 did not complete on this 16 GB VM (out of memory in its deduplication sort, twice) and is left out rather than tuned by us.</p>
+    <p class="note"><b>Where ANKAA loses.</b> Two one-host, one-hour queries, which TimescaleDB answers from an index in a few hundred microseconds while ANKAA pays 0.3 ms of Arrow Flight round trip and 0.3 ms of query planning for 30 µs of work; the newest five minutes against TimescaleDB's rowstore; and memory during a load, where ANKAA peaked at 5.1 GiB and kept it until restarted (the same data then takes 0.25 to 0.6 GiB). InfluxDB 3 Core 3.12 did not complete on this 16 GB VM (out of memory in its deduplication sort, twice) and is left out rather than tuned by us.</p>
     <p class="note">One VM size, four cores, one run, 1,000 series, clients on different protocols. Nothing here says how the engines compare with 100,000 series, on 64 cores or under concurrent load. <a href="https://github.com/ualsweb/ankaa/blob/main/docs/benchmarks/2026-11-11-axion-telemetry-comparison.md">The note</a> has the method, the raw results, how the day started (ANKAA lost 11 of 15 before the changes it describes) and the profile behind every change.</p>
   </div>
 </section>

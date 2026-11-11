@@ -37,8 +37,10 @@ cores or under concurrent load; those runs are not done.
   further. The raw CSV is 4.6 GiB.
 - **Memory is ANKAA's weak column.** It peaked at 5.1 GiB and stayed at 5.5 GiB resident at rest, for
   247 MiB of compressed data: the load keeps up to 1 GiB of uncompressed rows (`hot_budget_mib`), each
-  open chunk has a second copy for queries, and the allocator does not give the peak back. This is not yet
-  understood in detail and is the next thing to measure.
+  open chunk has a second copy for queries, and the allocator does not give the peak back. It is what the
+  load leaves behind, not what the data needs: the same server restarted on the same data uses 248 MiB
+  when it starts and 581 MiB after whole-table queries (the segments in its cache plus working memory).
+  Returning the load's peak to the system, and a smaller peak, are the next thing to work on.
 - ANKAA reaches its at-rest state (every row compressed and in a segment, one chunk per host, log cut)
   262 s after the load; it answers queries from the first row on, and those 262 s run in the background.
 - **InfluxDB 3 Core did not complete**, in two separate runs: a query failed with `Resources exhausted` in
