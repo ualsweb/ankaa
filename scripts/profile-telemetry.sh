@@ -5,7 +5,7 @@
 #   scripts/profile-telemetry.sh [phase ...]
 #
 # Phases run in the order given (default: load tier queries functions restart queries functions):
-#   load       wipe $WORK, load the dataset, profile the whole load
+#   load       wipe $WORK, load the dataset, profile the server until the last row is in
 #   tier       profile the running server for $TIER_SECONDS (compression right after a load)
 #   queries    every query of bench/telemetry/queries, one profile each
 #   functions  latest, gapfill, percentiles and a few plain SQL shapes, one profile each
@@ -110,11 +110,17 @@ for phase in "${PHASES[@]}"; do
       [ -n "$SERVER" ] && stop
       rm -rf "$WORK/wal" "$WORK/segments"; config
       t0=$(date +%s.%N)
-      start perf record -q -e cpu-clock -F "$FREQ" -o "$OUT/load.data" --
+      start
+      # the profile covers the load only: it is attached to the server as soon as it is up and
+      # stopped when the last row is in (compression that goes on after it is the `tier` phase)
+      until [ -n "$(pid_of_server)" ]; do sleep 0.02; done
+      perf record -q -e cpu-clock -F "$FREQ" -p "$(pid_of_server)" -o "$OUT/load.data" &
+      PERF=$!
       wait_rows
       echo "load: $ROWS rows in $(echo "$(date +%s.%N) - $t0" | bc) s"
-      # the profile of the load ends with the process; report it after the server stops
-      STATE="loaded"; LOAD_PENDING=1 ;;
+      kill -INT "$PERF" 2>/dev/null; wait "$PERF" 2>/dev/null
+      report "$OUT/load.data" "load of $ROWS CSV rows (from server start to the last row)"
+      STATE="loaded" ;;
     tier)
       ensure_server
       # sealing, compression and segment writes (right after a load: the bulk of it)
@@ -136,9 +142,6 @@ for phase in "${PHASES[@]}"; do
       one tiny --sql "SELECT 1" ;;
     restart)
       [ -n "$SERVER" ] && stop
-      if [ -n "${LOAD_PENDING:-}" ]; then
-        report "$OUT/load.data" "load of $ROWS CSV rows (whole process: load, what followed, shutdown)"; LOAD_PENDING=""
-      fi
       [ -f "$WORK/ankaad.toml" ] || config
       t0=$(date +%s.%N)
       start perf record -q -e cpu-clock -F "$FREQ" -o "$OUT/restart.data" --
@@ -151,7 +154,4 @@ for phase in "${PHASES[@]}"; do
   esac
 done
 [ -n "$SERVER" ] && stop
-if [ -n "${LOAD_PENDING:-}" ]; then
-  report "$OUT/load.data" "load of $ROWS CSV rows (whole process: load, what followed, shutdown)"
-fi
 echo "reports in $OUT/"
