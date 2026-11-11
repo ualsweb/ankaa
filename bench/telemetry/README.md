@@ -171,8 +171,13 @@ bench/telemetry/.venv/bin/python bench/telemetry/run.py --data-dir bench/telemet
   [capacity planning guide](https://questdb.com/docs/operations/capacity-planning/).
 - **ANKAA** — generated config (`work/ankaa/ankaad.toml`, written next to the WAL): `query_timeout_s = 600` (the
   others' timeouts are 10 min), `storage.warm_budget_mib` = 25 % of RAM (the share `timescaledb-tune` gives
-  `shared_buffers`), `resources.query_memory_mib` = 20 % of RAM (InfluxDB 3's default query memory pool); all
-  else default. Both are flags.
+  `shared_buffers`), `resources.query_memory_mib` = 20 % of RAM (InfluxDB 3's default query memory pool), both
+  flags; `storage.max_open_age_s = 60` (default 600), for the reason InfluxDB runs with a one-minute snapshot age:
+  rows that stopped arriving are compressed and persisted after a minute, so the at-rest state (everything in
+  segments, the log cut) is reached about two minutes after the load. The harness waits for it
+  (`wait_persisted`: at least 130 s, then tiers and WAL size unchanged for 75 s) before it measures disk and
+  runs the queries, as it waits for TimescaleDB's columnstore conversion and InfluxDB's Parquet persist. All
+  else default.
 
 If you change a setting for a published run, say so in the report and commit the change here.
 
