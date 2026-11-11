@@ -26,7 +26,7 @@ jobs:
           # Amazon Linux 2023, RHEL 9…), and the debian12 runtime image has 2.36
           - { platform: linux-arm64, runner: ubuntu-22.04-arm, docker: arm64 }
           - { platform: linux-amd64, runner: ubuntu-22.04, docker: amd64 }
-          - { platform: macos-arm64, runner: macos-14, docker: "" }
+          - { platform: macos-arm64, runner: macos-latest, docker: "" }   # Apple silicon
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
