@@ -268,8 +268,33 @@ pub async fn run(
             }
         }
     }
-    let _ = client.try_disconnect();
+    flush_on_shutdown(source_id, &client, &mut events).await;
     stats
+}
+
+/// Acknowledgements are requests queued to the event loop: unless it runs once more they are
+/// never written, and the broker hands the last messages to the next start again (stored a second
+/// time where their timestamp is the newest of their partition). The disconnect is queued after
+/// them, so once it has gone out, every acknowledgement before it has too. Bounded to 2 s.
+async fn flush_on_shutdown(source_id: u16, client: &AsyncClient, events: &mut EventLoop) {
+    if client.try_disconnect().is_err() {
+        return;
+    }
+    let flushed = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match events.poll().await {
+                Ok(Event::Outgoing(rumqttc::Outgoing::Disconnect)) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    if flushed.is_err() {
+        tracing::warn!(
+            source_id,
+            "mqtt: acknowledgements not flushed within 2 s at shutdown; the broker may deliver the last messages again"
+        );
+    }
 }
 
 /// Which edge nodes have published a BIRTH since the source started, and when a rebirth was
