@@ -72,6 +72,7 @@ pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udtf("percentiles", Arc::new(PercentilesFn { ctx: ctx.clone() }));
     ctx.register_udtf("rolling", Arc::new(RollingFn { ctx: ctx.clone() }));
     ctx.register_udtf("gapfill", Arc::new(GapfillFn { ctx: ctx.clone() }));
+    ctx.register_udtf("latest", Arc::new(LatestFn { ctx: ctx.clone() }));
     ctx.register_udaf(datafusion::logical_expr::AggregateUDF::from(
         crate::vwap::Vwap::default(),
     ));
@@ -1489,6 +1490,72 @@ impl TableFunctionImpl for GapfillFn {
         });
         Ok(Arc::new(LazyTable {
             name: "gapfill",
+            schema,
+            compute,
+        }))
+    }
+}
+
+struct LatestFn {
+    ctx: SessionContext,
+}
+
+impl std::fmt::Debug for LatestFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("LatestFn")
+    }
+}
+
+/// `latest('table' [, 'key'])`: the newest row of every value of the `dict` column `key`
+/// (default `symbol`), with all the columns of the table: "the last reading of every device".
+/// The newest row is the one with the greatest timestamp, the last stored among equals. Rows
+/// come in no particular order.
+///
+/// The work follows the number of key values, not the rows of the table (see
+/// [`ChunkTable::latest`]): on a table partitioned by the key nothing is scanned.
+impl TableFunctionImpl for LatestFn {
+    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        let table = arg_str(args, 0, "latest")?;
+        let key = if args.len() > 1 {
+            arg_str(args, 1, "latest")?
+        } else {
+            "symbol".to_owned()
+        };
+        if args.len() > 2 {
+            return plan_err!("latest: at most two arguments (table, key)");
+        }
+        let provider = match self.ctx.table_provider(table.as_str()).now_or_never() {
+            Some(Ok(p)) => p,
+            Some(Err(e)) => return Err(e),
+            None => return plan_err!("table {table} cannot be resolved while planning"),
+        };
+        let Some(chunks) = provider.downcast_ref::<crate::ChunkTable>() else {
+            return plan_err!(
+                "latest: {table} is not a stored table (it reads the tables of [[tables]] and the market tables)"
+            );
+        };
+        let schema = provider.schema();
+        let key_col = schema.index_of(&key).map_err(|_| {
+            DataFusionError::Plan(format!("latest: table {table} has no column {key}"))
+        })?;
+        if chunks.ankaa_schema().fields()[key_col].ty != ankaa_store::ColumnType::DictU32 {
+            return plan_err!("latest: column {key} of {table} is not a dict column");
+        }
+        let compute: Compute = Arc::new(move |projection| {
+            let provider = provider.clone();
+            async move {
+                blocking(move || {
+                    let Some(chunks) = provider.downcast_ref::<crate::ChunkTable>() else {
+                        return Err(DataFusionError::Internal("latest: table changed".into()));
+                    };
+                    chunks.latest(key_col, projection.as_deref())
+                })
+                .await
+            }
+            .boxed()
+        });
+        Ok(Arc::new(LazyTable {
+            name: "latest",
             schema,
             compute,
         }))

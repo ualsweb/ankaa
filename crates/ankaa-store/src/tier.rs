@@ -144,6 +144,38 @@ pub trait EncodedChunk: Send + Sync + Debug {
             .map(|c| (c, None))
             .collect())
     }
+    /// [`Self::decode_nullable`] for the rows `rows` only (clamped to the chunk): the columns
+    /// returned hold `rows.len()` values. A query for an hour of a chunk that spans days reads
+    /// the rows of that hour, not the chunk. The default decodes everything and cuts; an
+    /// encoding that can address rows (bit-packed blocks, frame of reference, ALP) overrides it
+    /// and decodes only the blocks the range touches.
+    fn decode_rows(
+        &self,
+        projection: &[usize],
+        rows: core::ops::Range<usize>,
+    ) -> Result<Vec<NullableColumn>, DecodeError> {
+        let rows = clamp_rows(&rows, self.meta().num_rows);
+        Ok(self
+            .decode_nullable(projection)?
+            .into_iter()
+            .map(|(c, valid)| {
+                let rows = clamp_rows(&rows, c.len());
+                let valid = valid.map(|v| {
+                    v.get(rows.clone())
+                        .map(<[bool]>::to_vec)
+                        .unwrap_or_default()
+                });
+                (c.copy_range(rows), valid)
+            })
+            .collect())
+    }
+}
+
+/// `rows` cut to `0..len` (an empty range when it starts beyond the end).
+#[must_use]
+pub fn clamp_rows(rows: &core::ops::Range<usize>, len: usize) -> core::ops::Range<usize> {
+    let end = rows.end.min(len);
+    rows.start.min(end)..end
 }
 
 /// Whether chunks written with schema `old` can be read as `new`: the columns of `old` come
@@ -220,10 +252,19 @@ impl Evolved {
     fn assemble<T>(
         &self,
         projection: &[usize],
+        stored: impl Iterator<Item = T>,
+        added: impl Fn(ColumnType, usize) -> T,
+    ) -> Vec<T> {
+        self.assemble_rows(projection, self.meta.num_rows, stored, added)
+    }
+
+    fn assemble_rows<T>(
+        &self,
+        projection: &[usize],
+        n: usize,
         mut stored: impl Iterator<Item = T>,
         added: impl Fn(ColumnType, usize) -> T,
     ) -> Vec<T> {
-        let n = self.meta.num_rows;
         projection
             .iter()
             .filter_map(|&i| {
@@ -290,6 +331,29 @@ impl EncodedChunk for Evolved {
         Ok(self.assemble(projection, stored.into_iter(), |ty, n| {
             (zeroed(ty, n), Some(vec![false; n]))
         }))
+    }
+
+    fn decode_rows(
+        &self,
+        projection: &[usize],
+        rows: core::ops::Range<usize>,
+    ) -> Result<Vec<NullableColumn>, DecodeError> {
+        let rows = clamp_rows(&rows, self.meta.num_rows);
+        let inner: Vec<usize> = projection
+            .iter()
+            .copied()
+            .filter(|&i| i < self.stored)
+            .collect();
+        let stored = if inner.is_empty() {
+            Vec::new()
+        } else {
+            self.inner.decode_rows(&inner, rows.clone())?
+        };
+        Ok(
+            self.assemble_rows(projection, rows.len(), stored.into_iter(), |ty, n| {
+                (zeroed(ty, n), Some(vec![false; n]))
+            }),
+        )
     }
 }
 

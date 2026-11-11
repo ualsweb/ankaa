@@ -351,6 +351,7 @@ impl Encoder {
         &self,
         cold: &ColdChunk,
         projection: &[usize],
+        rows: Option<core::ops::Range<usize>>,
     ) -> Result<Vec<NullableColumn>, TierError> {
         let bytes = std::fs::read(&cold.path).map_err(io_err(&cold.path))?;
         let file = self
@@ -362,11 +363,11 @@ impl Encoder {
         let expr = select(names.iter().map(String::as_str).collect::<Vec<_>>(), root())
             .bind(file.dtype())?
             .optimize_recursive()?;
-        let array = file
-            .scan()?
-            .with_projection(expr)
-            .into_array_iter(&self.runtime)?
-            .read_all()?;
+        let mut scan = file.scan()?.with_projection(expr);
+        if let Some(rows) = rows {
+            scan = scan.with_row_range(rows.start as u64..rows.end as u64);
+        }
+        let array = scan.into_array_iter(&self.runtime)?.read_all()?;
         let mut ctx = self.session.create_execution_ctx();
         let arrow = self.session.arrow().execute_arrow(array, None, &mut ctx)?;
         let st = arrow
@@ -433,22 +434,32 @@ impl EncodedChunk for WarmChunk {
             .collect())
     }
     fn decode_nullable(&self, projection: &[usize]) -> Result<Vec<NullableColumn>, DecodeError> {
+        self.decode_rows(projection, 0..self.meta.num_rows)
+    }
+    /// Only the rows asked for are decoded: the slice of a compressed array is taken in constant
+    /// time and decoding it touches the blocks it covers.
+    fn decode_rows(
+        &self,
+        projection: &[usize],
+        rows: core::ops::Range<usize>,
+    ) -> Result<Vec<NullableColumn>, DecodeError> {
         let fields = self.meta.schema.fields();
+        let err = |msg: String| DecodeError {
+            tier: Tier::Warm,
+            id: self.meta.id,
+            msg,
+        };
         projection
             .iter()
             .map(|&i| {
-                let f = fields.get(i).ok_or_else(|| DecodeError {
-                    tier: Tier::Warm,
-                    id: self.meta.id,
-                    msg: format!("column {i} out of range"),
-                })?;
+                let (Some(f), Some(column)) = (fields.get(i), self.columns.get(i)) else {
+                    return Err(err(format!("column {i} out of range")));
+                };
+                let rows = ankaa_store::clamp_rows(&rows, column.len());
+                let part = column.slice(rows).map_err(|e| err(e.to_string()))?;
                 self.enc
-                    .decompress_column(&f.name, f.ty, &self.columns[i])
-                    .map_err(|e| DecodeError {
-                        tier: Tier::Warm,
-                        id: self.meta.id,
-                        msg: e.to_string(),
-                    })
+                    .decompress_column(&f.name, f.ty, &part)
+                    .map_err(|e| err(e.to_string()))
             })
             .collect()
     }
@@ -499,7 +510,23 @@ impl EncodedChunk for ColdChunk {
     }
     fn decode_nullable(&self, projection: &[usize]) -> Result<Vec<NullableColumn>, DecodeError> {
         self.enc
-            .read_cold(self, projection)
+            .read_cold(self, projection, None)
+            .map_err(|e| DecodeError {
+                tier: Tier::Cold,
+                id: self.meta.id,
+                msg: e.to_string(),
+            })
+    }
+    /// The file's layout is asked for the row range: only the pieces of each projected column
+    /// that hold those rows are decoded.
+    fn decode_rows(
+        &self,
+        projection: &[usize],
+        rows: core::ops::Range<usize>,
+    ) -> Result<Vec<NullableColumn>, DecodeError> {
+        let rows = ankaa_store::clamp_rows(&rows, self.meta.num_rows);
+        self.enc
+            .read_cold(self, projection, Some(rows))
             .map_err(|e| DecodeError {
                 tier: Tier::Cold,
                 id: self.meta.id,
@@ -681,5 +708,110 @@ mod tests {
         }
         // a column with no NULL in this chunk reports no validity
         assert!(warm.decode_nullable(&[4]).unwrap()[0].1.is_none());
+    }
+
+    /// A sensors chunk with `NULL`s in three columns.
+    fn sensors(rows: i64) -> Chunk {
+        let schema = Schema::new(vec![
+            ankaa_store::Field::new("ts", ColumnType::TimestampNs),
+            ankaa_store::Field::new("device", ColumnType::DictU32),
+            ankaa_store::Field::nullable("temp", ColumnType::Float64),
+            ankaa_store::Field::nullable("count", ColumnType::Int64),
+            ankaa_store::Field::nullable("state", ColumnType::U8),
+        ])
+        .unwrap();
+        let mut c = Chunk::new(ChunkId(3), schema);
+        for i in 0..rows {
+            c.append_row(&[
+                Value::I64(1_000 + i * 10),
+                Value::U32((i % 4) as u32),
+                if i % 7 == 0 {
+                    Value::Null
+                } else {
+                    Value::F64(i as f64 / 10.0)
+                },
+                if i % 11 == 0 {
+                    Value::Null
+                } else {
+                    Value::I64(i * i)
+                },
+                if (2_000..2_100).contains(&i) {
+                    Value::Null
+                } else {
+                    Value::U8((i % 3) as u8)
+                },
+            ])
+            .unwrap();
+        }
+        c.seal();
+        c
+    }
+
+    /// Decoding a row range gives exactly those rows of the whole decode, values and `NULL`s,
+    /// in the warm and the cold tier and through the schema-evolution adapter: at block edges
+    /// (1,024 rows), for one row, for the last row, for an empty range and beyond the end.
+    #[test]
+    fn a_row_range_decodes_like_the_rows_of_the_whole() {
+        let enc = Arc::new(Encoder::new());
+        let dir = tempfile::tempdir().unwrap();
+        let ranges = [
+            0..0,
+            0..1,
+            0..1_024,
+            1..1_023,
+            1_023..1_025,
+            1_024..2_048,
+            1_999..2_101,
+            2_050..2_051,
+            4_999..5_000,
+            3_000..5_000,
+            0..5_000,
+            4_990..9_000,
+            7_000..8_000,
+        ];
+        for (table, chunk) in [("trades", chunk(5_000)), ("sensors", sensors(5_000))] {
+            let all: Vec<usize> = (0..chunk.schema().fields().len()).collect();
+            let warm = enc.encode_warm(table, 0, &chunk).unwrap();
+            let cold = enc.write_cold(dir.path(), &warm).unwrap();
+            // read as a table that gained a nullable column since the chunk was written
+            let mut fields = chunk.schema().fields().to_vec();
+            fields.push(ankaa_store::Field::nullable("added", ColumnType::Float64));
+            let evolved = ankaa_store::Evolved::wrap(
+                Arc::clone(&warm) as Arc<dyn EncodedChunk>,
+                &Schema::new(fields).unwrap(),
+            )
+            .unwrap();
+            let mut wide = all.clone();
+            wide.push(all.len());
+            let tiers: [(&str, &dyn EncodedChunk, &[usize]); 3] = [
+                ("warm", warm.as_ref(), &all),
+                ("cold", cold.as_ref(), &all),
+                ("evolved", evolved.as_ref(), &wide),
+            ];
+            for (tier, e, projection) in tiers {
+                let whole = e.decode_nullable(projection).unwrap();
+                for r in &ranges {
+                    let part = e.decode_rows(projection, r.clone()).unwrap();
+                    let rows = ankaa_store::clamp_rows(r, 5_000);
+                    assert_eq!(part.len(), whole.len());
+                    for (i, ((col, valid), (wcol, wvalid))) in part.iter().zip(&whole).enumerate() {
+                        let what = format!("{table} {tier} column {i} rows {r:?}");
+                        assert_eq!(col.len(), rows.len(), "{what}");
+                        assert!(same(col, &wcol.copy_range(rows.clone())), "{what}");
+                        // a range without a NULL may report no validity at all
+                        let want: Vec<bool> = wvalid
+                            .as_ref()
+                            .map_or_else(|| vec![true; rows.len()], |v| v[rows.clone()].to_vec());
+                        let got = valid.clone().unwrap_or_else(|| vec![true; rows.len()]);
+                        assert_eq!(got, want, "{what}");
+                    }
+                }
+                // a projection in another order, a column twice
+                let part = e.decode_rows(&[2, 0, 2], 100..200).unwrap();
+                assert!(same(&part[0].0, &whole[2].0.copy_range(100..200)));
+                assert!(same(&part[1].0, &whole[0].0.copy_range(100..200)));
+                assert!(same(&part[2].0, &part[0].0));
+            }
+        }
     }
 }

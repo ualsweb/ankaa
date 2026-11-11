@@ -92,6 +92,9 @@ struct KeyPred {
     negated: bool,
 }
 
+/// Rows per batch of a [`ChunkTable::latest`] result.
+const LATEST_BATCH_ROWS: usize = 8192;
+
 /// What a [`KeyPred`] says about a chunk from the range of ids it holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
@@ -280,6 +283,157 @@ impl ChunkTable {
     #[must_use]
     pub fn ankaa_schema(&self) -> &AnkaaSchema {
         &self.ankaa_schema
+    }
+
+    /// The newest row of every value of the `dict` column `key`: the row with the greatest
+    /// timestamp, the last stored one among equals. `projection` selects the columns (`None`:
+    /// all). The rows come in no particular order, in batches of at most 8,192.
+    ///
+    /// The cost follows the number of key values, not the rows of the table. A chunk that holds
+    /// one key value (every chunk of a table partitioned by the key) is judged from its
+    /// statistics: its last row is its newest, since the rows of a chunk are in time order.
+    /// Only the chunks that hold a winner are read, and of those only the winning row
+    /// ([`ankaa_store::EncodedChunk::decode_rows`]). A chunk that mixes key values has its key
+    /// and timestamp columns read to find the newest row of each.
+    pub fn latest(&self, key: usize, projection: Option<&[usize]>) -> Result<Vec<RecordBatch>> {
+        let fields = self.ankaa_schema.fields();
+        if !fields
+            .get(key)
+            .is_some_and(|f| f.ty == ankaa_store::ColumnType::DictU32)
+        {
+            return datafusion::common::plan_err!("latest: the key is not a dict column");
+        }
+        let projection: Vec<usize> =
+            projection.map_or_else(|| (0..fields.len()).collect(), <[usize]>::to_vec);
+        let out_schema = Arc::new(self.schema.project(&projection)?);
+        let dicts: Vec<Option<arrow::array::ArrayRef>> = projection
+            .iter()
+            .map(|&c| self.names_of(c).map(|n| n.values()))
+            .collect();
+        let chunks = self.chunks.read().clone();
+        let wanted = self.newest_rows(&chunks, key)?;
+        if projection.is_empty() {
+            // `count(*)`: the rows are counted, none of their columns is read
+            let rows =
+                arrow::record_batch::RecordBatchOptions::new().with_row_count(Some(wanted.len()));
+            return Ok(vec![RecordBatch::try_new_with_options(
+                out_schema,
+                Vec::new(),
+                &rows,
+            )?]);
+        }
+        let mut parts: Vec<RecordBatch> = Vec::new();
+        let mut from = 0;
+        while from < wanted.len() {
+            let ci = wanted[from].0;
+            let to = from + wanted[from..].partition_point(|&(c, _)| c == ci);
+            let rows: Vec<usize> = wanted[from..to].iter().map(|&(_, r)| r).collect();
+            from = to;
+            let (Some(&first), Some(&last), Some(chunk)) =
+                (rows.first(), rows.last(), chunks.get(ci))
+            else {
+                continue;
+            };
+            let span = first..last + 1;
+            let cols = match chunk {
+                ChunkRef::Hot(c) => {
+                    ChunkColumns::hot(c, &projection, span.clone(), out_schema.clone(), &dicts)?
+                }
+                ChunkRef::Encoded(e) => encoded_range(
+                    e.as_ref(),
+                    &projection,
+                    span.clone(),
+                    None,
+                    &out_schema,
+                    &dicts,
+                )?,
+            };
+            let batch = cols.batch(0, span.len())?;
+            parts.push(if rows.len() == span.len() {
+                batch
+            } else {
+                let pick: arrow::array::UInt32Array = rows
+                    .iter()
+                    .map(|&r| u32::try_from(r - first).unwrap_or(u32::MAX))
+                    .collect();
+                arrow::compute::take_record_batch(&batch, &pick)?
+            });
+        }
+        // one-row pieces make poor batches for whatever reads the result: put them together
+        let mut out = Vec::with_capacity(parts.len() / LATEST_BATCH_ROWS + 1);
+        let (mut start, mut held) = (0, 0);
+        for (i, p) in parts.iter().enumerate() {
+            held += p.num_rows();
+            if held >= LATEST_BATCH_ROWS || i + 1 == parts.len() {
+                out.push(arrow::compute::concat_batches(
+                    &out_schema,
+                    &parts[start..=i],
+                )?);
+                (start, held) = (i + 1, 0);
+            }
+        }
+        Ok(out)
+    }
+
+    /// `(chunk, row)` of the newest row of every value of the `dict` column `key`, sorted.
+    fn newest_rows(&self, chunks: &[ChunkRef], key: usize) -> Result<Vec<(usize, usize)>> {
+        use arrow::array::AsArray;
+        use datafusion::error::DataFusionError;
+        // per key id, the newest row seen so far: (timestamp, chunk, row)
+        let mut newest: Vec<Option<(i64, usize, usize)>> = Vec::new();
+        let mut consider = |id: u32, ts: i64, chunk: usize, row: usize| {
+            let id = id as usize;
+            if id >= newest.len() {
+                newest.resize(id + 1, None);
+            }
+            // `>=`: among equal timestamps the row stored last wins
+            if newest[id].is_none_or(|(best, _, _)| ts >= best) {
+                newest[id] = Some((ts, chunk, row));
+            }
+        };
+        let ids_schema = Arc::new(arrow_schema(&self.ankaa_schema).project(&[0, key])?);
+        for (ci, chunk) in chunks.iter().enumerate() {
+            let Some((_, ts_max)) = chunk.time_range() else {
+                continue; // empty
+            };
+            match chunk.u32_range(key) {
+                Some((lo, hi)) if lo == hi => consider(lo, ts_max, ci, chunk.num_rows() - 1),
+                _ => {
+                    let Some(cols) = chunk_columns(
+                        chunk,
+                        &[0, key],
+                        TimeBounds::default(),
+                        usize::MAX,
+                        &ids_schema,
+                        &[],
+                    )?
+                    else {
+                        continue;
+                    };
+                    let batch = cols.batch(0, cols.num_rows())?;
+                    let ts = batch
+                        .column(0)
+                        .as_primitive_opt::<arrow::datatypes::TimestampNanosecondType>()
+                        .ok_or_else(|| DataFusionError::Internal("latest: ts type".into()))?
+                        .values();
+                    let ids = batch
+                        .column(1)
+                        .as_primitive_opt::<arrow::datatypes::UInt32Type>()
+                        .ok_or_else(|| DataFusionError::Internal("latest: key type".into()))?
+                        .values();
+                    for (row, (&t, &id)) in ts.iter().zip(ids.iter()).enumerate() {
+                        consider(id, t, ci, row);
+                    }
+                }
+            }
+        }
+        let mut wanted: Vec<(usize, usize)> = newest
+            .iter()
+            .flatten()
+            .map(|&(_, chunk, row)| (chunk, row))
+            .collect();
+        wanted.sort_unstable();
+        Ok(wanted)
     }
 
     /// Extract `[lo, hi]` from filters of the form `ts <op> literal` / `literal <op> ts` /
@@ -964,8 +1118,13 @@ fn hot_columns(
     )?))
 }
 
-/// Columns of one encoded chunk: decode the timestamp column plus the projection, find the row
-/// range by binary search on the (sorted) timestamps.
+/// Columns of one encoded chunk, cut to the time bounds and to `remaining` rows.
+///
+/// The timestamps of a chunk are sorted, so the bounds are a row range: with bounds, the
+/// timestamp column is decoded first and searched, and the other columns are decoded **for
+/// that range only** ([`ankaa_store::EncodedChunk::decode_rows`]). A query for an hour of one
+/// device out of a chunk that holds three days decodes that hour, not the three days; a `LIMIT`
+/// without bounds decodes the first rows only.
 fn encoded_columns(
     e: &dyn ankaa_store::EncodedChunk,
     projection: &[usize],
@@ -975,20 +1134,59 @@ fn encoded_columns(
     dicts: &[Option<arrow::array::ArrayRef>],
 ) -> Result<Option<ChunkColumns>> {
     use datafusion::error::DataFusionError;
+    let external = |err| DataFusionError::External(Box::new(err));
+    let total = e.meta().num_rows;
+    let bounded = bounds != TimeBounds::default();
+    // the timestamps, decoded once: to find the rows and, when projected, as a column
+    let mut ts: Option<(ankaa_store::Column, Option<Vec<bool>>)> = None;
+    let mut rows = 0..total;
+    if bounded {
+        let col = e.decode_nullable(&[0]).map_err(external)?.pop();
+        let values = col
+            .as_ref()
+            .and_then(|(c, _)| c.as_i64())
+            .ok_or_else(|| DataFusionError::Internal("ts not i64".into()))?;
+        let start = values.partition_point(|&t| t < bounds.lo);
+        rows = start..values.partition_point(|&t| t <= bounds.hi).max(start);
+        ts = col;
+    }
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    if rows.len() > remaining {
+        rows.end = rows.start + remaining;
+    }
+    encoded_range(e, projection, rows, ts, schema, dicts).map(Some)
+}
+
+/// The projected columns of rows `rows` of an encoded chunk. `ts` is the chunk's timestamp
+/// column when the caller has already decoded it whole (it is cut to the range here).
+fn encoded_range(
+    e: &dyn ankaa_store::EncodedChunk,
+    projection: &[usize],
+    rows: core::ops::Range<usize>,
+    ts: Option<(ankaa_store::Column, Option<Vec<bool>>)>,
+    schema: &SchemaRef,
+    dicts: &[Option<arrow::array::ArrayRef>],
+) -> Result<ChunkColumns> {
+    use datafusion::error::DataFusionError;
+    let external = |err| DataFusionError::External(Box::new(err));
+    let whole = rows.len() == e.meta().num_rows;
     // each column decoded once, also when the projection names it twice
-    let mut want: Vec<usize> = Vec::with_capacity(projection.len() + 1);
+    let mut want: Vec<usize> = Vec::with_capacity(projection.len());
     for &ci in projection {
-        if !want.contains(&ci) {
+        let have_ts = ci == 0 && ts.is_some();
+        if !have_ts && !want.contains(&ci) {
             want.push(ci);
         }
     }
-    let bounded = bounds != TimeBounds::default();
-    if bounded && !want.contains(&0) {
-        want.push(0);
-    }
-    let cols = e
-        .decode_nullable(&want)
-        .map_err(|err| DataFusionError::External(Box::new(err)))?;
+    let cols = if want.is_empty() {
+        Vec::new()
+    } else if whole {
+        e.decode_nullable(&want).map_err(external)?
+    } else {
+        e.decode_rows(&want, rows.clone()).map_err(external)?
+    };
     if cols.len() != want.len() {
         return Err(DataFusionError::Internal(format!(
             "segment decoded {} of {} columns",
@@ -996,37 +1194,36 @@ fn encoded_columns(
             want.len()
         )));
     }
-    let total = e.meta().num_rows;
-    let mut rows = if bounded {
-        let ts = want
-            .iter()
-            .position(|&i| i == 0)
-            .and_then(|p| cols.get(p))
-            .and_then(|(c, _)| c.as_i64())
-            .ok_or_else(|| DataFusionError::Internal("ts not i64".into()))?;
-        let start = ts.partition_point(|&t| t < bounds.lo);
-        start..ts.partition_point(|&t| t <= bounds.hi).max(start)
-    } else {
-        0..total
-    };
-    if rows.is_empty() {
-        return Ok(None);
-    }
-    if rows.len() > remaining {
-        rows.end = rows.start + remaining;
-    }
+    // the timestamps were decoded whole: cut them to the range like the other columns
+    let ts = ts.map(|(c, valid)| {
+        if whole {
+            (c, valid)
+        } else {
+            let valid = valid.map(|v| {
+                v.get(rows.clone())
+                    .map(<[bool]>::to_vec)
+                    .unwrap_or_default()
+            });
+            (c.copy_range(rows.clone()), valid)
+        }
+    });
     let fields = e.meta().schema.fields();
     let mut decoded: Vec<Option<(ankaa_store::Column, Option<Vec<bool>>)>> =
         cols.into_iter().map(Some).collect();
+    let mut ts = ts;
     let mut typed: Vec<(
         ankaa_store::ColumnType,
         ankaa_store::Column,
         Option<Vec<bool>>,
     )> = Vec::with_capacity(projection.len());
     for (n, &ci) in projection.iter().enumerate() {
-        let pos = want.iter().position(|&w| w == ci).unwrap_or(0);
         let again = projection[n + 1..].contains(&ci);
-        let col = match decoded.get_mut(pos) {
+        let slot = match want.iter().position(|&w| w == ci) {
+            Some(pos) => decoded.get_mut(pos),
+            None if ci == 0 => Some(&mut ts),
+            None => None,
+        };
+        let col = match slot {
             // the last use of a column takes it; an earlier one (rare) copies
             Some(slot) if again => slot.clone(),
             Some(slot) => slot.take(),
@@ -1037,14 +1234,16 @@ fn encoded_columns(
                 "segment has no column {ci}"
             )));
         };
+        if col.len() != rows.len() {
+            return Err(DataFusionError::Internal(format!(
+                "segment column {ci} decoded {} rows for a range of {}",
+                col.len(),
+                rows.len()
+            )));
+        }
         typed.push((f.ty, col, valid));
     }
-    Ok(Some(ChunkColumns::decoded(
-        typed,
-        rows,
-        schema.clone(),
-        dicts,
-    )?))
+    ChunkColumns::decoded(typed, 0..rows.len(), schema.clone(), dicts)
 }
 
 impl DisplayAs for ChunkScanExec {
