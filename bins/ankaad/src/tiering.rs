@@ -727,7 +727,10 @@ mod tests {
         assert_eq!(tier.relieve_memory(&tables, budget, None), (0, 1));
         assert_eq!(open(&tables), vec![3_000, 0]);
         // the age limit seals what is left, whatever the budget
-        assert_eq!(tier.relieve_memory(&tables, 0, Some(Duration::ZERO)), (1, 0));
+        assert_eq!(
+            tier.relieve_memory(&tables, 0, Some(Duration::ZERO)),
+            (1, 0)
+        );
         assert_eq!(open(&tables), vec![0, 0]);
         // the sealed chunks leave the hot tier (the hot window of 4 does not keep them)
         for _ in 0..10 {

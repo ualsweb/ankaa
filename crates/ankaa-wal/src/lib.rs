@@ -582,10 +582,13 @@ mod tests {
             );
         }
         assert_eq!(wa.buf, wb.buf);
-        let before = (wb.buf.len(), wb.next_lsn);
-        let too_big = wb.append_with(1, |buf| buf.resize(buf.len() + MAX_PAYLOAD + 1, 0));
-        assert!(matches!(too_big, Err(WalError::TooLarge(n)) if n == MAX_PAYLOAD + 1));
-        assert_eq!((wb.buf.len(), wb.next_lsn), before);
+        // 64 MiB of payload: seconds natively, hours under Miri (which checks the rest)
+        if !cfg!(miri) {
+            let before = (wb.buf.len(), wb.next_lsn);
+            let too_big = wb.append_with(1, |buf| buf.resize(buf.len() + MAX_PAYLOAD + 1, 0));
+            assert!(matches!(too_big, Err(WalError::TooLarge(n)) if n == MAX_PAYLOAD + 1));
+            assert_eq!((wb.buf.len(), wb.next_lsn), before);
+        }
         wb.commit().unwrap();
         let (recs, err) = all(b.path());
         assert!(err.is_none());
