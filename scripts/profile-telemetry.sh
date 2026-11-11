@@ -2,7 +2,16 @@
 # Function-level profile of the engine on the telemetry (TSBS cpu-only) dataset: where the CPU goes
 # while it loads, compresses, restarts and answers each kind of query.
 #
-#   scripts/profile-telemetry.sh [phase ...]      phases: load tier restart queries functions (default: all)
+#   scripts/profile-telemetry.sh [phase ...]
+#
+# Phases run in the order given (default: load tier queries functions restart queries functions):
+#   load       wipe $WORK, load the dataset, profile the whole load
+#   tier       profile the running server for $TIER_SECONDS (compression right after a load)
+#   queries    every query of bench/telemetry/queries, one profile each
+#   functions  latest, gapfill, percentiles and a few plain SQL shapes, one profile each
+#   restart    stop the server and profile its start from the segments and the log
+# Queries are profiled against the server as it is at that point: "loaded" (rows just arrived, part
+# of them still uncompressed) or "restarted" (everything read from segment files).
 #
 # Needs, on an aarch64 Linux host: `perf`, a release build with symbols (`cargo build --release -p
 # ankaad`; the profile keeps debug info), the dataset of bench/telemetry (generate.py) and its
@@ -26,7 +35,8 @@ FREQ="${FREQ:-1999}"
 FLIGHT_PORT=50081
 METRICS_PORT=9181
 export ANKAA_TOKEN="${ANKAA_TOKEN:-profile-token}"
-PHASES=("$@"); [ ${#PHASES[@]} -eq 0 ] && PHASES=(load tier restart queries functions)
+PHASES=("$@"); [ ${#PHASES[@]} -eq 0 ] && PHASES=(load tier queries functions restart queries functions)
+TIER_SECONDS="${TIER_SECONDS:-45}"
 
 mkdir -p "$OUT" "$WORK"
 [ -x "$ANKAAD" ] || { echo "no $ANKAAD: cargo build --release -p ankaad" >&2; exit 1; }
@@ -68,62 +78,75 @@ start() { # [perf record prefix...]
 wait_rows() { until [ "$(metric ankaa_user_rows_total)" = "$ROWS" ] 2>/dev/null; do sleep 0.2; kill -0 "$SERVER" 2>/dev/null || { tail -5 "$WORK/ankaad.log"; exit 1; }; done; }
 wait_ready() { until curl -s -o /dev/null -H "Authorization: Bearer $ANKAA_TOKEN" "http://127.0.0.1:$METRICS_PORT/metrics"; do sleep 0.05; kill -0 "$SERVER" 2>/dev/null || { tail -5 "$WORK/ankaad.log"; exit 1; }; done; }
 pid_of_server() { pgrep -n -x ankaad; }
-stop() { kill -TERM "$(pid_of_server)" 2>/dev/null; wait "$SERVER" 2>/dev/null; }
+stop() { kill -TERM "$(pid_of_server)" 2>/dev/null; wait "$SERVER" 2>/dev/null; SERVER=""; }
 
-has() { local p; for p in "${PHASES[@]}"; do [ "$p" = "$1" ] && return 0; done; return 1; }
+SERVER=""
+STATE="restarted"   # label of the reports: "loaded" right after a load, "restarted" from segments
 
-if has load; then
-  rm -rf "$WORK/wal" "$WORK/segments"; config
-  t0=$(date +%s.%N)
-  start perf record -q -e cpu-clock -F "$FREQ" -o "$OUT/load.data" --
-  wait_rows
-  t1=$(date +%s.%N)
-  echo "load: $ROWS rows in $(echo "$t1 - $t0" | bc) s"
-  if has tier; then
-    # the same server, right after the load: sealing, compression and segment writes
-    perf record -q -e cpu-clock -F "$FREQ" -p "$(pid_of_server)" -o "$OUT/tier.data" -- sleep 45
-  fi
-  stop
-  report "$OUT/load.data" "load of $ROWS CSV rows (whole process, until the server stopped)"
-  has tier && report "$OUT/tier.data" "45 s after the load: sealing, compression, segments"
-fi
-
-if has restart; then
-  [ -f "$WORK/ankaad.toml" ] || config
-  t0=$(date +%s.%N)
-  start perf record -q -e cpu-clock -F "$FREQ" -o "$OUT/restart.data" --
-  wait_ready; wait_rows 2>/dev/null
-  t1=$(date +%s.%N)
-  echo "restart: serving $ROWS rows again after $(echo "$t1 - $t0" | bc) s"
-  stop
-  report "$OUT/restart.data" "restart: recovery from segments and the log"
-fi
-
-if has queries || has functions; then
+ensure_server() { # start the server on what $WORK holds, when none is running
+  [ -n "$SERVER" ] && kill -0 "$SERVER" 2>/dev/null && return
   [ -f "$WORK/ankaad.toml" ] || config
   start; wait_ready; wait_rows 2>/dev/null
-  # let compression finish so that queries read the tiers a settled server has
-  sleep "${SETTLE:-20}"
-  one() { # <name> <loop_query args...>
-    local name="$1"; shift
-    "$PY" bench/telemetry/loop_query.py "$@" --seconds 2 --flight "grpc://127.0.0.1:$FLIGHT_PORT" --token "$ANKAA_TOKEN" > /dev/null
-    perf record -q -e cpu-clock -F "$FREQ" -p "$(pid_of_server)" -o "$OUT/q-$name.data" -- \
-      "$PY" bench/telemetry/loop_query.py "$@" --seconds "$SECONDS_PER_QUERY" --flight "grpc://127.0.0.1:$FLIGHT_PORT" --token "$ANKAA_TOKEN" \
-      > "$OUT/q-$name.client" 2>&1
-    report "$OUT/q-$name.data" "$name: $(cat "$OUT/q-$name.client")"
-  }
-  if has queries; then
-    for q in $("$PY" bench/telemetry/loop_query.py --list); do one "$q" --query "$q"; done
-  fi
-  if has functions; then
-    one gapfill --sql "SELECT hostname, bucket, value, filled FROM gapfill('cpu', 'usage_user', 60000000000, 'hostname', 'avg', 'linear', 1451692800000000000, 1451696400000000000)"
-    one percentiles --sql "SELECT hostname, count, p50, p99 FROM percentiles('cpu', 'usage_user', '0.5,0.99', 'hostname')"
-    one count-all --sql "SELECT count(*) FROM cpu"
-    one group-by-tag --sql "SELECT region, datacenter, count(*), avg(usage_user) FROM cpu GROUP BY region, datacenter"
-    one filter-tag --sql "SELECT count(*), max(usage_system) FROM cpu WHERE region = 'eu-west-1' AND usage_user > 50"
-    one like-tag --sql "SELECT count(*) FROM cpu WHERE hostname LIKE 'host_1%'"
-    one order-limit --sql "SELECT ts, hostname, usage_user FROM cpu WHERE hostname = 'host_7' ORDER BY ts DESC LIMIT 100"
-  fi
-  stop
+  sleep "${SETTLE:-10}"
+}
+
+one() { # <name> <loop_query args...>: profile the server while one statement runs in a loop
+  local name="$1-$STATE"; shift
+  "$PY" bench/telemetry/loop_query.py "$@" --seconds 2 --flight "grpc://127.0.0.1:$FLIGHT_PORT" --token "$ANKAA_TOKEN" > /dev/null
+  perf record -q -e cpu-clock -F "$FREQ" -p "$(pid_of_server)" -o "$OUT/q-$name.data" -- \
+    "$PY" bench/telemetry/loop_query.py "$@" --seconds "$SECONDS_PER_QUERY" --flight "grpc://127.0.0.1:$FLIGHT_PORT" --token "$ANKAA_TOKEN" \
+    > "$OUT/q-$name.client" 2>&1
+  report "$OUT/q-$name.data" "$name: $(cat "$OUT/q-$name.client")"
+}
+
+for phase in "${PHASES[@]}"; do
+  case "$phase" in
+    load)
+      [ -n "$SERVER" ] && stop
+      rm -rf "$WORK/wal" "$WORK/segments"; config
+      t0=$(date +%s.%N)
+      start perf record -q -e cpu-clock -F "$FREQ" -o "$OUT/load.data" --
+      wait_rows
+      echo "load: $ROWS rows in $(echo "$(date +%s.%N) - $t0" | bc) s"
+      # the profile of the load ends with the process; report it after the server stops
+      STATE="loaded"; LOAD_PENDING=1 ;;
+    tier)
+      ensure_server
+      # sealing, compression and segment writes (right after a load: the bulk of it)
+      perf record -q -e cpu-clock -F "$FREQ" -p "$(pid_of_server)" -o "$OUT/tier-$STATE.data" -- sleep "${TIER_SECONDS:-45}"
+      report "$OUT/tier-$STATE.data" "$TIER_SECONDS s of sealing, compression and segment writes ($STATE)" ;;
+    queries)
+      ensure_server
+      for q in $("$PY" bench/telemetry/loop_query.py --list); do one "$q" --query "$q"; done ;;
+    functions)
+      ensure_server
+      one latest --sql "SELECT * FROM latest('cpu', 'hostname')"
+      one gapfill --sql "SELECT hostname, bucket, value, filled FROM gapfill('cpu', 'usage_user', 60000000000, 'hostname', 'avg', 'linear', 1451692800000000000, 1451696400000000000)"
+      one percentiles --sql "SELECT hostname, count, p50, p99 FROM percentiles('cpu', 'usage_user', '0.5,0.99', 'hostname')"
+      one count-all --sql "SELECT count(*) FROM cpu"
+      one group-by-tag --sql "SELECT region, datacenter, count(*), avg(usage_user) FROM cpu GROUP BY region, datacenter"
+      one filter-tag --sql "SELECT count(*), max(usage_system) FROM cpu WHERE region = 'eu-west-1' AND usage_user > 50"
+      one like-tag --sql "SELECT count(*) FROM cpu WHERE hostname LIKE 'host_1%'"
+      one order-limit --sql "SELECT ts, hostname, usage_user FROM cpu WHERE hostname = 'host_7' ORDER BY ts DESC LIMIT 100"
+      one tiny --sql "SELECT 1" ;;
+    restart)
+      [ -n "$SERVER" ] && stop
+      if [ -n "${LOAD_PENDING:-}" ]; then
+        report "$OUT/load.data" "load of $ROWS CSV rows (whole process: load, what followed, shutdown)"; LOAD_PENDING=""
+      fi
+      [ -f "$WORK/ankaad.toml" ] || config
+      t0=$(date +%s.%N)
+      start perf record -q -e cpu-clock -F "$FREQ" -o "$OUT/restart.data" --
+      wait_ready; wait_rows 2>/dev/null
+      echo "restart: serving $ROWS rows again after $(echo "$(date +%s.%N) - $t0" | bc) s"
+      stop
+      report "$OUT/restart.data" "restart: recovery from segments and the log"
+      SERVER=""; STATE="restarted" ;;
+    *) echo "unknown phase $phase (load tier queries functions restart)" >&2; exit 2 ;;
+  esac
+done
+[ -n "$SERVER" ] && stop
+if [ -n "${LOAD_PENDING:-}" ]; then
+  report "$OUT/load.data" "load of $ROWS CSV rows (whole process: load, what followed, shutdown)"
 fi
 echo "reports in $OUT/"
