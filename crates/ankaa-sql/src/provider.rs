@@ -269,7 +269,9 @@ impl KeyPred {
         let Some((lo, hi)) = range else {
             return Verdict::Rows;
         };
-        let any_in = self.ids.iter().any(|&i| lo <= i && i <= hi);
+        // the ids are sorted: the first one at or above `lo` decides
+        let at = self.ids.partition_point(|&i| i < lo);
+        let any_in = self.ids.get(at).is_some_and(|&i| i <= hi);
         match (self.negated, lo == hi, any_in) {
             (false, _, false) | (true, true, true) => Verdict::Skip,
             (false, true, true) | (true, _, false) => Verdict::All,
@@ -366,6 +368,98 @@ impl ChunkTable {
         let Expr::Column(c) = e else { return None };
         let (i, _) = self.schema.column_with_name(&c.name)?;
         Some((i, self.names_of(i)?))
+    }
+
+    /// The column of `f` when `f` is a predicate on one `dict` column shown as strings and on
+    /// nothing else that varies by row (`host LIKE 'web-%'`, `upper(host) = 'DB-1'`,
+    /// `host > 'm'`, `host ~ '^edge'`): such a predicate has one answer per name.
+    fn names_only(&self, f: &Expr) -> Option<usize> {
+        use datafusion::common::tree_node::TreeNode;
+        let mut col: Option<usize> = None;
+        for c in f.column_refs() {
+            let (i, _) = self.schema.column_with_name(&c.name)?;
+            self.names_of(i)?;
+            if col.is_some_and(|seen| seen != i) {
+                return None;
+            }
+            col = Some(i);
+        }
+        // a subquery or a volatile function (`random()`) has no answer per name
+        let per_name = !f.is_volatile()
+            && !f
+                .exists(|e| {
+                    Ok(matches!(
+                        e,
+                        Expr::ScalarSubquery(_)
+                            | Expr::Exists(_)
+                            | Expr::InSubquery(_)
+                            | Expr::OuterReferenceColumn(..)
+                            | Expr::Placeholder(_)
+                    ))
+                })
+                .unwrap_or(true);
+        if per_name { col } else { None }
+    }
+
+    /// The predicate `f` on name column `col` ([`Self::names_only`]) as a predicate on ids: `f`
+    /// is evaluated once over the names of the dictionary, and the ids of the names it accepts
+    /// are what a chunk is judged by. A pattern is compiled once per query instead of once per
+    /// batch, a table partitioned by the column has whole chunks skipped or taken, and the work
+    /// follows the number of names, not the number of rows.
+    fn pred_over_names(&self, state: &dyn Session, f: &Expr, col: usize) -> Result<KeyPred> {
+        use arrow::array::{Array, AsArray, DictionaryArray, UInt32Array};
+        use datafusion::error::DataFusionError;
+        let internal = |what: &str| DataFusionError::Internal(format!("name predicate: {what}"));
+        let names = self.names_of(col).ok_or_else(|| internal("no names"))?;
+        let values = names.values();
+        let n = u32::try_from(values.len()).map_err(|_| internal("too many names"))?;
+        let field = self.schema.field(col).clone();
+        let schema = Arc::new(arrow::datatypes::Schema::new(vec![field]));
+        // every name once, typed as the column is
+        let one_each = DictionaryArray::<arrow::datatypes::UInt32Type>::try_new(
+            UInt32Array::from_iter_values(0..n),
+            values,
+        )?;
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(one_each)])?;
+        let df_schema = datafusion::common::DFSchema::try_from(schema.as_ref().clone())?;
+        let accepted = state
+            .create_physical_expr(f.clone(), &df_schema)?
+            .evaluate(&batch)?
+            .into_array(batch.num_rows())?;
+        let accepted = accepted
+            .as_boolean_opt()
+            .ok_or_else(|| internal("not a boolean"))?;
+        // NULL (the predicate is unknown for the name) rejects, as in a WHERE clause
+        let ids: Vec<u32> = (0..n)
+            .filter(|&i| accepted.is_valid(i as usize) && accepted.value(i as usize))
+            .collect();
+        Ok(KeyPred {
+            col,
+            ids,
+            negated: false,
+        })
+    }
+
+    /// The filters answered on dictionary ids, as id predicates and as they were written: the
+    /// shapes read off the expression ([`Self::key_pred`]) and any other predicate on one name
+    /// column, evaluated over its names ([`Self::pred_over_names`]).
+    fn id_preds(&self, state: &dyn Session, filters: &[Expr]) -> Result<(Vec<KeyPred>, Vec<Expr>)> {
+        let mut preds: Vec<KeyPred> = Vec::new();
+        let mut written: Vec<Expr> = Vec::new();
+        for f in filters {
+            let pred = match self.key_pred(f) {
+                Some(p) => Some(p),
+                None => match self.names_only(f) {
+                    Some(col) => Some(self.pred_over_names(state, f, col)?),
+                    None => None,
+                },
+            };
+            if let Some(p) = pred {
+                preds.push(p);
+                written.push(f.clone());
+            }
+        }
+        Ok((preds, written))
     }
 
     /// `f` as a predicate on dictionary ids, when it has one of the supported shapes.
@@ -885,7 +979,10 @@ impl TableProvider for ChunkTable {
         Ok(filters
             .iter()
             .map(|f| {
-                if self.exact_time_filter(f) || self.key_pred(f).is_some() {
+                if self.exact_time_filter(f)
+                    || self.key_pred(f).is_some()
+                    || self.names_only(f).is_some()
+                {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Inexact
@@ -906,7 +1003,7 @@ impl TableProvider for ChunkTable {
         let projection: Vec<usize> = projection
             .cloned()
             .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
-        let preds: Vec<KeyPred> = filters.iter().filter_map(|f| self.key_pred(f)).collect();
+        let (preds, name_filters) = self.id_preds(state, filters)?;
         let (all, index) = self.indexed();
         // prune on statistics now, so the plan shows what will be read and the partitions
         // below only hold chunks that can contribute rows
@@ -973,11 +1070,6 @@ impl TableProvider for ChunkTable {
                 wide_schema.clone(),
                 dicts,
             );
-            let name_filters: Vec<Expr> = filters
-                .iter()
-                .filter(|f| self.key_pred(f).is_some())
-                .cloned()
-                .collect();
             let Some(predicate) = datafusion::logical_expr::utils::conjunction(name_filters) else {
                 return datafusion::common::internal_err!("row filter without a predicate");
             };

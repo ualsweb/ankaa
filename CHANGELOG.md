@@ -120,6 +120,11 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   memory, compressed as on disk and with their footer parsed. A cold chunk read again skips the file read
   and the parse, which are most of the cost of a small cold read. Metrics `ankaa_segment_cache_bytes`,
   `ankaa_segment_cache_reads_total{from}`.
+- Predicates on one `dict` column that are not a comparison with a literal (`LIKE`, `<`, `upper(host) = …`,
+  regular expressions) are evaluated once over the names of the dictionary and answered by id, per chunk,
+  like `=` and `IN`. Before, they ran row by row and a pattern was compiled for every batch.
+- Scans prune on flat arrays of chunk statistics (a quarter of a small query went into asking 17,000
+  chunks one by one); the tiering tick sums tier sizes once instead of three times.
 - Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
   could hand the last messages to the next start again.
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on

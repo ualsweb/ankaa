@@ -41,8 +41,12 @@ concatenate, repartition or hash them.
 literals are taken by the table (`Exact` pushdown) and translated once per query into a set of ids. Per chunk
 the zone map of the id column gives one of three verdicts: *skip* (no id of the set in range, or the name was
 never seen), *all* (the chunk holds one id and it matches: a partition-key chunk), *rows*. Only when some chunk
-needs *rows* the scan is wrapped in a filter over the ids. Other string operations (`LIKE`, `<`, functions,
-comparison with a column) run in DataFusion on the dictionary arrays, row by row.
+needs *rows* the scan is wrapped in a filter over the ids. Any other predicate that involves one name column
+and nothing else that varies by row (`LIKE`, `<`, a function of the column, a regular expression) is evaluated
+once per query over the dictionary's names, typed as the column is, and the accepted ids go through the same
+three verdicts (`ChunkTable::pred_over_names`): measured on Axion, `LIKE` on a 1,000-name column over 26 M rows
+went from compiling the pattern for every batch (490 ms) to once. What needs the names of a row together with
+another column runs in DataFusion on the dictionary arrays, row by row.
 
 **Aggregates and table functions.** The dense aggregate path and the aggregate-before-join rewrite read the
 keys of a dictionary column and group on them as before; their output key is a dictionary over the same values.

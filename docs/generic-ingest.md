@@ -610,8 +610,12 @@ SQL, `text` over the Postgres protocol, so every driver and tool reads it.
 - `GROUP BY` and joins on the column hash the ids; inside the engine the names of a result are one
   shared array per dictionary, referenced by every batch. A string is written per row only for the
   rows that leave the server.
-- Everything else SQL does with strings (`LIKE`, `<`, `upper()`, `ORDER BY`, comparison with another
-  column) works on the names, row by row.
+- Any other predicate on one such column alone (`LIKE 'web-%'`, `host > 'm'`, `upper(host) = 'DB-1'`,
+  a regular expression) is evaluated once over the names of the dictionary and then answered by id
+  the same way: the work follows the number of names, not the number of rows, and a pattern is
+  compiled once per query.
+- What involves the names of a row together with something else (`host = other_column`, `ORDER BY`,
+  functions in the select list) works on the names, row by row.
 - Table functions keyed by a `dict` column (`gapfill`, `ohlcv`, `rolling`, `percentiles`, `asof_join`)
   and continuous-query tables return the key as names too. `asof_join` between tables that do not
   share the dictionary is refused, as before.

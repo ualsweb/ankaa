@@ -213,6 +213,22 @@ const QUERIES: &[&str] = &[
     "SELECT host, region FROM cpu WHERE n = 0 ORDER BY host DESC",
     "SELECT count(DISTINCT host), count(DISTINCT region) FROM cpu",
     "SELECT host FROM cpu WHERE host = 'db-1' LIMIT 3",
+    // predicates on one name column that are not a comparison with a literal: answered over the
+    // names of the dictionary, then by id
+    "SELECT host, count(*) FROM cpu WHERE host LIKE 'db%' GROUP BY host",
+    "SELECT count(*), sum(n) FROM cpu WHERE host NOT LIKE '%-1'",
+    "SELECT count(*) FROM cpu WHERE host LIKE 'nothing%'",
+    "SELECT count(*) FROM cpu WHERE host LIKE '%'",
+    "SELECT count(*) FROM cpu WHERE upper(host) = 'CACHE-1'",
+    "SELECT count(*) FROM cpu WHERE host >= 'db-2' AND host < 'web-2'",
+    "SELECT count(*) FROM cpu WHERE host BETWEEN 'cache-1' AND 'db-1'",
+    "SELECT count(*) FROM cpu WHERE character_length(host) = 4",
+    "SELECT count(*) FROM cpu WHERE region LIKE '%east%' AND host LIKE 'web%'",
+    "SELECT count(*) FROM cpu WHERE region ~ '^(eu|ap)-' AND n < 200",
+    "SELECT count(*) FROM cpu WHERE host IS NULL",
+    "SELECT count(*) FROM cpu WHERE host IS NOT NULL AND host <> region",
+    "SELECT count(*) FROM cpu WHERE host LIKE 'web%' OR region = 'eu-west'",
+    "SELECT region, count(*) FROM cpu WHERE substr(region, 1, 2) IN ('eu', 'us') GROUP BY region",
 ];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
