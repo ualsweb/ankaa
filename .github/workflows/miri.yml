@@ -31,10 +31,17 @@ jobs:
           components: miri, rust-src
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - run: cargo +nightly-2026-10-15 miri setup
-      - run: cargo +nightly-2026-10-15 miri test -p ankaa-ring -p ankaa-store -p ankaa-wal --no-default-features
+      # our own unsafe code (the SPSC ring; the SIMD kernels the store calls): strictest checks
+      - run: cargo +nightly-2026-10-15 miri test -p ankaa-ring -p ankaa-store --no-default-features
         env:
-          # tempfile/fs in WAL tests need isolation disabled; heavy tests are #[cfg_attr(miri, ignore)]
+          # heavy tests are #[cfg_attr(miri, ignore)]
           MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check -Zmiri-disable-isolation
+      # the WAL forbids unsafe code; its tests reach the crc32c crate, which finds 8-byte
+      # boundaries from the pointer's address. Correct on real hardware, but a documented false
+      # positive of -Zmiri-symbolic-alignment-check, so that one flag is left out here.
+      - run: cargo +nightly-2026-10-15 miri test -p ankaa-wal --no-default-features
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-disable-isolation
   loom:
     name: loom (SPSC ring models)
     runs-on: ubuntu-24.04-arm
