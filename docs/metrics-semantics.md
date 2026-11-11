@@ -182,7 +182,7 @@ open chunk of every partition is copied on each query-snapshot swap.
 | `ankaa_replication_wal_streams` | gauge | streams | WAL streams this server is serving to standbys right now (bounded by `replication.max_standbys`). |
 | `ankaa_replication_wal_refused_total` | counter | requests | WAL stream requests refused: wrong token, stream limit reached. Should stay flat; a rise is a misconfigured standby or a probe. |
 | `ankaa_user_rows_total` | counter | rows | Generic sources (`[[sources]]`): messages mapped into rows. |
-| `ankaa_user_rejected_total` | counter | messages | Generic sources: messages that produced no row: the mapper rejected them (bad JSON/CSV, missing field, bad number, dictionary full, timestamp more than a day ahead) or the table did (older than the newest row of the partition). Should stay flat. |
+| `ankaa_user_rejected_total` | counter | messages | Generic sources: messages that produced no row: the mapper rejected them (bad JSON, CSV or line protocol, missing field, bad number, dictionary full, timestamp more than a day ahead) or the table did (older than the newest row of the partition). Should stay flat. |
 | `ankaa_source_oversized_total` | counter | messages | Generic sources: messages larger than the source's `max_message_bytes`, dropped before parsing. Process-wide, live. |
 | `ankaa_source_positions_saved_total` | counter | positions | File and Kafka read positions made permanent (written to `sources.json` after the data before them became durable). Flat while a Kafka source is delivering means positions are not being saved: check `ankaa_wal_durable_lsn`. |
 | `ankaa_retention_expired_rows_total` | counter | rows | Rows dropped because they fell out of their table's retention window. |

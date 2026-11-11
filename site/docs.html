@@ -55,7 +55,7 @@
         <h3>Bring your own feed</h3>
         <ul class="doc-list">
           <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/tutorials/uns-historian.md">Tutorial: a historian for your Unified Namespace</a><span>MQTT topics to columns, NULLs, late gateway data, live aggregates, retention, in 15 minutes.</span></li>
-          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/generic-ingest.md">Tables and sources</a><span>MQTT, Kafka, NATS and files; JSON, CSV and Sparkplug B; topic mapping; batches; nullable columns; adding columns; late data; retention.</span></li>
+          <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/generic-ingest.md">Tables and sources</a><span>MQTT, Kafka, NATS and files; JSON, CSV, InfluxDB line protocol (Telegraf) and Sparkplug B; topic mapping; batches; nullable columns; adding columns; late data; retention.</span></li>
           <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/continuous-queries.md">Continuous queries</a><span>Bars, quantiles, rolling windows and ASOF joins kept up to date as rows arrive.</span></li>
           <li><a href="https://github.com/ualsweb/ankaa/blob/main/docs/temporal-architecture.md">Time semantics</a><span>Watermarks, ordering, lateness, scans in time order, how aggregates use it.</span></li>
           <li><a href="https://github.com/ualsweb/ankaa/blob/main/crates/ankaa-ingest/examples/custom_feed.rs">Custom binary feed</a><span>The framing helper for a protocol of your own.</span></li>
@@ -153,7 +153,7 @@
 <span class="c-key">[resources]</span>  query_memory_mib, memory_budget_mib, memlock_mib
 <span class="c-key">[feed]</span>       enabled, url, streams, depth_snapshots          <span class="c-dim"># built-in exchange feed (optional)</span>
 <span class="c-key">[[tables]]</span>   name, columns, partition_by, max_lateness_ms, retention, max_dict_entries
-<span class="c-key">[[sources]]</span>  name, kind (mqtt|kafka|nats|file), url (mqtt:// or mqtts://), subject, format (json|csv|sparkplug), table, map, rows, ts_unit, tls (kafka), tls_ca, tls_cert, tls_key, sasl_mechanism, sasl_username, sasl_password_env (kafka), sparkplug_rebirth
+<span class="c-key">[[sources]]</span>  name, kind (mqtt|kafka|nats|file), url (mqtt:// or mqtts://), subject, format (json|csv|line_protocol|sparkplug), table, map, rows, measurement, ts_unit, tls (kafka), tls_ca, tls_cert, tls_key, sasl_mechanism, sasl_username, sasl_password_env (kafka), sparkplug_rebirth
 <span class="c-key">[[continuous]]</span> name, kind (ohlcv|percentiles|rolling|asof), table, key, value, width_ns
 <span class="c-key">[replication]</span> serve_wal, standby_of
 

@@ -67,6 +67,8 @@ Profiling passes are recorded under `docs/benchmarks/`. Pass 1 (2026-11-09): dec
 | MQTT over TLS: certificate verification against public roots or a private CA, client certificates; tested against Mosquitto with TLS and mutual TLS in CI | done (2026-11-11) |
 | Several readings per message (`rows`) and a single-pass JSON scanner (no document tree, no allocation per message) | done (2026-11-11) |
 | Sparkplug B: one row per metric, BIRTH definitions (datatypes, aliases, transient flags) kept in the write-ahead log across restarts and truncation, opt-in rebirth requests; decoder checked against a reference protobuf codec and fuzzed; end to end against Mosquitto | done (2026-11-11) |
+| InfluxDB line protocol as a source format (`format = "line_protocol"`, any transport): Telegraf and the InfluxDB client libraries feed a table, columns filled by tag and field name, one measurement per source; parser checked against the InfluxDB 3 parser and fuzzed; independent of the transport | done (2026-11-11) |
+| Line protocol over HTTP (an InfluxDB-compatible write endpoint on the same parser and mapping) | planned |
 | Ingest engine: batched hand-off to the write-ahead log, one table lock per message, interrupt moderation of the ingest loop and the log thread (profiled end to end on Google Axion) | done (2026-11-11) |
 | Adding nullable columns to a table (and making a column nullable) without losing its history: old segments read as the new schema, nothing rewritten | done (2026-11-11) |
 | Gap filling and interpolation in SQL: `gapfill()` with `null`, `locf` and `linear` fills, seven aggregates, optional range; verified against DataFusion's own grouping | done (2026-11-11) |

@@ -78,8 +78,8 @@ snapshot_ms = 50
 # between batches so one wake-up takes many messages (invisible to queries, which see rows at
 # the next snapshot). 0 = off, at most 10000.
 ingest_coalesce_us = 200
-# Threads mapping JSON/CSV messages to rows in parallel (applied in log order: same result as one
-# thread). Unset = cores - 2, at most 32; 0 = map in the ingest loop.
+# Threads mapping JSON, CSV and line protocol messages to rows in parallel (applied in log order:
+# same result as one thread). Unset = cores - 2, at most 32; 0 = map in the ingest loop.
 # ingest_workers = 8
 
 [server]
@@ -135,6 +135,7 @@ token_env = "ANKAA_TOKEN"
 # table = "telemetry"
 # ts_unit = "millis"
 # map = { ts = "meta.time", rack = "meta.id", temp = "temp" }   # every column must be mapped
+#                                 # format: json | csv | line_protocol | sparkplug (mqtt only)
 # max_message_bytes = 1048576     # larger messages are dropped and counted
 # start = "latest"                # kafka: latest | earliest, when no position is saved yet
 #
@@ -180,6 +181,19 @@ token_env = "ANKAA_TOKEN"
 # table = "scada"                  # columns ts, node, device, metric (dict), value (float64, nullable)
 # map = { ts = "$timestamp", node = "$node", device = "$device", metric = "$metric", value = "$value" }
 # sparkplug_rebirth = false        # true: ask nodes that send DATA before their BIRTH to rebirth
+#
+# [[sources]]                      # InfluxDB line protocol (Telegraf, InfluxDB client libraries):
+# name = "telegraf-cpu"            # one row per line, on mqtt, kafka, nats or file
+# kind = "kafka"
+# url = "kafka:9092"
+# subject = "telegraf"
+# format = "line_protocol"
+# table = "cpu"                    # columns are filled by name from the tags and fields of a line;
+#                                  # the first column takes the line's timestamp
+# measurement = "cpu"              # optional: keep only the lines of this measurement
+# map = { irq = "interrupts" }     # optional: a column that reads another key, "$measurement"
+#                                  # or (mqtt) "$topic.N"
+# ts_unit = "nanos"                # seconds | millis | micros | nanos (default)
 #
 # [[continuous]]                   # incrementally maintained: cq_btc_1s and cq_btc_1s_live
 # name = "btc_1s"

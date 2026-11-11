@@ -45,6 +45,17 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   resolve aliases without a new BIRTH; opt-in rebirth requests (`sparkplug_rebirth`). Decoder checked
   against a reference protobuf codec and fuzzed (`sparkplug`). End to end on Google Axion: 505 k rows/s,
   1.1 µs of server CPU per row over MQTT.
+- InfluxDB line protocol sources (`format = "line_protocol"`, on MQTT, Kafka, NATS and files): what
+  Telegraf, the InfluxDB client libraries and most collectors write feeds a table, one row per line.
+  Columns are filled by tag and field name (`map` only to read another key, `$measurement` or `$topic`),
+  the first column takes the line's timestamp in `ts_unit` (nanoseconds by default), keys without a column
+  are ignored, `measurement = "name"` keeps the lines of one measurement, a malformed line refuses only its
+  row. Values are converted by the JSON rules (`12i`/`12u` are integers, tags and strings are text). The
+  parser reads in place without allocating, is independent of the transport, is checked line by line
+  against the parser of InfluxDB 3 (`influxdb-line-protocol`, a dev-dependency) on generated and damaged
+  input, and fuzzed (`line_protocol`); the mapping workers take these sources. About 0.45 µs per Telegraf
+  line of 3 tags and 10 fields (laptop, criterion). The value conversion shared by every format is now
+  inlined into each format's loop: JSON, CSV and `rows` mapping measure 5–7% faster on the same laptop.
 - Tables can gain nullable columns at the end, and a column can become nullable, without losing their
   history: segments written before are read with the added columns `NULL`, nothing is rewritten. Other
   column changes still stop the start with the files and the reason.
@@ -59,7 +70,7 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   busy, sleeps when idle); dictionaries hashed with foldhash. File ingest 0.68 → 3.2 M rows/s
   (3,350 → 850 ns CPU per row); MQTT 24.6 → 9.9 µs CPU per message.
 - `loadgen --connections`, `--format sparkplug` and `e2e-profile.sh --publishers`, `$ANKAAD` for A/B runs.
-- Parallel ingest, stage 1 (RFC-0001, `docs/rfc/0001-parallel-ingest.md`): JSON and CSV messages are mapped
+- Parallel ingest, stage 1 (RFC-0001, `docs/rfc/0001-parallel-ingest.md`): JSON, CSV and line protocol messages are mapped
   to rows on `storage.ingest_workers` threads (default: cores − 2) that share nothing, and applied in log
   order by the ingest loop, so tables, dictionaries (values and ids), the dictionary cap, continuous queries
   and counters are exactly those of one thread (property test over random streams with 1–7 workers).

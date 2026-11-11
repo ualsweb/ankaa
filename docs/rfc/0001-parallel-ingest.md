@@ -51,8 +51,8 @@ sources ──frames──▶ sequencer (ingest loop) ──batch──▶ WAL t
 - **Sequencer.** Unchanged up to the log: it drains up to 1,024 frames, pushes them to the WAL as one
   batch (all or nothing) and so knows their LSNs. It then sends the batch as a job, numbered in order,
   to worker `seq mod N` (one queue per worker: no lock shared by the workers).
-- **Workers** hold a clone of every JSON/CSV source's `RowMapper` (the compiled paths and scratch
-  buffers; no state carries from one message to the next). They map each user frame of their job
+- **Workers** hold a clone of every JSON, CSV and line protocol source's `RowMapper` (the compiled
+  paths or keys and scratch buffers; no state carries from one message to the next). They map each user frame of their job
   **without access to the dictionaries**: every dictionary value is left as a pending name. A worker
   never reads or writes shared state, so N workers scale with no atomic operation per row.
 - **Workers learn dictionary ids.** A result goes back to its worker after it was applied, carrying
@@ -99,8 +99,8 @@ the WAL becomes one log per group when one log thread is the limit (about 1 GB/s
 
 ## Verification
 
-- Property test: random message streams (JSON and CSV, good and bad rows, new and known dictionary
-  values, a small dictionary cap) mapped by the pooled path with 1, 2 and 7 workers give the same tables,
+- Property test: random message streams (JSON, `rows` batches and line protocol, good and bad rows,
+  new and known dictionary values, a small dictionary cap) mapped by the pooled path with 1, 2 and 7 workers give the same tables,
   dictionaries and counters as the sequential path.
 - End-to-end tests run with workers on: restarts, crash and lost WAL (`tests/e2e.rs`), real brokers.
 - Measured on Axion: rows/s and CPU per row for 0, 1, 2 workers on 4 vCPU, and the scaling curve on a

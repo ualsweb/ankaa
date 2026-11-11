@@ -68,7 +68,7 @@ name = "racks"
 kind = "nats"                        # mqtt | nats | kafka | file
 url = "nats://127.0.0.1:4222"        # MQTT: mqtt://host:1883; Kafka: host:port,host:port (bootstrap servers); file: a path
 subject = "racks.>"                  # MQTT topic filter, NATS subject or Kafka topic
-format = "json"                      # json | csv | sparkplug (MQTT)
+format = "json"                      # json | csv | line_protocol | sparkplug (MQTT)
 table = "telemetry"
 ts_unit = "millis"                   # seconds | millis | micros | nanos | rfc3339
 map = { ts = "meta.time", rack = "meta.id", temp = "temp", ok = "ok", load = "load" }
@@ -81,7 +81,9 @@ map = { ts = "meta.time", rack = "meta.id", temp = "temp", ok = "ok", load = "lo
   also `$topic` (the whole topic) or `$topic.N` (its `N`-th `/` segment, from 0), because MQTT
   devices name the plant, line and machine in the topic, not in the payload. Every column must be
   mapped; the only exception is the timestamp when `ts_from_receive = true` (the host receive
-  time is used). A configuration that leaves a column unmapped is refused at start.
+  time is used). A configuration that leaves a column unmapped is refused at start. (Line
+  protocol names its values itself and fills columns by name: `map` is optional there, see
+  below.)
 - Several sources may feed one table; they share its dictionaries.
 - Source names are identifiers (letters, digits, `_`, `-`) and must be unique. A name keeps the
   same internal id for the life of the data directory, so sources can be reordered, added and
@@ -120,7 +122,8 @@ map = { ts = "t", machine = "$msg.machine", kw = "kw" }
   against `max_dict_entries` together: a batch cannot overshoot the cap.
 - A message is one WAL record however many rows it carries; recovery replays it exactly, also
   when its rows straddle a chunk boundary.
-- `rows` needs `format = "json"`. `$topic` selectors work in the same mapping.
+- `rows` needs `format = "json"` (line protocol carries several readings as several lines).
+  `$topic` selectors work in the same mapping.
 
 **How JSON is read.** The mapped paths are compiled once into a small trie, and each message is
 read in one forward pass: values on a mapped path are recorded as byte ranges of the message,
@@ -204,6 +207,194 @@ map = { ts = "$timestamp", node = "$node", device = "$device", metric = "$metric
   numbers come from their varint or fixed-width fields, and nothing is allocated per metric.
   Limits: 65,536 metrics per message, 1,000,000 definitions per source, names up to 1 KiB.
 
+### Line protocol (`format = "line_protocol"`)
+
+InfluxDB line protocol is what Telegraf (with its few hundred input plugins), the InfluxDB client
+libraries and most metric collectors write: text, one reading per line.
+
+```text
+cpu,host=web-01,cpu=cpu-total usage_idle=97.5,usage_user=1.2,interrupts=1284i 1762700000000000000
+└─┘ └────────────────────────┘ └────────────────────────────────────────────┘ └─────────────────┘
+measurement  tags (text)        fields (float, 12i, 12u, t/f, "string")        timestamp
+```
+
+A source with `format = "line_protocol"` stores one row per line, on any transport (an MQTT
+payload, a Kafka record, a NATS message, a line of a file). The line names its values, so
+columns are filled **by name** and `map` is optional:
+
+```toml
+[[tables]]
+name = "cpu"
+partition_by = "host"
+columns = [
+  { name = "ts",         type = "timestamp_ns" },
+  { name = "host",       type = "dict" },                       # the tag `host`
+  { name = "cpu",        type = "dict" },                       # the tag `cpu`
+  { name = "usage_idle", type = "float64", nullable = true },   # the field `usage_idle`
+  { name = "usage_user", type = "float64", nullable = true },
+  { name = "irq",        type = "int64",   nullable = true },
+]
+
+[[sources]]
+name = "telegraf-cpu"
+kind = "mqtt"
+url = "mqtt://broker:1883"
+subject = "telegraf/+/cpu"
+format = "line_protocol"
+table = "cpu"
+measurement = "cpu"                  # optional: keep only the lines of this measurement
+map = { irq = "interrupts" }         # optional: only the columns not named after their key
+# ts_unit = "nanos"                  # seconds | millis | micros | nanos (default; what Telegraf writes)
+# ts_from_receive = true             # a line without a timestamp takes the receive time
+```
+
+**Rows.** A message is one or more lines; every line that holds data is a row. Empty lines and
+lines starting with `#` are skipped. A line that is malformed, or whose values do not fit the
+table, is refused **alone** and counted (`ankaa_user_rejected_total`); the lines around it are
+stored. `ankaa_user_rows_total` counts rows.
+
+**Columns.**
+
+- The **first column** (the table's timestamp) takes the timestamp of the line, an integer in
+  `ts_unit` (`seconds`, `millis`, `micros` or `nanos`; the default is nanoseconds, the precision
+  Telegraf writes). A line without a timestamp is refused, unless `ts_from_receive = true` gives
+  it the receive time. The timestamp column is never in `map`.
+- **Every other column** reads the tag or the field whose key is the column's name. Tags and
+  fields are looked up the same way: a column does not care which of the two a producer chose.
+- `map` changes where a column reads from: `column = "key"` reads another key (taken as written:
+  `usage.idle` is one key, the dot means nothing); `column = "$measurement"` stores the
+  measurement name (a `dict` column); `column = "$topic"` or `"$topic.N"` reads the MQTT topic
+  as for any MQTT source. `$` starts a selector, so a key that begins with `$` cannot be named
+  (nor one with an empty part between two dots).
+- A line **without the key** of a column leaves `NULL` in a nullable column and is refused by
+  any other (`dict` columns are never nullable: a reading without its `host` tag has no
+  partition to go to).
+- **Keys that no column reads are ignored.** One Telegraf line often carries more tags and
+  fields than a table wants, and plugins gain fields between versions; neither is an error.
+  There is no strict mode. The flip side: a column whose name matches nothing (a typo) is
+  refused on every line when it is not nullable, and stays `NULL` when it is, so check a new
+  source with `SELECT count(col) FROM …`.
+- When a key comes twice in one line (two fields, or a tag and a field of the same name), the
+  last one counts.
+
+**`measurement = "name"`** keeps only the lines of that measurement; lines of other measurements
+are skipped, not rejected. One topic or file usually carries several measurements while a source
+feeds one table: declare one source per table, each with its measurement. Without it every line
+is a row, whatever its measurement (which `$measurement` can store).
+
+**Values** are converted by the same rules as JSON values ("How values are converted" below):
+a tag or a string field is a JSON string, a float, an integer (`12i`) or an unsigned integer
+(`12u`) is the JSON number 12, a boolean is `true`/`false`.
+
+| In the line | `dict` | `float64` | `int64` | `fixed8` | `u8` |
+|---|---|---|---|---|---|
+| tag, string field (`"…"`) | the text | numeric text | integer text | decimal text, exact, at most 8 decimals | refused |
+| float (`1`, `-1.5`, `1e-3`) | its canonical text | the number | only when written without fraction or exponent (`42`) | exact up to 8 decimals, otherwise rounded to 1e-8 | 0–255 written as an integer |
+| integer (`12i`), unsigned (`12u`) | `12` | the number (beyond 2^53: the nearest double) | the integer; a `u` value above `i64` is refused | exact; refused when it does not fit | 0–255 |
+| boolean (`t`, `true`, `F`, …) | `true` / `false` | refused | refused | refused | 1 / 0 |
+
+Telegraf writes numbers as floats unless the plugin declares an integer, so a counter usually
+arrives as `1284i` and a gauge as `97.5`; an `int64` column takes both `1284i` and `1284`, and
+refuses `1284.5` rather than truncate it.
+
+**The grammar** is the one of InfluxDB's own parsers (this reader is checked line by line
+against the parser of InfluxDB 3, on generated and on damaged input):
+
+- Measurement, tag keys, tag values and field keys: a backslash escapes a comma, a space and,
+  except in a measurement, an equals sign (`\,` `\ ` `\=`); `\\` is a backslash. A backslash
+  before any other character is kept as it is. None of them may be empty or end with a
+  backslash.
+- Field values: floats (digits, an optional fraction, an optional exponent: `1`, `-1.5`,
+  `1e-3`, `1.5E+3`; no `+` sign, no `.5`, no `NaN`), integers (`-12i`, within 64 bits),
+  unsigned integers (`12u`), booleans (`t`, `T`, `true`, `True`, `TRUE`, `f`, `F`, `false`,
+  `False`, `FALSE`) and strings in double quotes, where `\"` is a quote and `\\` a backslash. A
+  string may contain commas, spaces and newlines.
+- Parts are separated by spaces (a tab is not a separator). Spaces and tabs before a line are
+  ignored, and so are spaces and a carriage return after it: files with Windows line ends
+  work.
+- A newline ends a line unless it is inside a quoted string value (or follows a backslash). A
+  string whose closing quote is missing therefore takes the rest of the message with it: one
+  refused row.
+- Three deliberate differences from the InfluxDB 3 parser: it refuses `\r\n` line ends and
+  spaces after a line that has no timestamp, both accepted here; and it accepts a comma after
+  the first field when nothing follows it (`m v=1,`), refused here as in InfluxDB 1 and 2.
+
+**Limits.** 65,536 lines per message (a longer message is refused whole), 4,096 tags plus
+fields per line, `max_message_bytes` per message, 256 bytes per dictionary value, and new
+dictionary values of one message count against `max_dict_entries` together. A line must be
+UTF-8 (one that is not is refused; the others of the message are stored).
+
+**Telegraf.** Any output that serialises with `data_format = "influx"` works. Over MQTT, with
+the host and the plugin in the topic:
+
+```toml
+# telegraf.conf
+[[outputs.mqtt]]
+  servers = ["broker:1883"]
+  topic = 'telegraf/{{ .Tag "host" }}/{{ .Name }}'    # telegraf/web-01/cpu
+  qos = 1
+  data_format = "influx"
+  layout = "batch"        # one message per topic and flush; "non-batch" (one line each) works too
+```
+
+```toml
+# ankaad.toml: one source per measurement, selected by the topic
+[[sources]]
+name = "telegraf-cpu"
+kind = "mqtt"
+url = "mqtt://broker:1883"
+subject = "telegraf/+/cpu"
+format = "line_protocol"
+table = "cpu"
+```
+
+Over Kafka, where one topic carries every plugin, the measurement selects the lines:
+
+```toml
+# telegraf.conf
+[[outputs.kafka]]
+  brokers = ["kafka:9092"]
+  topic = "telegraf"
+  routing_tag = "host"    # the record key: the readings of one host stay in order in one partition
+  data_format = "influx"
+```
+
+```toml
+# ankaad.toml
+[[sources]]
+name = "telegraf-cpu"
+kind = "kafka"
+url = "kafka:9092"
+subject = "telegraf"
+format = "line_protocol"
+table = "cpu"
+measurement = "cpu"
+
+[[sources]]
+name = "telegraf-mem"
+kind = "kafka"
+url = "kafka:9092"
+subject = "telegraf"
+format = "line_protocol"
+table = "mem"
+measurement = "mem"
+```
+
+A file written by `[[outputs.file]]` (or exported from InfluxDB) is read by a `kind = "file"`
+source. A file source hands over one line at a time, so a string value that contains a newline
+cannot come from a file (its two halves are refused).
+
+**How it is read.** Nothing is copied: the measurement, keys and values are byte ranges of the
+message, and only text with a backslash escape is decoded (into a buffer that is reused). Keys
+are matched against the table's columns through a small table built when the server starts,
+indexed by a key's length and three of its bytes, so a key the table does not want is almost
+always dismissed without comparing its bytes. Nothing is allocated per line, and nothing
+carries from one message to the next, so the mapping workers (`storage.ingest_workers`) take
+these sources. On a laptop (Apple M4 Pro, one core; a development signal, not a product claim)
+a Telegraf `cpu` line of 3 tags and 10 float fields maps in about 0.45 µs when the table stores
+all 13 values and 0.28 µs when it wants four of them; reading the line is 0.16 µs of either
+(`generic_ingest_line_protocol` in `bench/benches/hot_paths.rs`).
+
 ### How values are converted
 
 | Column type | Accepted | Notes |
@@ -226,7 +417,7 @@ accepted).
 
 | kind | Behaviour | Guarantee |
 |---|---|---|
-| `file` | Every non-empty line is a message (NDJSON or CSV), read as a stream. The task idles after the file so the data stays queryable. | **At least once.** The read position is saved; a restart continues after the last durable line, and lines appended while the server was down are ingested on the next start. A file replaced by a different one is read from the beginning. |
+| `file` | Every non-empty line is a message (NDJSON, CSV or line protocol), read as a stream. The task idles after the file so the data stays queryable. | **At least once.** The read position is saved; a restart continues after the last durable line, and lines appended while the server was down are ingested on the next start. A file replaced by a different one is read from the beginning. |
 | `kafka` | Verified with Apache Kafka 3.9 (KRaft). All partitions of the topic are read concurrently, without a consumer group: the server keeps the next offset of every partition itself (see "No Kafka consumer groups"). Records of different partitions are merged by their Kafka timestamp before they are delivered, so a multi-partition topic arrives in time order (see below). Partitions added to the topic are picked up within 30 s and read from their beginning. Backpressure waits (nothing is dropped). Plaintext by default; `tls = true` connects with TLS and `sasl_*` authenticates with SASL `PLAIN` or `SCRAM-SHA-256/512` (see "Kafka over TLS, with SASL"). | **At least once.** A restart resumes from the saved offsets, so messages published while the server was down are ingested. If the broker no longer retains a saved offset the source continues from the earliest retained one and `ankaa_kafka_offset_resets_total` increases. |
 | `mqtt` | MQTT 3.1.1, QoS 1, persistent session (client id `ankaa-<source name>`, `clean_session = false`). A message is acknowledged once it is in the ingest channel; a full channel slows the broker down instead of dropping. `url` may carry `user:password@`; `mqtts://` connects with TLS (see below). | **At least once across outages and restarts** for what the broker keeps for the session (its queue limits apply); a crash loses the messages acknowledged but not yet in the WAL group commit (milliseconds). |
 | `nats` | Core NATS subscription; the client reconnects, reconnections are counted. | **At most once.** Core NATS has no replay: messages published while the server is down, or arriving while the ingest channel is full (`ankaa_source_dropped_full_total`), are lost. |
