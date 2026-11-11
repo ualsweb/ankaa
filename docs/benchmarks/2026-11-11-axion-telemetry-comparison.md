@@ -9,7 +9,7 @@ it changed in the engine during the day.
   `europe-southwest1-a`. Engines run one at a time on the same VM, client on the same VM.
 - **Data:** TSBS `cpu-only`, 1,000 hosts, 3 days at 10 s: 25,920,000 rows, 10 tags, 10 float fields
   (generator pinned to `tsbs 8323e59c7402`, seed 123).
-- **Engines:** `ankaad` at `0623f99` + the compaction pacing fix (`bench/telemetry/results` records the tree),
+- **Engines:** `ankaad` at `5e5c758`,
   InfluxDB 3 Core 3.12.2, TimescaleDB 2.31.0 on PostgreSQL 17.11, QuestDB 10.1.0, each configured as its
   vendor documents for this workload (`bench/telemetry/README.md` lists every setting and why).
 - **Method:** `bench/telemetry/run.py`: load (timed), the engine's own post-load step, disk and memory at
@@ -27,7 +27,7 @@ cores or under concurrent load; those runs are not done.
 
 | | ANKAA | TimescaleDB | QuestDB | InfluxDB 3 Core |
 |---|---:|---:|---:|---:|
-| Load, rows/s | **1,106,552** | 383,254 | 801,304 | loaded, see below |
+| Load, rows/s | **1,106,552** | 383,254 | 801,304 | did not complete, see below |
 | Load, seconds | 23.4 | 67.6 | 32.3 | |
 | Post-load step | compress, persist, cut the log: 262 s | columnstore conversion: 23.5 s | none | |
 | Disk at rest, MiB | **426** | 1,311 | 5,841 | |
@@ -41,9 +41,10 @@ cores or under concurrent load; those runs are not done.
   understood in detail and is the next thing to measure.
 - ANKAA reaches its at-rest state (every row compressed and in a segment, one chunk per host, log cut)
   262 s after the load; it answers queries from the first row on, and those 262 s run in the background.
-- **InfluxDB 3 Core did not complete**: it loaded the rows, then its first whole-range query failed with
-  `Resources exhausted` in its deduplication sort on this 16 GB VM, twice (two separate runs). It is left
-  out of the query table rather than tuned by us; its vendor's settings are in the README.
+- **InfluxDB 3 Core did not complete**, in two separate runs: a query failed with `Resources exhausted` in
+  its deduplication sort on this 16 GB VM before the harness could record its load. It is left out of
+  the tables rather than tuned by us; the settings it ran with are in `bench/telemetry/README.md` and the
+  full error is in the raw results.
 
 ## Queries
 
