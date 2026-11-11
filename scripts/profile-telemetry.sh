@@ -78,6 +78,9 @@ start() { # [perf record prefix...]
   SERVER=$!
 }
 wait_rows() { until [ "$(metric ankaa_user_rows_total)" = "$ROWS" ] 2>/dev/null; do sleep 0.2; kill -0 "$SERVER" 2>/dev/null || { tail -5 "$WORK/ankaad.log"; exit 1; }; done; }
+# after a restart nothing is ingested again: wait until the tables hold the rows (ankaa_rows counts
+# stored rows of every table; this server has one)
+wait_stored() { until [ "$(metric ankaa_rows)" -ge "$ROWS" ] 2>/dev/null; do sleep 0.2; kill -0 "$SERVER" 2>/dev/null || { tail -5 "$WORK/ankaad.log"; exit 1; }; done; }
 wait_ready() { until curl -s -o /dev/null -H "Authorization: Bearer $ANKAA_TOKEN" "http://127.0.0.1:$METRICS_PORT/metrics"; do sleep 0.05; kill -0 "$SERVER" 2>/dev/null || { tail -5 "$WORK/ankaad.log"; exit 1; }; done; }
 pid_of_server() { pgrep -n -x ankaad; }
 stop() { kill -TERM "$(pid_of_server)" 2>/dev/null; wait "$SERVER" 2>/dev/null; SERVER=""; }
@@ -88,7 +91,7 @@ STATE="restarted"   # label of the reports: "loaded" right after a load, "restar
 ensure_server() { # start the server on what $WORK holds, when none is running
   [ -n "$SERVER" ] && kill -0 "$SERVER" 2>/dev/null && return
   [ -f "$WORK/ankaad.toml" ] || config
-  start; wait_ready; wait_rows 2>/dev/null
+  start; wait_ready; wait_stored
   sleep "${SETTLE:-10}"
 }
 
@@ -139,7 +142,7 @@ for phase in "${PHASES[@]}"; do
       [ -f "$WORK/ankaad.toml" ] || config
       t0=$(date +%s.%N)
       start perf record -q -e cpu-clock -F "$FREQ" -o "$OUT/restart.data" --
-      wait_ready; wait_rows 2>/dev/null
+      wait_ready; wait_stored
       echo "restart: serving $ROWS rows again after $(echo "$(date +%s.%N) - $t0" | bc) s"
       stop
       report "$OUT/restart.data" "restart: recovery from segments and the log"
