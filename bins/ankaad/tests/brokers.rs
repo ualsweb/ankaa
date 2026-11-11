@@ -19,6 +19,10 @@
 //! The server is started with one NATS source and one Kafka source feeding the same user table
 //! plus a continuous query; messages are published with the real clients; counts, dictionary
 //! names and the continuous-query output are checked over Flight.
+//!
+//! TLS (and, for Kafka, SASL) needs brokers with certificates: `scripts/mqtt-tls-broker.sh <dir>`
+//! with `ANKAA_MQTT_TLS_DIR=<dir>`, and `scripts/kafka-tls-broker.sh <dir>` with
+//! `ANKAA_KAFKA_TLS_DIR=<dir>`. Each of those tests runs when its variable is set.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -89,6 +93,25 @@ fn first_cell(table: &str) -> String {
         .unwrap()
         .trim()
         .to_owned()
+}
+
+/// A server log without the colour escape sequences.
+fn plain_log(path: &Path) -> String {
+    let raw = std::fs::read_to_string(path).unwrap_or_default();
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for d in chars.by_ref() {
+                if d == 'm' {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn count_until(addr: &str, sql: &str, want: &str, timeout: Duration) {
@@ -887,23 +910,7 @@ map = {{ ts = "t", dev = "$topic.1", v = "v" }}
             .unwrap(),
     );
     // the log is coloured: drop the escape sequences before reading it
-    let plain = |path: &std::path::Path| {
-        let raw = std::fs::read_to_string(path).unwrap_or_default();
-        let mut out = String::with_capacity(raw.len());
-        let mut chars = raw.chars();
-        while let Some(c) = chars.next() {
-            if c == '\u{1b}' {
-                for d in chars.by_ref() {
-                    if d == 'm' {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
-    };
+    let plain = plain_log;
     // both verified sources connect (the log line carries tls=true)
     let t0 = Instant::now();
     loop {
@@ -958,4 +965,267 @@ map = {{ ts = "t", dev = "$topic.1", v = "v" }}
     ));
     assert_eq!(devices, "2");
     pump.abort();
+}
+
+/// Kafka over TLS and with SASL against a real broker (`scripts/kafka-tls-broker.sh`). Sources
+/// that trust the broker's private CA connect: with the server certificate only, with a client
+/// certificate on the mutual-TLS listener, and with SASL `PLAIN`, `SCRAM-SHA-256` and
+/// `SCRAM-SHA-512` inside TLS; `SCRAM-SHA-512` without TLS connects to the loopback listener.
+/// Sources that trust only the public roots, present no client certificate where one is
+/// required, send a wrong password or speak plaintext to a TLS listener never get in and store
+/// nothing. The password is in the environment only and never in the log.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn kafka_tls_and_sasl_sources_verify_the_broker_and_authenticate() {
+    let Ok(certs) = std::env::var("ANKAA_KAFKA_TLS_DIR") else {
+        eprintln!(
+            "skipped: run scripts/kafka-tls-broker.sh <dir> and set ANKAA_KAFKA_TLS_DIR=<dir>"
+        );
+        return;
+    };
+    let certs = std::path::PathBuf::from(certs);
+    let password = std::fs::read_to_string(certs.join("sasl-password")).expect("sasl-password");
+    let password = password.trim();
+    let wrong_password = "not-the-password-0123456789";
+    let run = std::process::id();
+    let p = |f: &str| certs.join(f).display().to_string();
+    let tls = format!("tls = true\ntls_ca = \"{}\"", p("ca.pem"));
+    let sasl = |mechanism: &str, var: &str| {
+        format!(
+            "sasl_mechanism = \"{mechanism}\"\nsasl_username = \"ankaa\"\nsasl_password_env = \"{var}\""
+        )
+    };
+    let good_var = "ANKAA_TEST_KAFKA_PASSWORD";
+    let wrong_var = "ANKAA_TEST_KAFKA_WRONG_PASSWORD";
+    // (source and device name, bootstrap server, connection settings)
+    let accepted: Vec<(&str, &str, String)> = vec![
+        ("tls", "127.0.0.1:19094", tls.clone()),
+        (
+            "mtls",
+            "localhost:19095",
+            format!(
+                "{tls}\ntls_cert = \"{}\"\ntls_key = \"{}\"",
+                p("client.pem"),
+                p("client.key")
+            ),
+        ),
+        (
+            "plain",
+            "127.0.0.1:19096",
+            format!("{tls}\n{}", sasl("plain", good_var)),
+        ),
+        (
+            "scram256",
+            "127.0.0.1:19096",
+            format!("{tls}\n{}", sasl("scram-sha-256", good_var)),
+        ),
+        (
+            "scram512",
+            "127.0.0.1:19096",
+            format!("{tls}\n{}", sasl("SCRAM-SHA-512", good_var)),
+        ),
+        // SASL without TLS: accepted by the configuration because the broker is on loopback
+        (
+            "scram-local",
+            "127.0.0.1:19097",
+            sasl("scram-sha-512", good_var),
+        ),
+    ];
+    let refused: Vec<(&str, &str, String)> = vec![
+        // the broker's CA is not a public one
+        ("public-roots", "127.0.0.1:19094", "tls = true".to_owned()),
+        // the mutual-TLS listener, without a client certificate
+        ("no-client-cert", "127.0.0.1:19095", tls.clone()),
+        (
+            "wrong-password",
+            "127.0.0.1:19096",
+            format!("{tls}\n{}", sasl("scram-sha-256", wrong_var)),
+        ),
+        // a TLS listener spoken to without TLS
+        ("no-tls", "127.0.0.1:19094", String::new()),
+    ];
+
+    // topics and their records exist before the server starts (`start = "earliest"`)
+    let kafka = rskafka::client::ClientBuilder::new(vec!["127.0.0.1:19092".to_owned()])
+        .build()
+        .await
+        .expect("plaintext listener of scripts/kafka-tls-broker.sh on 127.0.0.1:19092");
+    let controller = kafka.controller_client().unwrap();
+    let base_ms: i64 = 1_762_700_000_000;
+    let per_source: i64 = 50;
+    for (name, _, _) in accepted.iter().chain(&refused) {
+        let topic = format!("ankaa-sec-{run}-{name}");
+        controller.create_topic(&topic, 1, 1, 10_000).await.unwrap();
+        let pc = kafka
+            .partition_client(
+                &topic,
+                0,
+                rskafka::client::partition::UnknownTopicHandling::Retry,
+            )
+            .await
+            .unwrap();
+        let records: Vec<rskafka::record::Record> = (0..per_source)
+            .map(|i| rskafka::record::Record {
+                key: None,
+                value: Some(format!("{},{name},{i}.5", base_ms + i * 1000).into_bytes()),
+                headers: std::collections::BTreeMap::new(),
+                timestamp: chrono::Utc::now(),
+            })
+            .collect();
+        pc.produce(
+            records,
+            rskafka::client::partition::Compression::NoCompression,
+        )
+        .await
+        .unwrap();
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let (flight, metrics) = (free_port(), free_port());
+    let sources: Vec<String> = accepted
+        .iter()
+        .chain(&refused)
+        .map(|(name, url, settings)| {
+            format!(
+                r#"
+[[sources]]
+name = "{name}"
+kind = "kafka"
+url = "{url}"
+subject = "ankaa-sec-{run}-{name}"
+start = "earliest"
+format = "csv"
+table = "readings"
+ts_unit = "millis"
+map = {{ ts = "0", device = "1", value = "2" }}
+{settings}
+"#
+            )
+        })
+        .collect();
+    let config = format!(
+        r#"
+[feed]
+enabled = false
+streams = []
+[server]
+flight_addr = "127.0.0.1:{flight}"
+metrics_addr = "127.0.0.1:{metrics}"
+
+[[tables]]
+name = "readings"
+partition_by = "device"
+columns = [
+  {{ name = "ts", type = "timestamp_ns" }},
+  {{ name = "device", type = "dict" }},
+  {{ name = "value", type = "fixed8" }},
+]
+{}"#,
+        sources.concat()
+    );
+    let cfg_path = dir.path().join("kafka-tls.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let check = Command::new(bin())
+        .args(["config", "check"])
+        .arg(&cfg_path)
+        .env(good_var, password)
+        .env(wrong_var, wrong_password)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let log = dir.path().join("kafka-tls.log");
+    let _server = Server(
+        Command::new(bin())
+            .args(["serve", "--config"])
+            .arg(&cfg_path)
+            .args(["--duration-secs", "90"])
+            .env("ANKAA_TOKEN", "t0k3n")
+            .env(good_var, password)
+            .env(wrong_var, wrong_password)
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    // every accepted source reaches its topic
+    let t0 = Instant::now();
+    loop {
+        let text = plain_log(&log);
+        if text.matches("kafka consuming").count() >= accepted.len() {
+            break;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(40),
+            "TLS/SASL sources did not connect:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let addr = format!("127.0.0.1:{flight}");
+    let want = (per_source * i64::try_from(accepted.len()).unwrap()).to_string();
+    count_until(
+        &addr,
+        "SELECT count(*) FROM readings",
+        &want,
+        Duration::from_secs(30),
+    );
+    // every device of an accepted source has all its records, and no other device exists
+    for (name, _, _) in &accepted {
+        let n = first_cell(&query(
+            &addr,
+            &format!(
+                "SELECT count(*) FROM readings r JOIN dictionaries d ON d.\"table\" = 'readings' \
+                 AND d.\"column\" = 'device' AND d.id = r.device WHERE d.name = '{name}'"
+            ),
+        ));
+        assert_eq!(n, per_source.to_string(), "{name}");
+    }
+    let devices = first_cell(&query(
+        &addr,
+        "SELECT count(*) FROM dictionaries WHERE \"table\" = 'readings'",
+    ));
+    assert_eq!(devices, accepted.len().to_string());
+    // give the refused sources time for several attempts: none of them ever consumes
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let text = plain_log(&log);
+    assert_eq!(
+        text.matches("kafka consuming").count(),
+        accepted.len(),
+        "{text}"
+    );
+    assert_eq!(
+        first_cell(&query(&addr, "SELECT count(*) FROM readings")),
+        want
+    );
+    // the log says how each accepted source connected
+    let consuming = |name: &str| {
+        let topic = format!("topic=ankaa-sec-{run}-{name} ");
+        text.lines()
+            .find(|l| l.contains("kafka consuming") && l.contains(&topic))
+            .unwrap_or_else(|| panic!("no \"kafka consuming\" line for {name}:\n{text}"))
+            .to_owned()
+    };
+    for (name, tls_on, sasl_name) in [
+        ("tls", true, "none"),
+        ("mtls", true, "none"),
+        ("plain", true, "PLAIN"),
+        ("scram256", true, "SCRAM-SHA-256"),
+        ("scram512", true, "SCRAM-SHA-512"),
+        ("scram-local", false, "SCRAM-SHA-512"),
+    ] {
+        let line = consuming(name);
+        assert!(line.contains(&format!("tls={tls_on}")), "{line}");
+        assert!(line.contains(&format!("sasl=\"{sasl_name}\"")), "{line}");
+    }
+    // and why the others did not: the certificate is not trusted, the credentials are refused
+    assert!(text.contains("Failed to connect to broker"), "{text}");
+    assert!(text.contains("UnknownIssuer"), "{text}");
+    assert!(text.contains("Sasl handshake failed"), "{text}");
+    // secrets stay out of the log
+    assert!(!text.contains(password), "the SASL password is in the log");
+    assert!(!text.contains(wrong_password));
 }

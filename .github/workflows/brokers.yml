@@ -1,13 +1,16 @@
 name: brokers
 # Generic sources against real NATS, Kafka (service containers) and MQTT: Mosquitto plain (its
 # no-auth listener config, which a service container cannot pass) and with TLS and mutual TLS
-# (scripts/mqtt-tls-broker.sh, certificates from a throw-away CA).
+# (scripts/mqtt-tls-broker.sh, certificates from a throw-away CA). A second Kafka broker has TLS,
+# mutual-TLS and SASL listeners (scripts/kafka-tls-broker.sh, same kind of CA, a random password).
 on:
   pull_request:
     paths:
       - "crates/ankaa-feeds/src/sources/**"
       - "crates/ankaa-ingest/src/generic.rs"
       - "bins/ankaad/**"
+      - "scripts/kafka-tls-broker.sh"
+      - "scripts/mqtt-tls-broker.sh"
       - ".github/workflows/brokers.yml"
   push:
     branches: [main]
@@ -45,8 +48,10 @@ jobs:
         run: docker run -d --name mqtt -p 1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
       - name: Start Mosquitto with TLS (throw-away CA)
         run: scripts/mqtt-tls-broker.sh "$RUNNER_TEMP/mqtt-tls"
+      - name: Start Kafka with TLS and SASL (throw-away CA)
+        run: scripts/kafka-tls-broker.sh "$RUNNER_TEMP/kafka-tls"
       - name: Wait for Kafka and Mosquitto
         run: |
           for i in $(seq 1 60); do (echo > /dev/tcp/127.0.0.1/9092) 2>/dev/null && break; sleep 1; done
           for i in $(seq 1 30); do (echo > /dev/tcp/127.0.0.1/1883) 2>/dev/null && break; sleep 1; done
-      - run: ANKAA_BROKER_TESTS=1 ANKAA_MQTT_TLS_DIR="$RUNNER_TEMP/mqtt-tls" cargo test -p ankaad --test brokers -- --nocapture
+      - run: ANKAA_BROKER_TESTS=1 ANKAA_MQTT_TLS_DIR="$RUNNER_TEMP/mqtt-tls" ANKAA_KAFKA_TLS_DIR="$RUNNER_TEMP/kafka-tls" cargo test -p ankaad --test brokers -- --nocapture
