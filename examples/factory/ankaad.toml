@@ -1,0 +1,62 @@
+# ANKAA configuration of the factory demo: one table for the whole Unified Namespace, fed by MQTT.
+# Topic hierarchy (ISA-95):  acme/<site>/<area>/<line>/<machine>/telemetry
+
+[feed]
+enabled = false          # no built-in exchange feed: only [[sources]] feed this server
+streams = []
+
+[server]
+flight_addr = "0.0.0.0:50051"
+metrics_addr = "0.0.0.0:9100"
+pg_addr = "0.0.0.0:5432"   # Postgres wire: Grafana and psql connect here (password = token)
+token_env = "ANKAA_TOKEN"
+allow_plaintext = true     # inside the compose network only; put TLS in front for anything else
+
+[storage]
+wal_dir = "/var/lib/ankaa/wal"
+checkpoint_dir = "/var/lib/ankaa/segments"
+
+[[tables]]
+name = "telemetry"
+partition_by = "machine"     # ordering, watermark and late-data window per machine
+max_lateness_ms = 300000     # gateways that buffer up to five minutes are placed in time
+retention = "7d"             # measured from the newest reading
+columns = [
+  { name = "ts",      type = "timestamp_ns" },
+  { name = "site",    type = "dict" },
+  { name = "area",    type = "dict" },
+  { name = "line",    type = "dict" },
+  { name = "machine", type = "dict" },
+  { name = "kw",      type = "fixed8",  nullable = true },   # exact decimals; missing → NULL
+  { name = "temp_c",  type = "float64", nullable = true },
+  { name = "state",   type = "u8" },                         # 1 running, 0 stopped
+]
+
+[[sources]]
+name = "plant1"
+kind = "mqtt"
+url = "mqtt://mqtt:1883"
+subject = "acme/+/+/+/+/telemetry"
+format = "json"
+table = "telemetry"
+ts_unit = "millis"
+map = { ts = "t", site = "$topic.1", area = "$topic.2", line = "$topic.3", machine = "$topic.4", kw = "kw", temp_c = "temp_c", state = "state" }
+
+# live 1-minute power bars per machine → tables cq_power_1m (closed) and cq_power_1m_live (open)
+[[continuous]]
+name = "power_1m"
+kind = "ohlcv"
+table = "telemetry"
+key = "machine"
+value = "kw"
+width_ns = 60000000000
+
+# median and p99 temperature per machine over 5-minute windows
+[[continuous]]
+name = "temp_5m"
+kind = "percentiles"
+table = "telemetry"
+key = "machine"
+value = "temp_c"
+width_ns = 300000000000
+quantiles = [0.5, 0.99]

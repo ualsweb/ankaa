@@ -18,6 +18,15 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   - **Many devices.** The schema is shared rather than copied per partition and chunk; a scale test with 100,000
     devices in one table is in `crates/ankaa-store/tests/scale.rs`.
 - Project website under `site/`, published by GitHub Pages (`.github/workflows/pages.yml`).
+- Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on
+  `ghcr.io` built from the release binaries), release binaries for Linux arm64/x86-64 and macOS arm64
+  (`.github/workflows/release.yml`), and `examples/factory/`: one `docker compose up` for an MQTT plant,
+  ANKAA and a Grafana dashboard over the Postgres protocol. Tutorial `docs/tutorials/uns-historian.md`;
+  `docs/design-partners.md`.
+- A server with no feed and no `[[sources]]` now starts (with a warning) and serves the data it has
+  stored, instead of refusing the configuration.
+- Fixed: the eager-aggregation rewrite returned `NULL` instead of `0` for a `count` over no rows and
+  declared the column nullable (found by the Python tests on the first CI run).
 - Launch-readiness pass: restarts no longer lose, repeat or rename data. User-table dictionaries are persisted with
   the segments; file and Kafka sources resume from durable positions (`sources.json`, at least once); source ids are
   stable across config edits; continuous-query tables are rebuilt at start instead of being persisted (same results

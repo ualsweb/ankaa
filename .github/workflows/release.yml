@@ -1,0 +1,130 @@
+name: release
+# On a version tag (v0.1.0, …): ankaad binaries for Linux arm64/x86-64 and macOS arm64, a
+# multi-arch container image on ghcr.io built from those same binaries, and the GitHub release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "existing tag to (re)build, e.g. v0.1.0"
+        required: true
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+jobs:
+  build:
+    name: ankaad (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 builders: the binaries need glibc 2.35 or newer (Debian 12, Ubuntu 22.04,
+          # Amazon Linux 2023, RHEL 9…), and the debian12 runtime image has 2.36
+          - { platform: linux-arm64, runner: ubuntu-22.04-arm, docker: arm64 }
+          - { platform: linux-amd64, runner: ubuntu-22.04, docker: amd64 }
+          - { platform: macos-arm64, runner: macos-14, docker: "" }
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ env.TAG }}
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: 1.99.1
+      - name: Build
+        run: cargo build --release --locked -p ankaad
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="ankaa-${TAG}-${{ matrix.platform }}"
+          mkdir -p "dist/$name"
+          # the release profile keeps debug info for profiling; ship symbols only (names in backtraces)
+          if [ "$RUNNER_OS" = macOS ]; then strip -S target/release/ankaad; else strip --strip-debug target/release/ankaad; fi
+          cp target/release/ankaad LICENSE NOTICE README.md CHANGELOG.md "dist/$name/"
+          cp deploy/ankaad.example.toml "dist/$name/ankaad.example.toml"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          if [ -n "${{ matrix.docker }}" ]; then
+            mkdir -p "dist/image/${{ matrix.docker }}" && cp target/release/ankaad "dist/image/${{ matrix.docker }}/"
+          fi
+          ./target/release/ankaad --version
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.platform }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/image/
+          if-no-files-found: error
+
+  image:
+    name: container image (ghcr.io)
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ env.TAG }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+      - name: Build and push (linux/arm64, linux/amd64)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/data/wal dist/data/segments
+          for a in arm64 amd64; do
+            mkdir -p "dist/$a"
+            find artifacts -path "*/image/$a/ankaad" -exec cp {} "dist/$a/ankaad" \;
+            chmod 0755 "dist/$a/ankaad"
+          done
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ankaa"
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          docker buildx create --use --driver docker-container
+          # the image only copies files: no step runs under emulation for the other architecture
+          docker buildx build -f deploy/docker/Dockerfile.release --platform linux/arm64,linux/amd64 \
+            --label "org.opencontainers.image.version=${TAG}" \
+            -t "$image:${TAG#v}" -t "$image:latest" --push .
+
+  release:
+    name: GitHub release
+    needs: [build, image]
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: artifacts
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          cat > notes.md <<NOTES
+          Pre-alpha. What works and what does not yet: [STATUS](https://github.com/${GITHUB_REPOSITORY}/blob/${TAG}/docs/STATUS.md) · [CHANGELOG](https://github.com/${GITHUB_REPOSITORY}/blob/${TAG}/CHANGELOG.md)
+
+          **Container image** (linux/arm64, linux/amd64)
+
+          \`\`\`sh
+          docker run --rm -e ANKAA_TOKEN=change-me-to-16-chars -p 50051:50051 -p 5432:5432 -p 9100:9100 ghcr.io/${owner}/ankaa:${TAG#v}
+          \`\`\`
+
+          **Binaries**: download the archive for your platform, check it against its \`.sha256\`, unpack, run \`./ankaad --help\`. Linux builds need glibc 2.35 or newer.
+
+          **Try the factory demo** (MQTT plant → ANKAA → Grafana): \`cd examples/factory && docker compose up -d\`, then open http://localhost:3000.
+          NOTES
+          sed -i 's/^          //' notes.md
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "ANKAA ${TAG}" --notes-file notes.md --prerelease \
+            $(find artifacts -name '*.tar.gz' -o -name '*.sha256')

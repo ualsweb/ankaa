@@ -414,6 +414,11 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             "user tables and continuous queries"
         );
     }
+    if !cfg.feed.enabled && cfg.sources.is_empty() && !standby {
+        warn!(
+            "no feed and no [[sources]]: nothing is ingested; the server serves the data it has stored"
+        );
+    }
 
     // Tiering + checkpoints: re-attach persisted segments before replaying the WAL.
     let mut tiering = Tiering::new(

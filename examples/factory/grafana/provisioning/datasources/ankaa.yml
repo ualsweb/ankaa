@@ -1,0 +1,15 @@
+apiVersion: 1
+datasources:
+  - name: ANKAA
+    uid: ankaa
+    type: grafana-postgresql-datasource
+    url: ankaa:5432
+    user: ankaa
+    isDefault: true
+    jsonData:
+      database: ankaa
+      sslmode: disable
+      postgresVersion: 1500
+      timescaledb: false
+    secureJsonData:
+      password: demo-token-not-secret

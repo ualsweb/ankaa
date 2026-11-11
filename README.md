@@ -97,7 +97,28 @@ flowchart LR
 
 ---
 
-## Try it in 60 seconds
+## Try it
+
+### The factory demo: one command
+
+A simulated plant publishes to an MQTT Unified Namespace; ANKAA stores and aggregates it live; Grafana
+shows it over the Postgres protocol. Requires Docker with Compose.
+
+```sh
+git clone https://github.com/ualsweb/ankaa && cd ankaa/examples/factory
+docker compose up -d          # then open http://localhost:3000
+```
+
+What it shows and how to point it at your own broker: [`examples/factory`](examples/factory/) and the
+[Unified Namespace tutorial](docs/tutorials/uns-historian.md).
+
+### Install
+
+- **Container image** (linux/arm64, linux/amd64): `docker run --rm -e ANKAA_TOKEN=change-me-to-16-chars -p 50051:50051 -p 5432:5432 -p 9100:9100 ghcr.io/ualsweb/ankaa:latest`, with your configuration mounted at `/etc/ankaa/ankaad.toml` ([`deploy/docker/ankaad.toml`](deploy/docker/ankaad.toml) is the default).
+- **Binaries** for Linux arm64, Linux x86-64 and macOS arm64 are attached to each [release](https://github.com/ualsweb/ankaa/releases).
+- **From source**: Rust 1.95 or newer, `cargo build --release -p ankaad`.
+
+### Query a market-data capture in 60 seconds
 
 No account, no network needed. Requires [Rust](https://rustup.rs).
 
@@ -219,7 +240,7 @@ Details: [STATUS](docs/STATUS.md) · [ROADMAP](docs/ROADMAP.md) · [CHANGELOG](C
 
 ANKAA is **Apache-2.0** open source, free to use, modify and run commercially.
 
-- **Design partners.** If your team runs plant, meter, fleet, market-data or other telemetry workloads and wants to shape the engine, run it on your feeds or test it on Arm hardware, open a [GitHub Discussion](https://github.com/ualsweb/ankaa/discussions) with the *Design partner* label. Early partners get direct input on the roadmap.
+- **Design partners.** If your team runs plant, meter, fleet, market-data or other telemetry workloads and wants to shape the engine, run it on your feeds or test it on Arm hardware: what you get and what we ask is on [one page](docs/design-partners.md). Open a [GitHub Discussion](https://github.com/ualsweb/ankaa/discussions) with the *Design partner* label to start. Early partners get direct input on the roadmap.
 - **Hardware and cloud partners.** Access to Arm server instances for public, reproducible benchmarks is the most valuable contribution right now.
 - **Contributors.** Start with [`CONTRIBUTING.md`](CONTRIBUTING.md) (DCO sign-off, RFC process for design changes). Good first areas: new sources and decoders ([framing helper](crates/ankaa-ingest/examples/custom_feed.rs), [generic mapper](crates/ankaa-ingest/src/generic.rs)), SQL functions, docs.
 - **Security reports.** See [`SECURITY.md`](SECURITY.md).

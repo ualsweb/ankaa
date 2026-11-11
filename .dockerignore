@@ -1,0 +1,14 @@
+# never in an image: private notes, build output, local environments
+internal/
+target/
+**/target/
+.git/
+.github/
+**/.venv/
+**/__pycache__/
+crates/ankaa-py/dist/
+fuzz/corpus/
+fuzz/artifacts/
+site/
+*.ankc.tmp
+.playwright-mcp/

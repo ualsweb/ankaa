@@ -1,0 +1,16 @@
+# Release image: the binaries built by .github/workflows/release.yml, copied in per architecture
+# (no compilation here). For a build from source use the Dockerfile at the repository root.
+FROM gcr.io/distroless/cc-debian12:nonroot
+ARG TARGETARCH
+LABEL org.opencontainers.image.title="ANKAA" \
+      org.opencontainers.image.description="Real-time time-series engine for Arm servers" \
+      org.opencontainers.image.source="https://github.com/ualsweb/ankaa" \
+      org.opencontainers.image.licenses="Apache-2.0"
+COPY dist/${TARGETARCH}/ankaad /usr/local/bin/ankaad
+COPY deploy/docker/ankaad.toml /etc/ankaa/ankaad.toml
+COPY --chown=65532:65532 dist/data /var/lib/ankaa
+VOLUME ["/var/lib/ankaa"]
+EXPOSE 50051 9100 5432
+USER nonroot:nonroot
+ENTRYPOINT ["/usr/local/bin/ankaad"]
+CMD ["serve", "--config", "/etc/ankaa/ankaad.toml"]

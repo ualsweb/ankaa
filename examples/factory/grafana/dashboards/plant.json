@@ -1,0 +1,447 @@
+{
+  "title": "ANKAA \u00b7 Plant 1 (Unified Namespace demo)",
+  "uid": "ankaa-plant",
+  "tags": [
+    "ankaa",
+    "demo"
+  ],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Readings stored",
+      "description": "Every reading the plant published, queryable milliseconds after it arrived.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ankaa"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "table",
+          "rawSql": "SELECT count(*) AS readings FROM telemetry"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#E8590C"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "id": 1,
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ankaa"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Machines",
+      "description": "Line and machine come from the MQTT topic ($topic.3, $topic.4).",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ankaa"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "table",
+          "rawSql": "SELECT count(DISTINCT machine) AS machines FROM telemetry"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#E8590C"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "gridPos": {
+        "x": 6,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "id": 2,
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ankaa"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Readings without kW (NULL)",
+      "description": "Missing values are stored as NULL, not as zero: aggregates skip them.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ankaa"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "table",
+          "rawSql": "SELECT count(*) - count(kw) AS missing FROM telemetry"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#E8590C"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "id": 3,
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ankaa"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Stopped readings, last 5 min",
+      "description": "robot09 stops for a minute every ten.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ankaa"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "table",
+          "rawSql": "SELECT count(*) AS stopped FROM telemetry WHERE state = 0 AND ts > now() - interval '5 minutes'"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#E8590C"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value"
+      },
+      "gridPos": {
+        "x": 18,
+        "y": 0,
+        "w": 6,
+        "h": 4
+      },
+      "id": 4,
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ankaa"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Press shop: power per machine (10 s averages of raw readings)",
+      "description": "press03 draws 25 % more for two minutes every quarter hour.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ankaa"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "time_series",
+          "rawSql": "SELECT date_bin(interval '10 seconds', t.ts) AS time, dm.name AS machine, avg(t.kw) / 1e8 AS kw\nFROM telemetry t\nJOIN dictionaries dm ON dm.\"table\" = 'telemetry' AND dm.\"column\" = 'machine' AND dm.id = t.machine\nJOIN dictionaries da ON da.\"table\" = 'telemetry' AND da.\"column\" = 'area' AND da.id = t.area\nWHERE $__timeFilter(t.ts) AND da.name = 'press-shop'\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "kwatt",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "insertNulls": 30000,
+            "spanNulls": false,
+            "lineInterpolation": "smooth"
+          },
+          "displayName": "${__field.labels.machine}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 4,
+        "w": 12,
+        "h": 9
+      },
+      "id": 5,
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ankaa"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Assembly: power per machine (10 s averages of raw readings)",
+      "description": "Line 4's gateway drops off one minute in three and sends its readings late; they are placed in time.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ankaa"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "time_series",
+          "rawSql": "SELECT date_bin(interval '10 seconds', t.ts) AS time, dm.name AS machine, avg(t.kw) / 1e8 AS kw\nFROM telemetry t\nJOIN dictionaries dm ON dm.\"table\" = 'telemetry' AND dm.\"column\" = 'machine' AND dm.id = t.machine\nJOIN dictionaries da ON da.\"table\" = 'telemetry' AND da.\"column\" = 'area' AND da.id = t.area\nWHERE $__timeFilter(t.ts) AND da.name = 'assembly'\nGROUP BY 1, 2\nORDER BY 1"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "kwatt",
+          "custom": {
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "insertNulls": 30000,
+            "spanNulls": false,
+            "lineInterpolation": "smooth"
+          },
+          "displayName": "${__field.labels.machine}"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "right",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 4,
+        "w": 12,
+        "h": 9
+      },
+      "id": 6,
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ankaa"
+      }
+    },
+    {
+      "type": "table",
+      "title": "Current minute per machine (continuous query cq_power_1m_live)",
+      "description": "Maintained as readings arrive, not recomputed on refresh.",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ankaa"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "table",
+          "rawSql": "SELECT dm.name AS machine, t.open / 1e8 AS open_kw, t.high / 1e8 AS high_kw, t.low / 1e8 AS low_kw,\n       t.close / 1e8 AS close_kw, t.count AS readings, t.ts AS bar_start\nFROM cq_power_1m_live t\nJOIN dictionaries dm ON dm.\"table\" = 'telemetry' AND dm.\"column\" = 'machine' AND dm.id = t.machine\nWHERE t.ts = (SELECT max(ts) FROM cq_power_1m_live)\nORDER BY machine"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "readings"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 13,
+        "w": 12,
+        "h": 10
+      },
+      "id": 7,
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ankaa"
+      }
+    },
+    {
+      "type": "table",
+      "title": "Temperature median and p99, current 5-minute window (cq_temp_5m_live)",
+      "description": "Streaming quantiles (UDDSketch, 1 % relative error).",
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "grafana-postgresql-datasource",
+            "uid": "ankaa"
+          },
+          "rawQuery": true,
+          "editorMode": "code",
+          "format": "table",
+          "rawSql": "SELECT dm.name AS machine, t.p50 AS median_c, t.p99 AS p99_c, t.count AS readings, t.ts AS window_start\nFROM cq_temp_5m_live t\nJOIN dictionaries dm ON dm.\"table\" = 'telemetry' AND dm.\"column\" = 'machine' AND dm.id = t.machine\nORDER BY p99_c DESC"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 2
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byRegexp",
+              "options": "median_c|p99_c"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "celsius"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "readings"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 13,
+        "w": 12,
+        "h": 10
+      },
+      "id": 8,
+      "datasource": {
+        "type": "grafana-postgresql-datasource",
+        "uid": "ankaa"
+      }
+    }
+  ]
+}

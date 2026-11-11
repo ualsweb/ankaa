@@ -1,0 +1,22 @@
+# Default configuration of the container image: no built-in exchange feed, durable storage
+# under /var/lib/ankaa, every listener on all interfaces of the container.
+#
+# The token comes from the ANKAA_TOKEN environment variable (also the Postgres password).
+# Listeners are plaintext: run the container on a private network or behind a TLS proxy, or
+# mount a configuration with server.tls_cert / server.tls_key (see docs/deployment.md).
+# Add [[tables]], [[sources]] and [[continuous]] by mounting your own file over this one.
+
+[feed]
+enabled = false
+streams = []
+
+[server]
+flight_addr = "0.0.0.0:50051"
+metrics_addr = "0.0.0.0:9100"
+pg_addr = "0.0.0.0:5432"
+token_env = "ANKAA_TOKEN"
+allow_plaintext = true
+
+[storage]
+wal_dir = "/var/lib/ankaa/wal"
+checkpoint_dir = "/var/lib/ankaa/segments"

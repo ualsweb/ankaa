@@ -276,8 +276,17 @@ map     = { ts = <span class="c-str">"t"</span>, line = <span class="c-str">"$to
 <section id="quickstart">
   <div class="wrap">
     <p class="kicker">Quickstart</p>
-    <h2>Try it in 60 seconds. No account, no network.</h2>
-    <p class="sub">Requires <a href="https://rustup.rs">Rust</a>. A 20-second capture of live Binance data ships with the repository.</p>
+    <h2>A live plant in SQL, with one command.</h2>
+    <p class="sub">The <a href="https://github.com/ualsweb/ankaa/tree/main/examples/factory">factory demo</a> starts an MQTT broker, a simulated plant of 20 machines, ANKAA and a Grafana dashboard. Requires Docker. The <a href="https://github.com/ualsweb/ankaa/blob/main/docs/tutorials/uns-historian.md">Unified Namespace tutorial</a> walks through it and points it at your own broker.</p>
+    <div class="code-card" style="margin-bottom:18px">
+      <header><span>0 · the factory demo</span><span>shell</span></header>
+<pre><span class="c-key">git clone</span> https://github.com/ualsweb/ankaa <span class="c-dim">&amp;&amp;</span> cd ankaa/examples/factory
+docker compose up -d        <span class="c-dim"># then open http://localhost:3000</span>
+
+<span class="c-dim"># or run the server image on its own (linux/arm64, linux/amd64)</span>
+docker run --rm -e ANKAA_TOKEN=change-me-to-16-chars -p 5432:5432 ghcr.io/ualsweb/ankaa:latest</pre>
+    </div>
+    <p class="sub" style="margin-bottom:24px">Without Docker: install <a href="https://rustup.rs">Rust</a>; a 20-second capture of live Binance data ships with the repository.</p>
     <div class="grid g2">
       <div class="code-card">
         <header><span>1 · replay and query a capture</span><span>shell</span></header>
@@ -362,7 +371,7 @@ p99  = live.sql(<span class="c-str">"""
     <h2>Shape the engine with your data.</h2>
     <p class="sub">ANKAA is Apache-2.0, free to use, modify and run commercially. The most valuable contributions right now are real workloads and real hardware.</p>
     <div class="grid g3" style="text-align:left">
-      <div class="card"><h3>Design partners</h3><p>Run it on your plant, meter, fleet or market feeds and tell us what breaks. Open a <a href="https://github.com/ualsweb/ankaa/discussions">discussion</a> with the <i>Design partner</i> label.</p></div>
+      <div class="card"><h3>Design partners</h3><p>Run it on your plant, meter, fleet or market feeds with our help, at no cost, and tell us what breaks. <a href="https://github.com/ualsweb/ankaa/blob/main/docs/design-partners.md">What you get, what we ask</a>.</p></div>
       <div class="card"><h3>Hardware and cloud partners</h3><p>Access to Arm server instances for public, reproducible benchmarks moves the project forward most.</p></div>
       <div class="card"><h3>Contributors</h3><p>Sources and decoders, SQL functions, docs. Start with <a href="https://github.com/ualsweb/ankaa/blob/main/CONTRIBUTING.md">CONTRIBUTING.md</a> (DCO sign-off, RFCs for design changes).</p></div>
     </div>

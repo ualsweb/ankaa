@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: ankaa
+    folder: ANKAA
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

@@ -597,9 +597,9 @@ impl Config {
         if self.feed.enabled && self.feed.streams.is_empty() {
             return inv("feed.streams must not be empty (or set feed.enabled = false)");
         }
-        if !self.feed.enabled && self.sources.is_empty() && self.replication.standby_of.is_none() {
-            return inv("feed.enabled = false needs at least one [[sources]] entry");
-        }
+        // `feed.enabled = false` and no [[sources]] is allowed: such a server ingests nothing and
+        // serves the data it has stored (a read-only copy, a container started before its
+        // sources are configured); `serve` says so in its log
         for s in &self.feed.streams {
             // the symbol part ends up in a REST URL: letters, digits, `@` and `_` only
             if s.is_empty()
@@ -1365,8 +1365,8 @@ map = { ts = "t", v = "v" }
         assert_eq!(c.sources[0].max_message_bytes, 1024 * 1024);
         assert_eq!(c.sources[0].start, SourceStart::Latest);
         assert_eq!(c.tables[0].max_dict_entries, 100_000);
-        // no feed and no source is a configuration mistake
-        assert!(Config::from_toml("[feed]\nenabled = false\nstreams = []").is_err());
+        // no feed and no source: a server that only serves what it has stored (warned at start)
+        assert!(Config::from_toml("[feed]\nenabled = false\nstreams = []").is_ok());
         // an empty stream list still needs the feed switched off
         assert!(Config::from_toml("[feed]\nstreams = []").is_err());
         // the round trip keeps the new fields
