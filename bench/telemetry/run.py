@@ -313,6 +313,9 @@ def measure_engine(name: str, args, data_dir: Path, manifest: dict, qs, dialect_
         if name == "influxdb3":
             rec["ingest"]["persist"] = eng.wait_persisted(int(manifest["rows"]), args.influxdb3_persist_timeout_s)
             log(f"   persisted: {rec['ingest']['persist']}")
+        if name == "ankaa":
+            rec["ingest"]["persist"] = eng.wait_persisted()
+            log(f"   persisted: {rec['ingest']['persist']}")
 
         # ---- settle, then disk and memory at rest
         rec["ingest"]["settle"] = probes.wait_idle(probe, args.settle_max_s, args.settle_cpu_pct) if probe else {}
@@ -374,7 +377,8 @@ def markdown(report: dict) -> str:
         if "columnstore" in ing:
             post.append(f"columnstore {ing['columnstore']['wall_s']:.1f} s")
         if "persist" in ing:
-            post.append(f"persist to Parquet {ing['persist']['persist_wait_s']:.0f} s")
+            what = "persist to Parquet" if e == "influxdb3" else "compress, persist, cut the log"
+            post.append(f"{what} {ing['persist']['persist_wait_s']:.0f} s")
         if ing.get("settle", {}).get("settle_s"):
             post.append(f"idle after {ing['settle']['settle_s']:.0f} s")
         mem = load.get("memory", {})

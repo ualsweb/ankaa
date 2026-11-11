@@ -528,7 +528,11 @@ class AnkaaServeEngine(AnkaaFlightEngine):
         cols += [f'  {{ name = "{t}", type = "dict" }},' for t in tags]
         cols += [f'  {{ name = "{f}", type = "float64" }},' for f in fields]
         mapping = ", ".join(f'{c} = "{i}"' for i, c in enumerate(csv_cols))
-        storage = [f'wal_dir = "{self.workdir / "wal"}"', f'checkpoint_dir = "{self.workdir / "segments"}"']
+        # max_open_age_s: rows that stopped arriving are compressed and persisted after a minute instead
+        # of the default ten (the same reason InfluxDB runs with INFLUXDB3_FORCE_SNAPSHOT_MAX_AGE=1m): the
+        # at-rest state is reached soon after the load, see wait_persisted().
+        storage = [f'wal_dir = "{self.workdir / "wal"}"', f'checkpoint_dir = "{self.workdir / "segments"}"',
+                   "max_open_age_s = 60"]
         if self.warm_budget_mib:
             storage.append(f"warm_budget_mib = {int(self.warm_budget_mib)}")
         resources = [f"query_memory_mib = {int(self.query_memory_mib)}"] if self.query_memory_mib else []
@@ -617,6 +621,31 @@ class AnkaaServeEngine(AnkaaFlightEngine):
         return {"method": "ankaad serve, [[sources]] kind=file format=csv (cpu.csv), wal_dir + checkpoint_dir",
                 "wall_s": wall, "rows": rows, "first_row_s": first_row_s, "visible_wait_s": visible_wait,
                 "config": str(self.workdir / "ankaad.toml")}
+
+    def wait_persisted(self, timeout_s: float = 1800.0) -> dict:
+        """Block until the server has compressed and persisted what the load left open and has cut the
+        log behind it: at least `max_open_age_s` plus a checkpoint interval after the load (130 s), then
+        until the tiers and the WAL size have not changed for 75 s. This is the at-rest state the other
+        engines are measured in (TimescaleDB after its columnstore conversion, InfluxDB after its Parquet
+        persist); before it, the disk figure would count the whole log and queries would read rows that
+        are still uncompressed."""
+        t0 = time.monotonic()
+        last, stable_since = None, t0
+        while True:
+            self._check_alive()
+            m = self._metrics()
+            state = tuple(int(m.get(k, -1)) for k in (
+                "ankaa_wal_bytes", 'ankaa_tier_chunks{tier="hot"}', 'ankaa_tier_chunks{tier="warm"}',
+                'ankaa_tier_chunks{tier="cold"}', "ankaa_tier_sealed_for_age_total"))
+            now = time.monotonic()
+            if state != last:
+                last, stable_since = state, now
+            elif now - t0 >= 130.0 and now - stable_since >= 75.0:
+                return {"persist_wait_s": round(now - t0, 1), "wal_bytes": state[0], "hot_chunks": state[1],
+                        "warm_chunks": state[2], "cold_segments": state[3], "sealed_for_age": state[4]}
+            if now - t0 > timeout_s:
+                raise RuntimeError(f"ankaa: tiers and WAL still changing after {timeout_s:.0f} s: {state}")
+            time.sleep(2.0)
 
     def data_paths(self) -> list[Path]:
         return [self.workdir / "wal", self.workdir / "segments"]
