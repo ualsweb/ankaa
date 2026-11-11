@@ -46,6 +46,9 @@ type Key = (String, u32, ChunkId);
 /// Smallest open chunk sealed to stay within the memory budget (an age limit seals any size).
 pub const MIN_SEAL_ROWS: usize = 1024;
 
+/// How long tier totals are reused while no chunk changes tier (see `Tiering::tier_totals`).
+const STATS_MAX_AGE: Duration = Duration::from_millis(500);
+
 /// Tiering state.
 pub struct Tiering {
     enc: Arc<Encoder>,
@@ -55,6 +58,9 @@ pub struct Tiering {
     budget: Duration,
     checkpoint_interval: Duration,
     last_truncate: Option<Instant>,
+    /// Tier totals of all tables and the moves they were taken after: summing them walks every
+    /// chunk, so a tick reuses them until a chunk moves or [`STATS_MAX_AGE`] passes.
+    totals: Option<(Instant, u64, TierStats)>,
     /// Segment written for a chunk (table, partition, id) → cold reference.
     cold: HashMap<Key, Arc<ColdChunk>>,
     /// Partitions `(table, key)` whose sealed chunks are persisted at once, whatever the hot
@@ -197,6 +203,7 @@ impl Tiering {
             budget,
             checkpoint_interval,
             last_truncate: None,
+            totals: None,
             cold: HashMap::new(),
             forced: std::collections::HashSet::new(),
             retention: HashMap::new(),
@@ -217,6 +224,26 @@ impl Tiering {
     pub fn with_segment_cache(mut self, bytes: usize) -> Self {
         self.enc = Arc::new(Encoder::new().with_segment_cache(bytes));
         self
+    }
+
+    /// Chunks and bytes per tier over all tables. Walking every chunk of every partition is
+    /// the cost (a table of many small chunks: milliseconds), and a tick asks three times, so
+    /// the sum is kept until a chunk changes tier here or it is [`STATS_MAX_AGE`] old (chunks
+    /// sealed by ingest in between show up then).
+    fn tier_totals(&mut self, tables: &Tables) -> TierStats {
+        let moves = self.moves_to_warm + self.moves_to_cold;
+        if let Some((at, seen, total)) = &self.totals
+            && *seen == moves
+            && at.elapsed() < STATS_MAX_AGE
+        {
+            return *total;
+        }
+        let mut total = TierStats::default();
+        for (_, t) in tables.persistent() {
+            total.merge(&t.tier_stats());
+        }
+        self.totals = Some((Instant::now(), moves, total));
+        total
     }
 
     pub fn with_encoders(mut self, n: usize) -> std::io::Result<Self> {
@@ -544,11 +571,10 @@ impl Tiering {
         max_age: Option<Duration>,
     ) -> (usize, usize) {
         let now = Instant::now();
-        let mut hot = 0usize;
+        let mut hot = self.tier_totals(tables).hot_bytes;
         // (first row, bytes, rows, table, partition)
         let mut open: Vec<(Instant, usize, usize, String, u32)> = Vec::new();
         for (name, table) in tables.persistent() {
-            hot += table.tier_stats().hot_bytes;
             table.for_each_partition(|p| {
                 if let Some(since) = p.open_since() {
                     let b = p.open_bytes();
@@ -706,11 +732,7 @@ impl Tiering {
         }
         // 2. warm → cold when over budget (only chunks that have a segment)
         if self.checkpoint_dir.is_some() {
-            let mut warm_bytes: usize = tables
-                .persistent()
-                .iter()
-                .map(|(_, t)| t.tier_stats().warm_bytes)
-                .sum();
+            let mut warm_bytes: usize = self.tier_totals(tables).warm_bytes;
             if warm_bytes > self.warm_budget_bytes {
                 // oldest first by max timestamp
                 let mut warm: Vec<(i64, Key, Arc<ColdChunk>)> = Vec::new();
@@ -761,10 +783,7 @@ impl Tiering {
             }
         }
         // 3. metrics
-        let mut total = TierStats::default();
-        for (_, t) in tables.persistent() {
-            total.merge(&t.tier_stats());
-        }
+        let total = self.tier_totals(tables);
         let tm = &metrics.tier;
         tm.hot_chunks
             .store(total.hot_chunks as u64, Ordering::Relaxed);

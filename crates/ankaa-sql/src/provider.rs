@@ -67,6 +67,86 @@ pub struct KeyBounds {
     pub hi: u32,
 }
 
+/// The statistics a scan prunes on, of one chunk list, laid out as plain arrays: the time range
+/// of every chunk, and the id range of every chunk for the `dict` columns queries have filtered
+/// on so far.
+///
+/// Pruning used to ask each chunk in turn, which is a pointer to follow per chunk (two for an
+/// encoded one: the chunk, then its metadata) and a cache miss each at the first touch: for a
+/// table of tens of thousands of chunks that was a quarter of a small query. Here the first
+/// scan of a chunk list pays that walk once per column it filters on, and every later scan of
+/// the same list compares numbers that sit next to each other. A chunk list is immutable; a
+/// new snapshot gets a new index.
+struct PruneIndex {
+    ts_min: Vec<i64>,
+    ts_max: Vec<i64>,
+    /// Per column, built at the first filter on it.
+    ids: Vec<std::sync::OnceLock<IdRanges>>,
+}
+
+impl fmt::Debug for PruneIndex {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PruneIndex")
+            .field("chunks", &self.ts_min.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Smallest and largest id of one column per chunk (`lo > hi`: the chunk has no statistics for
+/// the column and cannot be judged).
+struct IdRanges {
+    lo: Vec<u32>,
+    hi: Vec<u32>,
+}
+
+impl IdRanges {
+    fn of(chunks: &[ChunkRef], col: usize) -> Self {
+        let (mut lo, mut hi) = (
+            Vec::with_capacity(chunks.len()),
+            Vec::with_capacity(chunks.len()),
+        );
+        for c in chunks {
+            let (a, b) = c.u32_range(col).unwrap_or((1, 0));
+            lo.push(a);
+            hi.push(b);
+        }
+        Self { lo, hi }
+    }
+
+    /// The id range of chunk `i`, when it is known.
+    fn range(&self, i: usize) -> Option<(u32, u32)> {
+        let (lo, hi) = (*self.lo.get(i)?, *self.hi.get(i)?);
+        (lo <= hi).then_some((lo, hi))
+    }
+}
+
+impl PruneIndex {
+    fn new(chunks: &[ChunkRef], columns: usize) -> Self {
+        let (mut ts_min, mut ts_max) = (
+            Vec::with_capacity(chunks.len()),
+            Vec::with_capacity(chunks.len()),
+        );
+        for c in chunks {
+            // an empty chunk overlaps nothing
+            let (a, b) = c.time_range().unwrap_or((i64::MAX, i64::MIN));
+            ts_min.push(a);
+            ts_max.push(b);
+        }
+        Self {
+            ts_min,
+            ts_max,
+            ids: (0..columns).map(|_| std::sync::OnceLock::new()).collect(),
+        }
+    }
+
+    fn ids(&self, chunks: &[ChunkRef], col: usize) -> Option<&IdRanges> {
+        Some(self.ids.get(col)?.get_or_init(|| IdRanges::of(chunks, col)))
+    }
+}
+
+/// A chunk list and its [`PruneIndex`].
+type Indexed = (Arc<Vec<ChunkRef>>, Arc<PruneIndex>);
+
 /// A table backed by a fixed set of chunks sharing one schema.
 #[derive(Debug, Clone)]
 pub struct ChunkTable {
@@ -79,6 +159,9 @@ pub struct ChunkTable {
     /// Per column: the published names of a `dict` column shown as strings (`None`: the column
     /// is not a dictionary, or is shown as ids).
     names: Vec<Option<Arc<Names>>>,
+    /// The index of the chunk list scanned last (the list is held with it, so that "the same
+    /// list" can be told by identity).
+    prune: Arc<parking_lot::Mutex<Option<Indexed>>>,
 }
 
 /// `column = 'name'`, `column <> 'name'` or `column [NOT] IN ('a', 'b')` on a `dict` column
@@ -229,7 +312,22 @@ impl ChunkTable {
             schema: arrow,
             ts_name,
             names: Vec::new(),
+            prune: Arc::default(),
         }
+    }
+
+    /// The current chunk list with its pruning index (built now if this list has none yet).
+    fn indexed(&self) -> Indexed {
+        let chunks = self.chunks.read().clone();
+        let mut held = self.prune.lock();
+        if let Some((list, index)) = held.as_ref()
+            && Arc::ptr_eq(list, &chunks)
+        {
+            return (chunks, index.clone());
+        }
+        let index = Arc::new(PruneIndex::new(&chunks, self.ankaa_schema.fields().len()));
+        *held = Some((chunks.clone(), index.clone()));
+        (chunks, index)
     }
 
     /// Show `dict` columns as strings: `names[i]` holds the published names of column `i`
@@ -809,28 +907,39 @@ impl TableProvider for ChunkTable {
             .cloned()
             .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
         let preds: Vec<KeyPred> = filters.iter().filter_map(|f| self.key_pred(f)).collect();
-        let all = self.chunks.read().clone();
+        let (all, index) = self.indexed();
         // prune on statistics now, so the plan shows what will be read and the partitions
         // below only hold chunks that can contribute rows
+        let key_ranges: Vec<Option<&IdRanges>> =
+            keys.iter().map(|k| index.ids(&all, k.col)).collect();
+        let pred_ranges: Vec<Option<&IdRanges>> =
+            preds.iter().map(|p| index.ids(&all, p.col)).collect();
         let mut by_row = false;
-        let candidates: Vec<ChunkRef> = all
-            .iter()
-            .filter(|c| c.may_overlap(bounds.lo, bounds.hi))
-            .filter(|c| keys.iter().all(|k| c.may_overlap_u32(k.col, k.lo, k.hi)))
-            .filter(|c| {
-                let mut rows = false;
-                for p in &preds {
-                    match p.verdict(c.u32_range(p.col)) {
-                        Verdict::Skip => return false,
-                        Verdict::Rows => rows = true,
-                        Verdict::All => {}
-                    }
+        let mut candidates: Vec<ChunkRef> = Vec::new();
+        'chunks: for (i, c) in all.iter().enumerate() {
+            let (min, max) = (index.ts_min[i], index.ts_max[i]);
+            if bounds.hi < min || bounds.lo > max {
+                continue;
+            }
+            for (k, ranges) in keys.iter().zip(&key_ranges) {
+                // without statistics for the column the chunk cannot be ruled out
+                if let Some((lo, hi)) = ranges.and_then(|r| r.range(i))
+                    && (k.hi < lo || k.lo > hi)
+                {
+                    continue 'chunks;
                 }
-                by_row |= rows;
-                true
-            })
-            .cloned()
-            .collect();
+            }
+            let mut rows = false;
+            for (p, ranges) in preds.iter().zip(&pred_ranges) {
+                match p.verdict(ranges.and_then(|r| r.range(i))) {
+                    Verdict::Skip => continue 'chunks,
+                    Verdict::Rows => rows = true,
+                    Verdict::All => {}
+                }
+            }
+            by_row |= rows;
+            candidates.push(c.clone());
+        }
         let pruned = all.len() - candidates.len();
         let dicts_of = |cols: &[usize]| -> Vec<Option<arrow::array::ArrayRef>> {
             cols.iter()
