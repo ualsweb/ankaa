@@ -171,6 +171,10 @@ pub struct RowMapper {
     /// Per column: the distinct new dictionary values of the last message, counted against
     /// `max_dict_entries` so that one message of many rows cannot overshoot the cap.
     new_names: Vec<std::collections::HashSet<Box<str>>>,
+    /// Mapping without the dictionaries (a parallel worker): per column, the ids this mapper has
+    /// learned from results the dictionaries' owner resolved ([`Self::learn`]). Ids never change
+    /// once given, so an entry is never stale; it saves the owner one hash per value.
+    learned: Vec<HashMap<Box<str>, u32, foldhash::fast::RandomState>>,
     /// `format = "sparkplug"`: payloads are Sparkplug B, one row per metric.
     sparkplug: Option<Box<SpState>>,
 }
@@ -307,6 +311,7 @@ impl RowMapper {
             csv_fields: Vec::new(),
             out,
             new_names: Vec::new(),
+            learned: Vec::new(),
             sparkplug: None,
         })
     }
@@ -717,6 +722,7 @@ impl RowMapper {
     fn begin(&mut self, n_rows: usize, ncols: usize) {
         let cells = n_rows * ncols;
         self.out.n_rows = n_rows;
+        self.out.asked.clear();
         if self.out.rows.len() < cells {
             self.out.rows.resize(cells, Value::Null);
         }
@@ -771,8 +777,36 @@ impl RowMapper {
         std::mem::swap(&mut o.row_err, &mut other.row_err);
         std::mem::swap(&mut o.pending, &mut other.pending);
         std::mem::swap(&mut o.pending_set, &mut other.pending_set);
+        std::mem::swap(&mut o.asked, &mut other.asked);
         other.schema = o.schema.clone();
         other.partition_col = o.partition_col;
+    }
+
+    /// Learn the dictionary ids the owner gave to the values this mapper left pending in `m`
+    /// (one of its own results, after it was applied): the next messages carry them already.
+    /// Values of refused rows that were not interned are skipped. At most
+    /// [`MAX_LEARNED_PER_COLUMN`] values per column are kept.
+    pub fn learn(&mut self, m: &Mapped) {
+        let ncols = self.schema.fields().len();
+        if ncols == 0 {
+            return;
+        }
+        if self.learned.len() < ncols {
+            self.learned.resize_with(ncols, HashMap::default);
+        }
+        for &idx in &m.asked {
+            let idx = idx as usize;
+            let (Some(Value::U32(id)), Some(name)) = (m.rows.get(idx), m.pending.get(idx)) else {
+                continue;
+            };
+            let map = &mut self.learned[idx % ncols];
+            if *id != u32::MAX
+                && map.len() < MAX_LEARNED_PER_COLUMN
+                && !map.contains_key(name.as_str())
+            {
+                map.insert(name.as_str().into(), *id);
+            }
+        }
     }
 
     /// An empty result shaped for this mapper (a first buffer for [`Self::swap_mapped`]).
@@ -884,10 +918,15 @@ impl RowMapper {
         // Mapped without the dictionaries (a parallel mapping worker): the name stays pending,
         // and the cap is checked when the result is resolved against them (`Mapped::resolve`)
         let Some(dict) = dicts.get(c).and_then(Option::as_ref) else {
+            if let Some(&id) = self.learned.get(c).and_then(|m| m.get(name)) {
+                self.out.rows[idx] = Value::U32(id);
+                return Ok(());
+            }
             self.out.pending[idx].clear();
             self.out.pending[idx].push_str(name);
             self.out.pending_set[idx] = true;
             self.out.rows[idx] = Value::U32(u32::MAX);
+            self.out.asked.push(u32::try_from(idx).unwrap_or(u32::MAX));
             return Ok(());
         };
         if let Some(SymbolId(id)) = dict.get(name) {
@@ -927,6 +966,9 @@ pub struct Mapped {
     pending_set: Vec<bool>,
     /// Scratch of [`Self::resolve`]: new values per column in the message.
     new_names: Vec<std::collections::HashSet<Box<str>>>,
+    /// Cells left pending by a mapper without the dictionaries: once resolved, their ids are
+    /// what that mapper learns ([`RowMapper::learn`]).
+    asked: Vec<u32>,
 }
 
 impl Mapped {
@@ -942,6 +984,7 @@ impl Mapped {
             pending: Vec::new(),
             pending_set: Vec::new(),
             new_names: Vec::new(),
+            asked: Vec::new(),
         }
     }
 
@@ -1042,6 +1085,10 @@ impl Mapped {
         (key, &self.rows[base..base + ncols])
     }
 }
+
+/// Most dictionary values a mapping worker remembers per column ([`RowMapper::learn`]); values
+/// beyond them are resolved by the dictionaries' owner, as before.
+pub const MAX_LEARNED_PER_COLUMN: usize = 1_000_000;
 
 /// Longest value accepted for a `dict` column, in bytes.
 pub const MAX_DICT_VALUE_BYTES: usize = 256;

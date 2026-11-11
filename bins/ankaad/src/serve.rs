@@ -149,7 +149,7 @@ impl Ingest {
                                 self.tables
                                     .apply_mapped(source_id, frame.recv_ns, Ok(&mut m));
                             self.note_user(source_id, done);
-                            pool.recycle(worker, m);
+                            pool.recycle(worker, source_id, m);
                         }
                         Err(e) => {
                             let done = self.tables.apply_mapped(source_id, frame.recv_ns, Err(e));

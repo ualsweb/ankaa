@@ -87,35 +87,48 @@ fn via_workers(
     cap: usize,
     workers: usize,
 ) -> (Outcome, Vec<Option<SymbolDict>>) {
-    // each worker has its own mapper; messages are dealt round-robin, results applied in order
+    // each worker has its own mapper; messages are dealt round-robin and mapped `lag` messages
+    // ahead of the applier (as jobs in flight are); each applied result goes back to its worker,
+    // which learns the ids in it and resolves those values itself afterwards
     let mut pool: Vec<RowMapper> = (0..workers).map(|_| mapper(rows, cap)).collect();
-    let results: Vec<Option<Mapped>> = msgs
-        .iter()
-        .enumerate()
-        .map(|(i, msg)| {
-            let w = &mut pool[i % workers];
-            w.parse(msg, 0, false, &[]).ok().map(|_| {
-                let mut taken = w.empty_mapped();
-                w.swap_mapped(&mut taken);
-                taken
-            })
-        })
-        .collect();
+    let lag = workers * 2;
+    let mut ready: std::collections::VecDeque<(usize, Option<Mapped>)> =
+        std::collections::VecDeque::new();
     let mut dicts = RowMapper::dictionaries_for(&schema());
     let mut out = Vec::new();
-    for result in results {
+    let mut apply = |(w, result): (usize, Option<Mapped>),
+                     pool: &mut Vec<RowMapper>,
+                     dicts: &mut Vec<Option<SymbolDict>>| {
         let mut per = Vec::new();
         if let Some(mut m) = result {
-            m.resolve(&dicts, cap);
+            m.resolve(dicts, cap);
             for r in 0..m.n_rows() {
                 if m.parsed(r).is_ok() {
-                    per.push(Some(m.finish_row(r, &mut dicts).1.to_vec()));
+                    per.push(Some(m.finish_row(r, dicts).1.to_vec()));
                 } else {
                     per.push(None);
                 }
             }
+            pool[w].learn(&m);
         }
         out.push(per);
+    };
+    for (i, msg) in msgs.iter().enumerate() {
+        let w = i % workers;
+        let mapper = &mut pool[w];
+        let result = mapper.parse(msg, 0, false, &[]).ok().map(|_| {
+            let mut taken = mapper.empty_mapped();
+            mapper.swap_mapped(&mut taken);
+            taken
+        });
+        ready.push_back((w, result));
+        if ready.len() > lag {
+            let next = ready.pop_front().unwrap();
+            apply(next, &mut pool, &mut dicts);
+        }
+    }
+    while let Some(next) = ready.pop_front() {
+        apply(next, &mut pool, &mut dicts);
     }
     (out, dicts)
 }

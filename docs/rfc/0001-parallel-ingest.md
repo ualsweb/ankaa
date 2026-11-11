@@ -55,6 +55,12 @@ sources ──frames──▶ sequencer (ingest loop) ──batch──▶ WAL t
   buffers; no state carries from one message to the next). They map each user frame of their job
   **without access to the dictionaries**: every dictionary value is left as a pending name. A worker
   never reads or writes shared state, so N workers scale with no atomic operation per row.
+- **Workers learn dictionary ids.** A result goes back to its worker after it was applied, carrying
+  the ids the applier gave to the values the worker had left pending; the worker remembers them (per
+  source and column, up to 1 M values) and resolves those values itself afterwards. Ids never change
+  once given, so nothing is ever invalidated, and nothing is shared between threads: in steady state
+  the applier hashes only values it has never seen (a TSBS row has 10 dictionary columns: 10 hash
+  lookups per row taken off the one serial thread).
 - **`Mapped`**, the output of mapping one message (row-major cells, per-row errors, pending names), is
   a value of its own. The applier returns it to its worker after use, so buffers are reused and nothing
   is allocated per message in steady state; the memory a worker touches stays in its own L2.

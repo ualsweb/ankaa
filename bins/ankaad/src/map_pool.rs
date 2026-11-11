@@ -9,7 +9,10 @@
 //!   touches no shared state: nothing per row is atomic or contended.
 //! - Results come back in any order and wait in a reorder buffer until their number is next.
 //! - Used result buffers go back to the worker that filled them: no allocation per message in
-//!   steady state, and each worker keeps reusing memory in its own caches.
+//!   steady state, and each worker keeps reusing memory in its own caches. On the way back a
+//!   buffer carries the dictionary ids the ingest loop gave to the values the worker left
+//!   pending; the worker remembers them ([`RowMapper::learn`]) and resolves those values itself
+//!   from then on, so the loop hashes only values it has never seen.
 //!
 //! Frames a worker does not map (market data, control frames, Sparkplug sources) travel with the
 //! job unmapped and are handled by the ingest loop at their place.
@@ -51,7 +54,7 @@ pub struct Done {
 /// The workers and the reorder buffer.
 pub struct MapPool {
     jobs: Vec<SyncSender<Job>>,
-    recycle: Vec<Sender<Mapped>>,
+    recycle: Vec<Sender<(u16, Mapped)>>,
     done_rx: tokio::sync::mpsc::UnboundedReceiver<Done>,
     threads: Vec<std::thread::JoinHandle<()>>,
     next_seq: u64,
@@ -69,7 +72,7 @@ impl MapPool {
         let mut threads = Vec::with_capacity(n);
         for w in 0..n {
             let (job_tx, job_rx) = sync_channel::<Job>(JOBS_PER_WORKER + 1);
-            let (rec_tx, rec_rx) = std::sync::mpsc::channel::<Mapped>();
+            let (rec_tx, rec_rx) = std::sync::mpsc::channel::<(u16, Mapped)>();
             let mine = mappers.to_vec();
             let done_tx = done_tx.clone();
             threads.push(
@@ -164,10 +167,11 @@ impl MapPool {
         Some(d)
     }
 
-    /// Give a used result back to the worker that filled it.
-    pub fn recycle(&self, worker: usize, m: Mapped) {
+    /// Give a used result of `source` back to the worker that filled it (after it was applied:
+    /// the worker learns the dictionary ids it holds).
+    pub fn recycle(&self, worker: usize, source: u16, m: Mapped) {
         if let Some(tx) = self.recycle.get(worker) {
-            let _ = tx.send(m);
+            let _ = tx.send((source, m));
         }
     }
 }
@@ -185,13 +189,18 @@ impl Drop for MapPool {
 fn work(
     me: usize,
     jobs: &Receiver<Job>,
-    recycled: &Receiver<Mapped>,
+    recycled: &Receiver<(u16, Mapped)>,
     mut mappers: Vec<Option<(RowMapper, bool)>>,
     done: &tokio::sync::mpsc::UnboundedSender<Done>,
 ) {
     let mut spare: Vec<Mapped> = Vec::new();
     while let Ok(job) = jobs.recv() {
-        spare.extend(recycled.try_iter());
+        for (source, m) in recycled.try_iter() {
+            if let Some(Some((mapper, _))) = mappers.get_mut(usize::from(source)) {
+                mapper.learn(&m);
+            }
+            spare.push(m);
+        }
         let mapped = job
             .frames
             .iter()
