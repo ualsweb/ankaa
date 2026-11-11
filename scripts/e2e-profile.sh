@@ -3,6 +3,7 @@
 #
 #   scripts/e2e-profile.sh <scenario> [--transport mqtt|file] [--format json|json-array|sparkplug]
 #                          [--batch B] [--messages N] [--devices D] [--tls] [--publishers P]
+#                          [--workers W]   (storage.ingest_workers; default: the server's own)
 #
 # Needs: target/release/ankaad (or $ANKAAD), bench/target/release/loadgen, mosquitto (for mqtt), perf.
 # Writes target/e2e/<scenario>/: summary.txt, perf-stat.txt, perf-report.txt, ankaad.log.
@@ -12,7 +13,7 @@
 set -euo pipefail
 export LC_ALL=C
 scenario="${1:?scenario name}"; shift
-transport=mqtt; format=json; batch=10; messages=1000000; devices=1000; tls=0; publishers=1
+transport=mqtt; format=json; batch=10; messages=1000000; devices=1000; tls=0; publishers=1; workers=
 while [ $# -gt 0 ]; do
   case "$1" in
     --transport) transport="$2"; shift 2;;
@@ -22,6 +23,7 @@ while [ $# -gt 0 ]; do
     --devices) devices="$2"; shift 2;;
     --tls) tls=1; shift;;
     --publishers) publishers="$2"; shift 2;;
+    --workers) workers="$2"; shift 2;;
     *) echo "unknown argument $1" >&2; exit 2;;
   esac
 done
@@ -103,6 +105,7 @@ token_env = "ANKAA_TOKEN"
 [storage]
 wal_dir = "$work/wal"
 checkpoint_dir = "$work/segments"
+$( [ -n "$workers" ] && echo "ingest_workers = $workers" )
 [[tables]]
 name = "telemetry"
 partition_by = "dev"
@@ -167,7 +170,7 @@ sudo perf report -i "$work/perf.data" --no-children --stdio -g none --sort comm 
 wall=$(echo "$t_end - ${first:-$t_start}" | bc -l)
 cpu_s=$(echo "($c1 - $c0) / $hz" | bc -l)
 {
-  echo "scenario:        $scenario ($transport, $format, batch $batch, $devices devices, tls $tls, publishers $publishers)"
+  echo "scenario:        $scenario ($transport, $format, batch $batch, $devices devices, tls $tls, publishers $publishers, workers ${workers:-default})"
   echo "host:            $(uname -m) $(lscpu 2>/dev/null | awk -F: '/Model name/ {gsub(/^ +/,"",$2); print $2; exit}') $(nproc) vCPU"
   echo "commit:          $(cat "$root/.source-commit" 2>/dev/null | cut -c1-12 || git -C "$root" rev-parse --short HEAD)"
   echo "rows stored:     $rows of $expected (rejected ${rejected:-0})"
