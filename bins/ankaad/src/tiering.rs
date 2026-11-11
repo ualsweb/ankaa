@@ -67,6 +67,9 @@ pub struct Tiering {
     compact: bool,
     last_compact: Option<Instant>,
     merging: std::collections::HashSet<(String, u32)>,
+    /// Partitions (counted across the tables) the next search for runs skips: where the last
+    /// one stopped because the encode threads were busy.
+    compact_from: usize,
     /// Merges done and chunks they replaced.
     pub compactions: u64,
     pub compacted_chunks: u64,
@@ -128,7 +131,9 @@ const MIN_MERGE_PARTS: usize = 4;
 /// Most chunks one merge takes, and most ids a merged chunk may list as replaced.
 const MAX_MERGE_PARTS: usize = 64;
 const MAX_REPLACED_IDS: usize = 4096;
-/// How often partitions are searched for runs to merge.
+/// How often partitions are searched for runs to merge once a search has gone through all of
+/// them (a search that had to stop because the encode threads were busy goes on at the next
+/// tick).
 const COMPACT_EVERY: Duration = Duration::from_secs(1);
 
 /// Encode a chunk (and write its segment when `dir` is given); for a compaction, first build
@@ -213,7 +218,9 @@ impl EncodePool {
             jobs: job_tx,
             done: done_rx,
             threads,
-            max_in_flight: 2 * n,
+            // enough queued that a thread does not idle between two ticks (a chunk takes a few
+            // milliseconds, a tick comes every 50 by default)
+            max_in_flight: 8 * n,
         })
     }
 }
@@ -270,6 +277,7 @@ impl Tiering {
             compact: true,
             last_compact: None,
             merging: std::collections::HashSet::new(),
+            compact_from: 0,
             compactions: 0,
             compacted_chunks: 0,
             cold: HashMap::new(),
@@ -465,12 +473,25 @@ impl Tiering {
     /// partition in a hundred pieces is read a hundred times slower than its rows need.
     fn compact_small_chunks(&mut self, tables: &Tables, t0: Instant) -> bool {
         let mut persisted = false;
+        // partitions are visited in one order across the tables, from where the last pass
+        // had to stop (the encode threads were busy, or the tick's time was up)
+        let skip = std::mem::take(&mut self.compact_from);
+        let mut at = 0usize;
         for (name, table) in tables.persistent() {
             for idx in 0..table.num_partitions() {
-                match &self.pool {
-                    Some(p) if self.in_flight.len() >= p.max_in_flight => return persisted,
-                    None if t0.elapsed() > self.budget => return persisted,
-                    _ => {}
+                at += 1;
+                if at <= skip {
+                    continue;
+                }
+                let busy = match &self.pool {
+                    Some(p) => self.in_flight.len() >= p.max_in_flight,
+                    None => t0.elapsed() > self.budget,
+                };
+                if busy {
+                    // go on from this partition at the next tick
+                    self.compact_from = at - 1;
+                    self.last_compact = None;
+                    return persisted;
                 }
                 let job = table.with_partition(idx, |p| {
                     if self.merging.contains(&(name.to_owned(), p.key())) {
