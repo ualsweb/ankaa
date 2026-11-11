@@ -535,6 +535,7 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             rows = st.rows,
             max_lsn = st.max_lsn,
             bad_files = st.bad_files,
+            evolved = st.evolved,
             symbols = symbols_saved,
             dictionary_values = dict_values_saved,
             ms = t0.elapsed().as_millis(),

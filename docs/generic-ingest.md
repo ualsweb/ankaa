@@ -328,9 +328,34 @@ checkpoints) exactly like the market tables and appear under their own name in `
 Equality and range predicates on a `dict` column prune whole chunks (`WHERE rack = 3`), and
 scans run one partition per group of chunks in parallel.
 
+## Changing a table
+
+A table may gain columns without losing what it holds:
+
+```toml
+columns = [
+  { name = "ts",   type = "timestamp_ns" },
+  { name = "rack", type = "dict" },
+  { name = "temp", type = "fixed8" },
+  { name = "kw",   type = "float64", nullable = true },   # added: must be nullable, at the end
+]
+```
+
+- Add the new columns **at the end** and make them **nullable**; map them in every source of the
+  table (a message without the field gives `NULL`). Restart.
+- An existing column may also become nullable (`nullable = true` on a column that had none).
+- Rows stored before the change read `NULL` in the added columns, in SQL, over Flight and in
+  Python. Nothing is rewritten: a segment written before the change is read as the new schema
+  (the added columns cost nothing on disk and are not read from it); the write-ahead log is
+  replayed through the new mapping. `segments restored … evolved=N` in the start log counts
+  the segments read that way.
+- Other changes (removing, renaming, retyping or reordering a column, adding one that is not
+  nullable) stop the start with a message that names the files and the difference: restore the
+  previous definition, or move the table's segment files out of `checkpoint_dir` to start the
+  table empty.
+
 ## Limits (v1)
 
-- No schema migration: changing the columns of a table that already has segments makes those
-  segments unreadable for that table (they are skipped with a warning at start).
+- Columns can only be added (nullable, at the end) or made nullable; see "Changing a table".
 - `replay` ignores user frames: it only knows the market tables. Use `serve` with a `file` source
   for offline runs.

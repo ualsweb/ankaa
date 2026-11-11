@@ -786,3 +786,202 @@ map = {{ ts = "t", dev = "$msg.dev", v = "v" }}
     assert_eq!(fingerprint(&addr), before, "without the WAL");
     stop(s);
 }
+
+/// A table gains nullable columns: segments written before keep their rows, read with `NULL` in
+/// the added columns (nothing is rewritten), new rows fill them, and the result survives a crash
+/// and the loss of the WAL. Removing or retyping a column is refused at start with the reason.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn a_table_gains_nullable_columns_without_losing_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let old_data = dir.path().join("old.ndjson");
+    let new_data = dir.path().join("new.ndjson");
+    let base = 1_762_700_000_000i64; // ms
+    // 2 devices × 100,000 readings before the change: chunks of 65,536 are sealed and persisted
+    let mut f = std::fs::File::create(&old_data).unwrap();
+    for i in 0..100_000i64 {
+        for dev in ["m1", "m2"] {
+            writeln!(f, r#"{{"t":{},"dev":"{dev}","v":{}.5}}"#, base + i, i % 100).unwrap();
+        }
+    }
+    drop(f);
+    // 2 × 5,000 readings after it, with the new fields (every fourth without kw)
+    let mut f = std::fs::File::create(&new_data).unwrap();
+    for i in 100_000..105_000i64 {
+        for dev in ["m1", "m2"] {
+            if i % 4 == 0 {
+                writeln!(f, r#"{{"t":{},"dev":"{dev}","v":1.0,"n":{i}}}"#, base + i).unwrap();
+            } else {
+                writeln!(
+                    f,
+                    r#"{{"t":{},"dev":"{dev}","v":1.0,"kw":2.5,"n":{i}}}"#,
+                    base + i
+                )
+                .unwrap();
+            }
+        }
+    }
+    drop(f);
+    let empty = dir.path().join("empty.ndjson");
+    std::fs::write(&empty, "").unwrap();
+    let (flight, metrics) = (free_port(), free_port());
+    // every source maps every column: messages without the new fields give NULL
+    let config = |columns: &str, old: &Path, new: &Path, map: &str| {
+        format!(
+            r#"
+[feed]
+enabled = false
+streams = []
+[server]
+flight_addr = "127.0.0.1:{flight}"
+metrics_addr = "127.0.0.1:{metrics}"
+[storage]
+snapshot_ms = 100
+wal_dir = "{wal}"
+checkpoint_dir = "{ckpt}"
+hot_sealed_chunks = 1
+checkpoint_interval_s = 1
+
+[[tables]]
+name = "readings"
+partition_by = "dev"
+columns = [
+  {{ name = "ts", type = "timestamp_ns" }},
+  {{ name = "dev", type = "dict" }},
+  {columns}
+]
+
+[[sources]]
+name = "old"
+kind = "file"
+url = "{old}"
+format = "json"
+table = "readings"
+ts_unit = "millis"
+map = {map}
+
+[[sources]]
+name = "new"
+kind = "file"
+url = "{new}"
+format = "json"
+table = "readings"
+ts_unit = "millis"
+map = {map}
+"#,
+            wal = dir.path().join("wal").display(),
+            ckpt = dir.path().join("ckpt").display(),
+            old = old.display(),
+            new = new.display(),
+        )
+    };
+    let v1_cols = r#"{ name = "v", type = "float64", nullable = true },"#;
+    let v2_cols = r#"{ name = "v", type = "float64", nullable = true },
+  { name = "kw", type = "fixed8", nullable = true },
+  { name = "n", type = "int64", nullable = true },"#;
+    let v1 = config(
+        v1_cols,
+        &old_data,
+        &empty,
+        r#"{ ts = "t", dev = "dev", v = "v" }"#,
+    );
+    let v2 = config(
+        v2_cols,
+        &old_data,
+        &new_data,
+        r#"{ ts = "t", dev = "dev", v = "v", kw = "kw", n = "n" }"#,
+    );
+    let addr = format!("127.0.0.1:{flight}");
+    let long = Duration::from_secs(60);
+
+    let s = start(&v1, dir.path(), "v1", &[]);
+    wait_for(&s.1, "flight listening", long);
+    until(&addr, "SELECT count(*) FROM readings", "200000", long);
+    let old_sum = first_cell(&query(&addr, "SELECT sum(v) FROM readings"));
+    stop(s);
+    let segments =
+        std::fs::read_dir(dir.path().join("ckpt").join("readings")).map_or(0, Iterator::count);
+    assert!(
+        segments >= 2,
+        "segments written before the change: {segments}"
+    );
+
+    // two nullable columns added at the end
+    let fingerprint = |addr: &str| -> Vec<String> {
+        [
+            "SELECT count(*) FROM readings",
+            "SELECT count(kw) FROM readings",
+            "SELECT count(n) FROM readings",
+            "SELECT count(*) FROM readings WHERE kw IS NULL AND ts < TIMESTAMP '2025-11-09T14:55:00Z'",
+            "SELECT sum(v) FROM readings WHERE ts < TIMESTAMP '2025-11-09T14:55:00Z'",
+            "SELECT sum(kw) FROM readings",
+            "SELECT min(n) FROM readings",
+        ]
+        .iter()
+        .map(|q| first_cell(&query(addr, q)))
+        .collect()
+    };
+    let s = start(&v2, dir.path(), "v2", &[]);
+    wait_for(&s.1, "flight listening", long);
+    until(&addr, "SELECT count(*) FROM readings", "210000", long);
+    let start_log = strip_ansi(&std::fs::read_to_string(&s.1).unwrap());
+    assert!(
+        !start_log.contains("evolved=0"),
+        "segments read as the new schema:\n{start_log}"
+    );
+    let after = fingerprint(&addr);
+    assert_eq!(after[0], "210000");
+    assert_eq!(
+        after[1], "7500",
+        "kw in 3 of 4 new readings, none in the old ones"
+    );
+    assert_eq!(after[2], "10000");
+    assert_eq!(after[3], "200000", "old rows read NULL in the added column");
+    assert_eq!(after[4], old_sum, "old values unchanged");
+    assert_eq!(
+        after[5], "1875000000000",
+        "fixed8 sums are in ticks: 7,500 × 2.5 × 10^8"
+    );
+    assert_eq!(after[6], "100000");
+    // crash and recover: identical
+    drop(s);
+    let s = start(&v2, dir.path(), "v2-crash", &[]);
+    wait_for(&s.1, "flight listening", long);
+    until(&addr, "SELECT count(*) FROM readings", "210000", long);
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(fingerprint(&addr), after, "after a crash");
+    stop(s);
+    // without the WAL: every row from segments, old and new shapes side by side
+    std::fs::remove_dir_all(dir.path().join("wal")).unwrap();
+    let v2_empty = config(
+        v2_cols,
+        &empty,
+        &empty,
+        r#"{ ts = "t", dev = "dev", v = "v", kw = "kw", n = "n" }"#,
+    );
+    let s = start(&v2_empty, dir.path(), "v2-nowal", &[]);
+    wait_for(&s.1, "flight listening", long);
+    until(&addr, "SELECT count(*) FROM readings", "210000", long);
+    assert_eq!(fingerprint(&addr), after, "without the WAL");
+    stop(s);
+
+    // a column retyped: refused with the reason, nothing attached
+    let retyped = config(
+        r#"{ name = "v", type = "int64", nullable = true },"#,
+        &empty,
+        &empty,
+        r#"{ ts = "t", dev = "dev", v = "v" }"#,
+    );
+    let mut s = start(&retyped, dir.path(), "retyped", &[]);
+    let t0 = Instant::now();
+    while s.0.try_wait().unwrap().is_none() {
+        assert!(t0.elapsed() < long, "a retyped column must stop the start");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let refusal = strip_ansi(&std::fs::read_to_string(&s.1).unwrap());
+    assert!(refusal.contains("cannot be read as table"), "{refusal}");
+    assert!(
+        refusal.contains("columns can only be added at the end"),
+        "{refusal}"
+    );
+}

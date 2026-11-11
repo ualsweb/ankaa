@@ -396,7 +396,8 @@ both directories at once is simpler still.
 
 ## 10. Upgrades
 
-Single binary, no schema migration: **stop, replace, start**.
+Single binary, no migration step: **stop, replace, start**. (Adding nullable columns to a user
+table needs no migration either: see "Changing a table" in `docs/generic-ingest.md`.)
 
 ```sh
 sudo systemctl stop ankaad            # SIGINT, orderly shutdown, final WAL commit

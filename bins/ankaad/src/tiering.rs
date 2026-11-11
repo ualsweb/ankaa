@@ -77,6 +77,8 @@ pub struct RestoreStats {
     pub max_lsn: u64,
     /// Unreadable files skipped.
     pub bad_files: usize,
+    /// Segments written before their table gained columns (read with the added ones `NULL`).
+    pub evolved: usize,
 }
 
 impl Tiering {
@@ -265,11 +267,15 @@ impl Tiering {
 
     /// Re-attach persisted segments to the (empty) tables.
     ///
-    /// Fails, without attaching anything that could be overwritten later, when a segment cannot
-    /// be read or was written with a different column set than the table has now. Starting
-    /// without those files would hide their rows and then reuse their chunk ids, replacing the
-    /// old files with new data. The message names the files; the operator decides (restore the
-    /// previous table definition, or move the files out of the directory).
+    /// A segment written before the table gained nullable columns at the end (or before a
+    /// column became nullable) is read as the current schema, the added columns `NULL`
+    /// ([`ankaa_store::Evolved`]); nothing is rewritten. Fails, without attaching anything that
+    /// could be overwritten later, when a segment cannot be read or its columns cannot be read
+    /// as the table's (a column removed, renamed, retyped or reordered, or a non-nullable one
+    /// added). Starting without those files would hide their rows and then reuse their chunk
+    /// ids, replacing the old files with new data. The message names the files and the
+    /// difference; the operator decides (restore the previous table definition, or move the
+    /// files out of the directory).
     pub fn restore(&mut self, tables: &Tables) -> anyhow::Result<RestoreStats> {
         let Some(dir) = &self.checkpoint_dir else {
             return Ok(RestoreStats::default());
@@ -285,10 +291,10 @@ impl Tiering {
         for seg in &segments {
             let meta = seg.meta();
             if let Some(table) = names.get(meta.table.as_str())
-                && *table.schema() != meta.schema
+                && let Err(why) = ankaa_store::schema_evolves(&meta.schema, table.schema())
             {
                 problems.push(format!(
-                    "{}: written with a different column set than table {:?} has now",
+                    "{}: cannot be read as table {:?} now: {why}",
                     seg.path().display(),
                     meta.table
                 ));
@@ -302,7 +308,7 @@ impl Tiering {
                 .collect::<Vec<_>>()
                 .join("\n  ");
             anyhow::bail!(
-                "{} segment file(s) under {} cannot be used:\n  {shown}\nThere is no schema migration yet. Restore the previous table definition, or move these files out of the directory to start without their rows.",
+                "{} segment file(s) under {} cannot be used:\n  {shown}\nA table may gain nullable columns at the end (and a column may become nullable); other changes need the previous table definition back, or these files moved out of the directory to start without their rows.",
                 problems.len(),
                 dir.display()
             );
@@ -315,7 +321,14 @@ impl Tiering {
                 continue;
             };
             let part = table.partition_for(meta.partition);
-            table.with_partition(part, |p| p.restore_sealed(ChunkRef::Encoded(seg.clone())));
+            // the same allocation as `seg`: the cold map's reference count still tells whether
+            // a query holds the file
+            let chunk = ankaa_store::Evolved::wrap(seg.clone(), table.schema())
+                .map_err(|why| anyhow::anyhow!("{}: {why}", seg.path().display()))?;
+            if meta.schema != *table.schema() {
+                st.evolved += 1;
+            }
+            table.with_partition(part, |p| p.restore_sealed(ChunkRef::Encoded(chunk)));
             st.segments += 1;
             st.rows += meta.num_rows as u64;
             st.max_lsn = st.max_lsn.max(meta.lsn_range.1);

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use crate::chunk::{Chunk, ChunkId};
 use crate::column::Column;
-use crate::schema::Schema;
+use crate::schema::{ColumnType, Schema};
 
 /// Which tier a chunk lives in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -143,6 +143,153 @@ pub trait EncodedChunk: Send + Sync + Debug {
             .into_iter()
             .map(|c| (c, None))
             .collect())
+    }
+}
+
+/// Whether chunks written with schema `old` can be read as `new`: the columns of `old` come
+/// first in `new` with the same names and types, a column may have become nullable (old rows all
+/// hold a value), and every column `new` adds is nullable (old rows hold `NULL` there).
+/// `Err` says what differs.
+pub fn schema_evolves(old: &Schema, new: &Schema) -> Result<(), String> {
+    let (o, n) = (old.fields(), new.fields());
+    if n.len() < o.len() {
+        return Err(format!(
+            "the table has {} columns, fewer than the {} it was written with (columns cannot be removed)",
+            n.len(),
+            o.len()
+        ));
+    }
+    for (i, (a, b)) in o.iter().zip(n).enumerate() {
+        if a.name != b.name || a.ty != b.ty {
+            return Err(format!(
+                "column {i} was {:?} ({:?}) and is now {:?} ({:?}): columns can only be added at the end",
+                a.name, a.ty, b.name, b.ty
+            ));
+        }
+        if a.nullable && !b.nullable {
+            return Err(format!(
+                "column {:?} held NULLs and is no longer nullable",
+                a.name
+            ));
+        }
+    }
+    if let Some(f) = n[o.len()..].iter().find(|f| !f.nullable) {
+        return Err(format!(
+            "added column {:?} must be nullable (the rows written before it have no value)",
+            f.name
+        ));
+    }
+    Ok(())
+}
+
+/// An encoded chunk written before its table gained columns (see [`schema_evolves`]), read as
+/// the table's current schema: the stored columns are decoded as they are, an added column is
+/// all `NULL` (zeroed pages from the allocator, nothing read from disk). Its metadata carries
+/// the new schema and promises no order on the last column (that column changed).
+#[derive(Debug)]
+pub struct Evolved {
+    inner: Arc<dyn EncodedChunk>,
+    meta: ChunkMeta,
+    /// Columns the inner chunk holds (a prefix of the schema).
+    stored: usize,
+}
+
+impl Evolved {
+    /// `inner` read as `schema`: the chunk itself when the schemas are equal, an adapter when
+    /// `schema` evolved from it, `Err` (the reason) otherwise.
+    pub fn wrap(
+        inner: Arc<dyn EncodedChunk>,
+        schema: &Schema,
+    ) -> Result<Arc<dyn EncodedChunk>, String> {
+        let old = &inner.meta().schema;
+        if old == schema {
+            return Ok(inner);
+        }
+        schema_evolves(old, schema)?;
+        let stored = old.fields().len();
+        let mut meta = inner.meta().clone();
+        meta.schema = schema.clone();
+        meta.tie_order = None;
+        Ok(Arc::new(Self {
+            inner,
+            meta,
+            stored,
+        }))
+    }
+
+    fn assemble<T>(
+        &self,
+        projection: &[usize],
+        mut stored: impl Iterator<Item = T>,
+        added: impl Fn(ColumnType, usize) -> T,
+    ) -> Vec<T> {
+        let n = self.meta.num_rows;
+        projection
+            .iter()
+            .filter_map(|&i| {
+                if i < self.stored {
+                    stored.next()
+                } else {
+                    Some(added(self.meta.schema.fields().get(i)?.ty, n))
+                }
+            })
+            .collect()
+    }
+}
+
+/// A column of `n` zeros (the placeholder of `NULL` rows).
+fn zeroed(ty: ColumnType, n: usize) -> Column {
+    match ty {
+        ColumnType::TimestampNs | ColumnType::FixedPoint { .. } | ColumnType::Int64 => {
+            Column::I64(vec![0; n])
+        }
+        ColumnType::DictU32 => Column::U32(vec![0; n]),
+        ColumnType::U8 => Column::U8(vec![0; n]),
+        ColumnType::Float64 => Column::F64(vec![0.0; n]),
+    }
+}
+
+impl EncodedChunk for Evolved {
+    fn meta(&self) -> &ChunkMeta {
+        &self.meta
+    }
+
+    fn tier(&self) -> Tier {
+        self.inner.tier()
+    }
+
+    fn encoded_bytes(&self) -> usize {
+        self.inner.encoded_bytes()
+    }
+
+    fn decode(&self, projection: &[usize]) -> Result<Vec<Column>, DecodeError> {
+        let inner: Vec<usize> = projection
+            .iter()
+            .copied()
+            .filter(|&i| i < self.stored)
+            .collect();
+        let stored = if inner.is_empty() {
+            Vec::new()
+        } else {
+            self.inner.decode(&inner)?
+        };
+        Ok(self.assemble(projection, stored.into_iter(), zeroed))
+    }
+
+    fn decode_nullable(&self, projection: &[usize]) -> Result<Vec<NullableColumn>, DecodeError> {
+        let inner: Vec<usize> = projection
+            .iter()
+            .copied()
+            .filter(|&i| i < self.stored)
+            .collect();
+        let stored = if inner.is_empty() {
+            Vec::new()
+        } else {
+            self.inner.decode_nullable(&inner)?
+        };
+        Ok(self.assemble(projection, stored.into_iter(), |ty, n| {
+            (zeroed(ty, n), Some(vec![false; n]))
+        }))
     }
 }
 
@@ -388,5 +535,148 @@ impl TierStats {
         self.hot_bytes += o.hot_bytes;
         self.warm_bytes += o.warm_bytes;
         self.cold_bytes += o.cold_bytes;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::Field;
+
+    /// A plain in-memory encoded chunk for the adapter tests.
+    #[derive(Debug)]
+    struct Plain(ChunkMeta, Vec<Column>, Vec<Option<Vec<bool>>>);
+
+    impl EncodedChunk for Plain {
+        fn meta(&self) -> &ChunkMeta {
+            &self.0
+        }
+        fn tier(&self) -> Tier {
+            Tier::Cold
+        }
+        fn encoded_bytes(&self) -> usize {
+            0
+        }
+        fn decode(&self, projection: &[usize]) -> Result<Vec<Column>, DecodeError> {
+            Ok(projection.iter().map(|&i| self.1[i].clone()).collect())
+        }
+        fn decode_nullable(
+            &self,
+            projection: &[usize],
+        ) -> Result<Vec<NullableColumn>, DecodeError> {
+            Ok(projection
+                .iter()
+                .map(|&i| (self.1[i].clone(), self.2[i].clone()))
+                .collect())
+        }
+    }
+
+    fn schema(fields: Vec<Field>) -> Schema {
+        Schema::new(fields).unwrap()
+    }
+
+    fn v1() -> Schema {
+        schema(vec![
+            Field::new("ts", ColumnType::TimestampNs),
+            Field::new("dev", ColumnType::DictU32),
+            Field::new("seq", ColumnType::Int64),
+        ])
+    }
+
+    #[test]
+    fn which_changes_old_chunks_survive() {
+        let v2 = schema(vec![
+            Field::new("ts", ColumnType::TimestampNs),
+            Field::new("dev", ColumnType::DictU32),
+            Field::nullable("seq", ColumnType::Int64),
+            Field::nullable("kw", ColumnType::Float64),
+        ]);
+        assert_eq!(schema_evolves(&v1(), &v1()), Ok(()));
+        assert_eq!(
+            schema_evolves(&v1(), &v2),
+            Ok(()),
+            "added nullable, relaxed NOT NULL"
+        );
+        let bad = |fields: Vec<Field>| schema_evolves(&v1(), &schema(fields)).unwrap_err();
+        assert!(bad(vec![Field::new("ts", ColumnType::TimestampNs)]).contains("removed"));
+        assert!(
+            bad(vec![
+                Field::new("ts", ColumnType::TimestampNs),
+                Field::new("dev", ColumnType::DictU32),
+                Field::new("seq", ColumnType::Float64),
+            ])
+            .contains("added at the end")
+        );
+        assert!(
+            bad(vec![
+                Field::new("ts", ColumnType::TimestampNs),
+                Field::new("dev", ColumnType::DictU32),
+                Field::new("seq", ColumnType::Int64),
+                Field::new("kw", ColumnType::Float64),
+            ])
+            .contains("must be nullable")
+        );
+        // NULLs written cannot become NOT NULL
+        assert!(schema_evolves(&v2, &v1()).is_err());
+    }
+
+    #[test]
+    fn evolved_chunks_read_added_columns_as_null() {
+        let n = 5;
+        let old = v1();
+        let meta = ChunkMeta {
+            table: "t".into(),
+            partition: 0,
+            id: ChunkId(3),
+            schema: old.clone(),
+            num_rows: n,
+            ts_min: 0,
+            ts_max: 4,
+            lsn_range: (1, 1),
+            last_lsn_rows: 5,
+            u32_ranges: vec![(1, 0, 0)],
+            i64_stats: vec![(0, 0, 4, 10)],
+            tie_order: Some((0, 4)),
+        };
+        let cols = vec![
+            Column::I64((0..5).collect()),
+            Column::U32(vec![0; 5]),
+            Column::I64((10..15).collect()),
+        ];
+        let inner: Arc<dyn EncodedChunk> = Arc::new(Plain(meta, cols, vec![None, None, None]));
+        // the same schema: the chunk itself
+        assert!(Arc::ptr_eq(
+            &Evolved::wrap(inner.clone(), &old).unwrap(),
+            &inner
+        ));
+        let v2 = schema(vec![
+            Field::new("ts", ColumnType::TimestampNs),
+            Field::new("dev", ColumnType::DictU32),
+            Field::new("seq", ColumnType::Int64),
+            Field::nullable("kw", ColumnType::Float64),
+            Field::nullable("n", ColumnType::Int64),
+        ]);
+        let e = Evolved::wrap(inner.clone(), &v2).unwrap();
+        assert_eq!(e.meta().schema, v2);
+        assert_eq!(e.meta().tie_order, None, "the last column changed");
+        assert_eq!(e.meta().i64_stats, vec![(0, 0, 4, 10)]);
+        // any projection order, stored and added columns mixed
+        let got = e.decode_nullable(&[4, 2, 3, 0]).unwrap();
+        assert_eq!(got[0], (Column::I64(vec![0; n]), Some(vec![false; n])));
+        assert_eq!(got[1], (Column::I64((10..15).collect()), None));
+        assert_eq!(got[2], (Column::F64(vec![0.0; n]), Some(vec![false; n])));
+        assert_eq!(got[3], (Column::I64((0..5).collect()), None));
+        assert_eq!(e.decode(&[3]).unwrap(), vec![Column::F64(vec![0.0; n])]);
+        // the adapter shares the inner allocation (a file's reference count stays meaningful)
+        assert_eq!(Arc::strong_count(&inner), 2);
+        drop(e);
+        assert_eq!(Arc::strong_count(&inner), 1);
+        assert!(
+            Evolved::wrap(
+                inner,
+                &schema(vec![Field::new("ts", ColumnType::TimestampNs)])
+            )
+            .is_err()
+        );
     }
 }

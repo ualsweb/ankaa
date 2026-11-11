@@ -83,7 +83,7 @@
 - No cap on the number of Flight connections (each is limited to 64 concurrent calls; queries are capped globally).
 - Replication is asynchronous with manual failover; there is no fencing of an old primary (the WAL `epoch` field is constant) and no automatic re-seed.
 - Keyed ASOF continuous queries are limited to the market tables (user tables keep one dictionary each). Continuous queries drop late rows (no retraction).
-- No schema migration for user tables: segments written with another column set are skipped at start with a warning.
+- User tables can gain nullable columns at the end (or make a column nullable) with their history kept; any other column change stops the start with the reason (restore the definition or move the segments away).
 - The `file://` capture feed re-serves its captures on every start: do not combine it with `storage.wal_dir` outside demos.
 - Postgres wire: no TLS of its own and no statement timeout (the query memory pool applies); trusted tools only. `/metrics` is plaintext.
 - Replay inputs are operator-supplied and partly trusted: WAL segments are read whole into memory at recovery (bounded by the 256 MiB segment size), CSV and Parquet files are read as they are.
