@@ -387,6 +387,14 @@ pub struct StorageConfig {
     pub wal_dir: Option<PathBuf>,
     /// Keep this many sealed chunks per partition hot (uncompressed) before encoding to the warm tier.
     pub hot_sealed_chunks: usize,
+    /// Memory for uncompressed rows, MiB: open chunks (counted twice: the chunk and its query
+    /// view) and hot sealed chunks. Over it, the partitions with the oldest open rows are sealed
+    /// and encoded first, then the hot window of every partition shrinks. 0 = no budget.
+    pub hot_budget_mib: u64,
+    /// An open chunk whose first row is older than this (seconds, wall clock) is sealed and
+    /// encoded, filled or not: devices that report rarely do not keep rows uncompressed for
+    /// days. 0 = never by age.
+    pub max_open_age_s: u64,
     /// Directory for checkpointed segments; `None` keeps everything in memory.
     pub checkpoint_dir: Option<PathBuf>,
     /// Snapshot (query view swap) interval in milliseconds.
@@ -511,6 +519,8 @@ impl Default for StorageConfig {
         Self {
             wal_dir: None,
             hot_sealed_chunks: 4,
+            hot_budget_mib: 1024,
+            max_open_age_s: 600,
             checkpoint_dir: None,
             snapshot_ms: 50,
             ingest_coalesce_us: 200,

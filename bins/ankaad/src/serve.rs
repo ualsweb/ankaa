@@ -946,6 +946,12 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let mut last_rebase: Option<Instant> = None;
     // Sparkplug definitions frames: when the last was written, and the newest checkpoint
     let mut last_sp_mark: Option<Instant> = None;
+    // uncompressed rows: bounded in bytes and in age (see `Tiering::relieve_memory`)
+    let mut last_mem_check = Instant::now();
+    let hot_budget = usize::try_from(cfg.storage.hot_budget_mib.saturating_mul(1024 * 1024))
+        .unwrap_or(usize::MAX);
+    let max_open_age =
+        (cfg.storage.max_open_age_s > 0).then(|| Duration::from_secs(cfg.storage.max_open_age_s));
     let mut last_ckpt = 0u64;
     let sp_mark_every = Duration::from_secs(cfg.storage.checkpoint_interval_s.max(1));
     let wal_budget = cfg.storage.wal_budget_mib.saturating_mul(1024 * 1024);
@@ -1133,6 +1139,15 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                             ingest.rebase_books = false;
                             last_rebase = Some(Instant::now());
                             info!("order books are being re-based on fresh snapshots");
+                        }
+                    }
+                    if last_mem_check.elapsed() >= Duration::from_secs(1) {
+                        last_mem_check = Instant::now();
+                        let (aged, pressed) =
+                            tiering.relieve_memory(&ingest.tables, hot_budget, max_open_age);
+                        if aged + pressed > 0 {
+                            metrics.tier.sealed_for_age.fetch_add(aged as u64, Ordering::Relaxed);
+                            metrics.tier.sealed_for_memory.fetch_add(pressed as u64, Ordering::Relaxed);
                         }
                     }
                     // Sparkplug definitions into the log, so that truncation can pass the BIRTHs

@@ -54,6 +54,11 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   to rows on `storage.ingest_workers` threads (default: cores − 2) that share nothing, and applied in log
   order by the ingest loop, so tables, dictionaries (values and ids), the dictionary cap, continuous queries
   and counters are exactly those of one thread (property test over random streams with 1–7 workers).
+- Uncompressed rows are bounded: `storage.hot_budget_mib` (default 1 GiB) seals and encodes the partitions with
+  the oldest open rows first, and `storage.max_open_age_s` (default 10 min) seals open chunks that wait too
+  long. Before, a table with one partition per device kept every reading uncompressed (twice: the open chunk
+  and its query view) until 65,536 had arrived for that device. Metrics `ankaa_tier_sealed_for_age_total`,
+  `ankaa_tier_sealed_for_memory_total`.
 - Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
   could hand the last messages to the next start again.
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on

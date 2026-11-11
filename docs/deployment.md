@@ -68,6 +68,8 @@ The schema is `crates/ankaa-core/src/config.rs`. All fields, with defaults:
 |---|---|---|---|
 | `wal_dir` | unset (no WAL) | `--wal-dir` | Directory for write-ahead-log segments. Setting it enables group-committed durability and recovery on start. Created if missing. |
 | `hot_sealed_chunks` | `4` | — | Sealed chunks per partition kept uncompressed (hot) before encoding to the warm tier. Must be ≥ 1. |
+| `hot_budget_mib` | `1024` | — | Memory for uncompressed rows: open chunks (counted twice: the chunk and its query view) plus hot sealed chunks. Over it, the partitions whose open rows are oldest are sealed and encoded first (open chunks of at least 1,024 rows), then every partition's hot window is given up. Matters with many partitions that fill slowly (one per device): without it their rows would wait uncompressed until 65,536 per device arrived. 0 = no budget. |
+| `max_open_age_s` | `600` | — | An open chunk whose first row arrived longer ago than this is sealed and encoded, whatever its size: a device that reports once a minute does not keep its readings uncompressed for 45 days. 0 = never by age. |
 | `checkpoint_dir` | unset | — | Directory for segment files (Vortex-encoded sealed chunks, one file per chunk under `<table>/p<partition>-c<id>.vortex`, plus the dictionaries `symbols.json` and `dictionaries.json`). Created if missing. A sealed chunk is written here before it leaves the hot tier; at start the segments are re-attached without decoding and the WAL replay skips the rows they already hold; WAL segments below the checkpoint LSN are deleted. Unset = everything stays in memory and the WAL is never truncated. |
 | `warm_budget_mib` | `512` | — | Encoded bytes kept in memory as warm chunks; above it the oldest warm chunks become cold (decoded from their segment file on demand). Needs `checkpoint_dir`. |
 | `checkpoint_interval_s` | `60` | — | Minimum seconds between WAL truncations. |
@@ -425,7 +427,7 @@ No measurements are published; these are arithmetic, not promises.
   `/metrics`, plus DataFusion query threads (one per core by default). Two cores run a handful of symbols; reserve
   cores for queries separately. Table functions (`asof_join`, `ohlcv`, `percentiles`) are eager and materialise
   their inputs, so a wide query can use a core and a copy of the table for its duration.
-- **Memory.** Hot chunks are plain columns; sealed chunks beyond `hot_sealed_chunks` are encoded (typically 4–12× smaller) and demoted to disk past `warm_budget_mib`. Per hot row before alignment:
+- **Memory.** Hot chunks are plain columns; sealed chunks beyond `hot_sealed_chunks` are encoded (typically 4–12× smaller) and demoted to disk past `warm_budget_mib`; uncompressed rows as a whole are kept within `hot_budget_mib` and open chunks younger than `max_open_age_s`. Per hot row before alignment:
   `trades` 37 B, `book_deltas` 45 B, `quotes` 52 B, in 65,536-row chunks. A depth stream at 100 ms with ~10 levels
   per message yields ~100 `book_deltas` rows/s per symbol (~16 MB/h) plus up to 10 `quotes` rows/s. Add the 64k-row
   open-chunk copies taken every `snapshot_ms`, the 65,536-frame source and WAL channels (bounded by frame size), and

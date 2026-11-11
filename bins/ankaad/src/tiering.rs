@@ -35,6 +35,9 @@ use crate::tables::Tables;
 /// Key of a sealed chunk across tables.
 type Key = (String, u32, ChunkId);
 
+/// Smallest open chunk sealed to stay within the memory budget (an age limit seals any size).
+pub const MIN_SEAL_ROWS: usize = 1024;
+
 /// Tiering state.
 pub struct Tiering {
     enc: Arc<Encoder>,
@@ -338,6 +341,70 @@ impl Tiering {
         Ok(st)
     }
 
+    /// Keep uncompressed rows within `budget` bytes and open chunks younger than `max_age`: seal
+    /// the open chunks that are too old, then, while the hot bytes (open chunks twice, for their
+    /// query view, plus hot sealed chunks) exceed the budget, the open chunks with the oldest
+    /// first row (only those of at least [`MIN_SEAL_ROWS`] rows, so busy partitions are not
+    /// shredded into small chunks); still over it, every partition's hot window is given up.
+    /// Sealed partitions are marked so that the next tiering steps encode all their hot chunks.
+    /// Returns `(sealed for age, sealed for memory)`.
+    pub fn relieve_memory(
+        &mut self,
+        tables: &Tables,
+        budget: usize,
+        max_age: Option<Duration>,
+    ) -> (usize, usize) {
+        let now = Instant::now();
+        let mut hot = 0usize;
+        // (first row, bytes, rows, table, partition)
+        let mut open: Vec<(Instant, usize, usize, String, u32)> = Vec::new();
+        for (name, table) in tables.persistent() {
+            hot += table.tier_stats().hot_bytes;
+            table.for_each_partition(|p| {
+                if let Some(since) = p.open_since() {
+                    let b = p.open_bytes();
+                    hot += 2 * b;
+                    open.push((since, b, p.open_rows(), name.to_owned(), p.key()));
+                }
+            });
+        }
+        open.sort_by_key(|o| o.0);
+        let mut seal: Vec<(String, u32)> = Vec::new();
+        let mut by_age = 0;
+        let mut by_memory = 0;
+        for (since, b, rows, name, key) in open {
+            let old = max_age.is_some_and(|m| now.duration_since(since) >= m);
+            let over = budget > 0 && hot > budget && rows >= MIN_SEAL_ROWS;
+            if old || over {
+                if old {
+                    by_age += 1;
+                } else {
+                    by_memory += 1;
+                }
+                // once encoded, its bytes leave the hot tier (the view's copy goes at once)
+                hot = hot.saturating_sub(2 * b);
+                seal.push((name, key));
+            }
+        }
+        for (name, key) in seal {
+            if let Some((_, table)) = tables.persistent().into_iter().find(|(n, _)| *n == name) {
+                table.with_partition(key as usize, ankaa_store::Partition::seal_open);
+            }
+            self.forced.insert((name, key));
+        }
+        if budget > 0 && hot > budget {
+            // sealed hot chunks alone exceed the budget: no partition keeps a hot window
+            for (name, table) in tables.persistent() {
+                table.for_each_partition(|p| {
+                    if p.hot_sealed() > 0 {
+                        self.forced.insert((name.to_owned(), p.key()));
+                    }
+                });
+            }
+        }
+        (by_age, by_memory)
+    }
+
     /// The WAL has outgrown its budget and `target_lsn` is where its second-oldest segment
     /// starts: seal and persist the partitions that still hold rows from before it, so that the
     /// next checkpoint can pass `target_lsn` and the oldest segment can go. Without this, one
@@ -619,6 +686,59 @@ mod tests {
 
     fn total_rows(t: &Tables) -> u64 {
         t.trades.stats().rows
+    }
+
+    /// Uncompressed rows stay bounded: open chunks older than the age limit are sealed whatever
+    /// their size; over the byte budget the ones with the oldest first row go first, never one
+    /// under `MIN_SEAL_ROWS`; sealed partitions are encoded by the next tiering steps (also
+    /// without a checkpoint directory), and no row is lost.
+    #[test]
+    fn memory_relief_seals_old_and_large_open_chunks_first() {
+        let metrics = Metrics::default();
+        let mut tables = Tables::new(false);
+        // symbol 1 first (oldest open rows), then symbol 0; 3,000 rows each, plus a small one
+        let mut b = trades(0, 0);
+        for i in 0..3_000 {
+            let mut t = trades(2 * i + 1, 1).trades[0];
+            t.symbol = SymbolId(1);
+            b.trades.push(t);
+        }
+        tables.ingest(&b);
+        std::thread::sleep(Duration::from_millis(20));
+        let mut b = trades(0, 0);
+        for i in 0..3_000 {
+            let mut t = trades(10_000 + 2 * i, 1).trades[0];
+            t.symbol = SymbolId(0);
+            b.trades.push(t);
+        }
+        tables.ingest(&b);
+        let open = |t: &Tables| {
+            let mut v = Vec::new();
+            t.trades.for_each_partition(|p| v.push(p.open_rows()));
+            v
+        };
+        assert_eq!(open(&tables), vec![3_000, 3_000]);
+        let mut tier = Tiering::new(None, 4, usize::MAX, Duration::from_secs(5), Duration::ZERO);
+        // no budget, no age limit: nothing
+        assert_eq!(tier.relieve_memory(&tables, 0, None), (0, 0));
+        // a budget that one partition's rows exceed: the oldest (symbol 1) only
+        let row = tables.trades.schema().fields().len() * 8;
+        let budget = 2 * 3_000 * row + 1;
+        assert_eq!(tier.relieve_memory(&tables, budget, None), (0, 1));
+        assert_eq!(open(&tables), vec![3_000, 0]);
+        // the age limit seals what is left, whatever the budget
+        assert_eq!(tier.relieve_memory(&tables, 0, Some(Duration::ZERO)), (1, 0));
+        assert_eq!(open(&tables), vec![0, 0]);
+        // the sealed chunks leave the hot tier (the hot window of 4 does not keep them)
+        for _ in 0..10 {
+            tier.tick(&tables, &metrics);
+        }
+        let st = tables.trades.tier_stats();
+        assert_eq!((st.hot_chunks, st.warm_chunks), (0, 2));
+        assert_eq!(total_rows(&tables), 6_000);
+        // a chunk under MIN_SEAL_ROWS is left to fill, however tight the budget
+        tables.ingest(&trades(20_000, 10));
+        assert_eq!(tier.relieve_memory(&tables, 1, None), (0, 0));
     }
 
     /// Retention drops the old chunks of every tier, and a segment file goes only once no query

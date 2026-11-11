@@ -143,6 +143,8 @@ All WAL metrics are 0 when `storage.wal_dir` is unset.
 | `ankaa_wal_oversized_total` | counter | frames | Frames larger than a WAL record may be (64 MiB), dropped before ingest so that memory and log agree. Expected 0. |
 | `ankaa_wal_errors_total` | counter | errors | Failed `append` (payload over 64 MiB) or failed `commit` (I/O error, disk full). Each is logged at `warn`. Expected 0. |
 | `ankaa_wal_recovered_frames` | gauge | frames | Frames replayed from the WAL at start. Constant for the life of the process. |
+| `ankaa_tier_sealed_for_age_total` | counter | chunks | Open chunks sealed (and then encoded) because their first row was older than `storage.max_open_age_s`. |
+| `ankaa_tier_sealed_for_memory_total` | counter | chunks | Open chunks sealed to keep uncompressed rows within `storage.hot_budget_mib`. A steady climb under load means the budget is smaller than the open rows of the busy partitions. |
 | `ankaa_wal_truncated_segments_total` | counter | segments | WAL segments deleted after a checkpoint (every sealed chunk in a segment, LSNs below the oldest open chunk). Only whole 256 MiB segments are removed, so short runs show 0. |
 
 Good looks like: `rate(ankaa_wal_durable_lsn[1m]) > 0` whenever `rate(ankaa_frames_total[1m]) > 0`

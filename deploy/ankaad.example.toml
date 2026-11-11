@@ -44,6 +44,11 @@ depth_snapshots = true
 
 # Sealed chunks per partition kept uncompressed (hot) before encoding to the warm tier (>= 1).
 hot_sealed_chunks = 4
+# Uncompressed rows (open chunks, counted twice for their query view, and hot sealed chunks)
+# are kept within this many MiB; the partitions with the oldest open rows are sealed first.
+hot_budget_mib = 1024
+# Open chunks older than this are sealed and encoded however few rows they hold (0 = never).
+max_open_age_s = 600
 
 # Directory for segment files (Vortex-encoded sealed chunks + the symbol dictionary). With it set,
 # every sealed chunk is written to disk before leaving the hot tier, restarts restore segments

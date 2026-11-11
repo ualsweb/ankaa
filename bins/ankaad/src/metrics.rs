@@ -76,6 +76,10 @@ pub struct TierMetrics {
     pub checkpoints: AtomicU64,
     /// WAL segments truncated after checkpoints.
     pub wal_truncated_segments: AtomicU64,
+    /// Open chunks sealed because their first row was older than `storage.max_open_age_s`.
+    pub sealed_for_age: AtomicU64,
+    /// Open chunks sealed to keep uncompressed rows within `storage.hot_budget_mib`.
+    pub sealed_for_memory: AtomicU64,
     /// Rows dropped by retention.
     pub expired_rows: AtomicU64,
     /// Chunks dropped by retention.
@@ -415,6 +419,18 @@ impl Metrics {
             "WAL segments removed after checkpoints",
             "counter",
             g(&self.tier.wal_truncated_segments),
+        );
+        m(
+            "ankaa_tier_sealed_for_age_total",
+            "Open chunks sealed because their first row was older than storage.max_open_age_s",
+            "counter",
+            g(&self.tier.sealed_for_age),
+        );
+        m(
+            "ankaa_tier_sealed_for_memory_total",
+            "Open chunks sealed to keep uncompressed rows within storage.hot_budget_mib",
+            "counter",
+            g(&self.tier.sealed_for_memory),
         );
         // books
         m(

@@ -57,6 +57,9 @@ pub struct Partition {
     /// How much older than the watermark a row may be and still be accepted, ns (0 = rows
     /// must arrive in time order).
     max_lateness: i64,
+    /// When the open chunk received its first row (`None` while it is empty): how long its rows
+    /// have been waiting, uncompressed, for the chunk to fill.
+    open_since: Option<std::time::Instant>,
 }
 
 /// What queries see of a chunk that is still being written: sealed copies of consecutive row
@@ -93,7 +96,28 @@ impl Partition {
             persisted_lsn_rows: 0,
             open_view: parking_lot::Mutex::new(OpenView::default()),
             max_lateness,
+            open_since: None,
         }
+    }
+
+    /// Rows in the open chunk.
+    #[must_use]
+    pub fn open_rows(&self) -> usize {
+        self.open.num_rows()
+    }
+
+    /// Bytes of the open chunk's columns (its query view holds a copy of about the same size).
+    #[must_use]
+    pub fn open_bytes(&self) -> usize {
+        (0..self.schema.fields().len())
+            .map(|i| self.open.column(i).map_or(0, |c| c.len() * c.value_size()))
+            .sum()
+    }
+
+    /// When the open chunk received its first row (`None` while empty).
+    #[must_use]
+    pub fn open_since(&self) -> Option<std::time::Instant> {
+        self.open_since
     }
 
     /// Set the WAL LSN for the rows appended next (0 = unknown). Rows from an LSN at or below
@@ -270,6 +294,8 @@ impl Partition {
             Ok(()) => {
                 self.stats.rows += 1;
                 self.open.note_lsn(self.current_lsn);
+                // one clock read per chunk, not per row
+                self.open_since.get_or_insert_with(std::time::Instant::now);
                 Ok(())
             }
             Err(e @ AppendError::OutOfOrder { .. }) => {
@@ -312,6 +338,7 @@ impl Partition {
             Chunk::new(ChunkId(self.next_id), self.schema.clone()),
         );
         self.next_id += 1;
+        self.open_since = None;
         done.seal();
         self.open.set_watermark(done.watermark());
         self.sealed.push(ChunkRef::Hot(Arc::new(done)));
