@@ -444,7 +444,27 @@ fn births_define_aliases_that_data_messages_use() {
 #[test]
 fn other_messages_give_no_rows() {
     let mut m = mapper();
-    let d = RowMapper::dictionaries_for(&schema());
+    let mut d = RowMapper::dictionaries_for(&schema());
+    // after a message with rows, one without must not leave them in the result (they would be
+    // stored again: an NCMD the server publishes comes back through its own subscription)
+    let birth = Payload {
+        metrics: vec![named("Temp", 0, dt::DOUBLE, Val::Double(1.0))],
+        ..Payload::default()
+    };
+    assert_eq!(
+        rows(&mut m, &msg("spBv1.0/plant/NBIRTH/gw1", &birth), &mut d).len(),
+        1
+    );
+    assert_eq!(
+        m.parse(b"spBv1.0/plant/NCMD/gw1\0", 0, false, &d).unwrap(),
+        0
+    );
+    assert_eq!(m.mapped().n_rows(), 0);
+    assert!(
+        m.parse(b"spBv1.0/plant/NDATA/gw1\0\xff", 0, false, &d)
+            .is_err()
+    );
+    assert_eq!(m.mapped().n_rows(), 0);
     let p = Payload {
         metrics: vec![named("bdSeq", 0, dt::INT64, Val::Long(1))],
         ..Payload::default()

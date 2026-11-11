@@ -109,7 +109,7 @@ impl SpField {
 }
 
 /// Sparkplug state of a mapper: what the BIRTH messages of its edge nodes defined.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct SpState {
     defs: Definitions,
     /// Per column: the selector has one value per message (`$group`, `$node`, `$device`,
@@ -147,14 +147,12 @@ enum ColSrc {
 }
 
 /// Compiled mapping for one table.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RowMapper {
     schema: Schema,
     selectors: Vec<Selector>,
     ts_unit: TsUnit,
     ts_from_receive: bool,
-    /// Index of the partition column (`DictU32`), if any.
-    partition_col: Option<usize>,
     /// Cap on distinct values per dictionary column.
     max_dict_entries: usize,
     /// Messages arrive as `topic \0 payload` (MQTT sources).
@@ -168,15 +166,8 @@ pub struct RowMapper {
     found: json_scan::Found,
     /// Scratch CSV field ranges.
     csv_fields: Vec<(usize, usize)>,
-    /// Output rows of the last message, row-major (`n_rows × columns`); reused.
-    rows: Vec<Value>,
-    n_rows: usize,
-    /// Per row of the last message: why it was refused (`None`: accepted so far).
-    row_err: Vec<Option<MapError>>,
-    /// Dictionary values not interned yet, per (row, column); the strings are reused.
-    pending: Vec<String>,
-    /// Which entries of `pending` belong to the last message.
-    pending_set: Vec<bool>,
+    /// What the last message mapped to (see [`Mapped`]); its buffers are reused.
+    out: Mapped,
     /// Per column: the distinct new dictionary values of the last message, counted against
     /// `max_dict_entries` so that one message of many rows cannot overshoot the cap.
     new_names: Vec<std::collections::HashSet<Box<str>>>,
@@ -301,12 +292,12 @@ impl RowMapper {
             None => None,
         };
         let (plan, col_src) = Self::compile(&selectors, None);
+        let out = Mapped::new(schema.clone(), partition_col);
         Ok(Self {
             schema,
             selectors,
             ts_unit,
             ts_from_receive,
-            partition_col,
             max_dict_entries: DEFAULT_MAX_DICT_ENTRIES,
             topic_prefixed: false,
             plan,
@@ -314,11 +305,7 @@ impl RowMapper {
             rows_path: None,
             found: json_scan::Found::default(),
             csv_fields: Vec::new(),
-            rows: Vec::new(),
-            n_rows: 0,
-            row_err: Vec::new(),
-            pending: Vec::new(),
-            pending_set: Vec::new(),
+            out,
             new_names: Vec::new(),
             sparkplug: None,
         })
@@ -509,6 +496,10 @@ impl RowMapper {
         csv: bool,
         dicts: &[Option<SymbolDict>],
     ) -> Result<usize, MapError> {
+        // the result describes this message whatever path returns: a message that maps to no
+        // row (or is refused) must not leave the previous message's rows behind
+        self.out.n_rows = 0;
+        self.out.row_err.clear();
         let (topic, payload) = if self.topic_prefixed {
             let cut =
                 memchr::memchr(0, msg).ok_or(MapError::Malformed("message without its topic"))?;
@@ -537,7 +528,7 @@ impl RowMapper {
                     Selector::Path(_) | Selector::Sparkplug(_) | Selector::Absent => None,
                 };
                 if let Err(e) = self.convert(0, c, raw.map(Scalar::Text), payload, recv_ns, dicts) {
-                    self.row_err[0] = Some(e);
+                    self.out.row_err[0] = Some(e);
                     break;
                 }
             }
@@ -565,7 +556,7 @@ impl RowMapper {
                     },
                 };
                 if let Err(e) = self.convert(r, c, raw, payload, recv_ns, dicts) {
-                    self.row_err[r] = Some(e);
+                    self.out.row_err[r] = Some(e);
                     break;
                 }
             }
@@ -639,13 +630,13 @@ impl RowMapper {
                 Err(e) => Err(e),
             };
             if let Err(e) = row {
-                self.row_err[r] = Some(e);
+                self.out.row_err[r] = Some(e);
             }
             r += 1;
         });
         walked.map_err(|e| MapError::Malformed(e.0))?;
-        self.n_rows = r;
-        self.row_err.truncate(r);
+        self.out.n_rows = r;
+        self.out.row_err.truncate(r);
         Ok(r)
     }
 
@@ -653,10 +644,10 @@ impl RowMapper {
     fn copy_cell(&mut self, from: usize, to: usize, c: usize) {
         let ncols = self.schema.fields().len();
         let (a, b) = (from * ncols + c, to * ncols + c);
-        self.rows[b] = self.rows[a];
-        self.pending_set[b] = self.pending_set[a];
-        if self.pending_set[a] {
-            let (lo, hi) = self.pending.split_at_mut(b);
+        self.out.rows[b] = self.out.rows[a];
+        self.out.pending_set[b] = self.out.pending_set[a];
+        if self.out.pending_set[a] {
+            let (lo, hi) = self.out.pending.split_at_mut(b);
             hi[0].clone_from(&lo[a]);
         }
     }
@@ -682,11 +673,11 @@ impl RowMapper {
         };
         let Some(raw) = raw else {
             if f.nullable && c > 0 {
-                self.rows[idx] = Value::Null;
+                self.out.rows[idx] = Value::Null;
                 return Ok(());
             }
             if c == 0 && self.ts_from_receive {
-                self.rows[idx] = Value::I64(recv_ns);
+                self.out.rows[idx] = Value::I64(recv_ns);
                 return Ok(());
             }
             // a key column always holds a value: "" where the selector does not apply
@@ -718,24 +709,24 @@ impl RowMapper {
             column: f.name.clone(),
             reason: reason.to_owned(),
         })?;
-        self.rows[idx] = value;
+        self.out.rows[idx] = value;
         Ok(())
     }
 
     /// Size the reused output buffers for `n_rows` rows.
     fn begin(&mut self, n_rows: usize, ncols: usize) {
         let cells = n_rows * ncols;
-        self.n_rows = n_rows;
-        if self.rows.len() < cells {
-            self.rows.resize(cells, Value::Null);
+        self.out.n_rows = n_rows;
+        if self.out.rows.len() < cells {
+            self.out.rows.resize(cells, Value::Null);
         }
-        if self.pending.len() < cells {
-            self.pending.resize_with(cells, String::new);
+        if self.out.pending.len() < cells {
+            self.out.pending.resize_with(cells, String::new);
         }
-        self.pending_set.clear();
-        self.pending_set.resize(cells, false);
-        self.row_err.clear();
-        self.row_err.resize(n_rows, None);
+        self.out.pending_set.clear();
+        self.out.pending_set.resize(cells, false);
+        self.out.row_err.clear();
+        self.out.row_err.resize(n_rows, None);
         if self.new_names.len() < ncols {
             self.new_names.resize_with(ncols, Default::default);
         }
@@ -750,47 +741,50 @@ impl RowMapper {
 
     /// Row `r` of the last message: its timestamp and partition key, or why it was refused.
     pub fn parsed(&self, r: usize) -> Result<Parsed, MapError> {
-        if let Some(e) = self.row_err.get(r).and_then(Option::as_ref) {
-            return Err(e.clone());
-        }
-        let ncols = self.schema.fields().len();
-        let base = r * ncols;
-        let ts = match self.rows.get(base) {
-            Some(Value::I64(t)) => *t,
-            _ => 0,
-        };
-        let key = match self.partition_col {
-            None => Some(0),
-            Some(i) if self.pending_set[base + i] => None,
-            Some(i) => match self.rows[base + i] {
-                Value::U32(k) => Some(k),
-                _ => Some(0),
-            },
-        };
-        Ok(Parsed { ts, key })
+        self.out.parsed(r)
     }
 
     /// Take row `r` of the last message: add its new dictionary values and return its
     /// partition key and values. Call it only once the row is going to be stored.
     pub fn finish_row(&mut self, r: usize, dicts: &mut [Option<SymbolDict>]) -> (u32, &[Value]) {
-        let ncols = self.schema.fields().len();
-        let base = r * ncols;
-        for c in 0..ncols {
-            if std::mem::take(&mut self.pending_set[base + c])
-                && let Some(d) = dicts.get_mut(c).and_then(Option::as_mut)
-            {
-                let SymbolId(id) = d.intern(&self.pending[base + c]);
-                self.rows[base + c] = Value::U32(id);
-            }
-        }
-        let key = match self.partition_col {
-            Some(i) => match self.rows[base + i] {
-                Value::U32(k) => k,
-                _ => 0,
-            },
-            None => 0,
-        };
-        (key, &self.rows[base..base + ncols])
+        self.out.finish_row(r, dicts)
+    }
+
+    /// What the last message mapped to.
+    #[must_use]
+    pub fn mapped(&self) -> &Mapped {
+        &self.out
+    }
+
+    /// The last message's result, mutably (to resolve and take its rows, see [`Mapped`]).
+    pub fn mapped_mut(&mut self) -> &mut Mapped {
+        &mut self.out
+    }
+
+    /// Exchange the last message's result with `other` (a used one, of any source, whose buffers
+    /// this mapper then reuses): how a mapping worker hands a result over without copying or
+    /// allocating. `other` takes this mapper's schema.
+    pub fn swap_mapped(&mut self, other: &mut Mapped) {
+        let o = &mut self.out;
+        std::mem::swap(&mut o.rows, &mut other.rows);
+        std::mem::swap(&mut o.n_rows, &mut other.n_rows);
+        std::mem::swap(&mut o.row_err, &mut other.row_err);
+        std::mem::swap(&mut o.pending, &mut other.pending);
+        std::mem::swap(&mut o.pending_set, &mut other.pending_set);
+        other.schema = o.schema.clone();
+        other.partition_col = o.partition_col;
+    }
+
+    /// An empty result shaped for this mapper (a first buffer for [`Self::swap_mapped`]).
+    #[must_use]
+    pub fn empty_mapped(&self) -> Mapped {
+        Mapped::new(self.out.schema.clone(), self.out.partition_col)
+    }
+
+    /// Cap on distinct values per dictionary column.
+    #[must_use]
+    pub fn max_dict_entries(&self) -> usize {
+        self.max_dict_entries
     }
 
     /// Convert one raw value into cell (`r`, `c`).
@@ -819,12 +813,12 @@ impl RowMapper {
             Some(Scalar::Text(s)) => s.is_empty(),
         };
         if absent && f.nullable && c > 0 {
-            self.rows[idx] = Value::Null;
+            self.out.rows[idx] = Value::Null;
             return Ok(());
         }
         let Some(raw) = raw else {
             if c == 0 && self.ts_from_receive {
-                self.rows[idx] = Value::I64(recv_ns);
+                self.out.rows[idx] = Value::I64(recv_ns);
                 return Ok(());
             }
             return Err(MapError::Missing(f.name.clone()));
@@ -867,7 +861,7 @@ impl RowMapper {
             return self.dict_value(idx, c, name, dicts);
         }
         let value = typed_value(f.ty, raw, text, num, kind, self.ts_unit).map_err(|r| conv(&r))?;
-        self.rows[idx] = value;
+        self.out.rows[idx] = value;
         Ok(())
     }
 
@@ -887,12 +881,17 @@ impl RowMapper {
         if name.len() > MAX_DICT_VALUE_BYTES {
             return Err(conv("dictionary value longer than 256 bytes"));
         }
-        let dict = dicts
-            .get(c)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| conv("not a dict column"))?;
+        // Mapped without the dictionaries (a parallel mapping worker): the name stays pending,
+        // and the cap is checked when the result is resolved against them (`Mapped::resolve`)
+        let Some(dict) = dicts.get(c).and_then(Option::as_ref) else {
+            self.out.pending[idx].clear();
+            self.out.pending[idx].push_str(name);
+            self.out.pending_set[idx] = true;
+            self.out.rows[idx] = Value::U32(u32::MAX);
+            return Ok(());
+        };
         if let Some(SymbolId(id)) = dict.get(name) {
-            self.rows[idx] = Value::U32(id);
+            self.out.rows[idx] = Value::U32(id);
             return Ok(());
         }
         // values new to the dictionary in this message count against the cap together
@@ -904,11 +903,143 @@ impl RowMapper {
             set.insert(name.into());
         }
         // interned by `finish_row`, once the row has been accepted
-        self.pending[idx].clear();
-        self.pending[idx].push_str(name);
-        self.pending_set[idx] = true;
-        self.rows[idx] = Value::U32(u32::MAX);
+        self.out.pending[idx].clear();
+        self.out.pending[idx].push_str(name);
+        self.out.pending_set[idx] = true;
+        self.out.rows[idx] = Value::U32(u32::MAX);
         Ok(())
+    }
+}
+
+/// What one message mapped to: its rows (row-major, `n_rows × columns`), why a row was refused,
+/// and the dictionary values not interned yet. Produced by [`RowMapper::parse`]; a mapping worker
+/// that has no access to the dictionaries hands it over ([`RowMapper::swap_mapped`]) and whoever
+/// owns them calls [`Self::resolve`], then [`Self::parsed`] and [`Self::finish_row`] per row.
+/// Buffers are reused across messages.
+#[derive(Debug, Clone)]
+pub struct Mapped {
+    schema: Schema,
+    partition_col: Option<usize>,
+    rows: Vec<Value>,
+    n_rows: usize,
+    row_err: Vec<Option<MapError>>,
+    pending: Vec<String>,
+    pending_set: Vec<bool>,
+    /// Scratch of [`Self::resolve`]: new values per column in the message.
+    new_names: Vec<std::collections::HashSet<Box<str>>>,
+}
+
+impl Mapped {
+    /// An empty result for rows of `schema`.
+    #[must_use]
+    pub fn new(schema: Schema, partition_col: Option<usize>) -> Self {
+        Self {
+            schema,
+            partition_col,
+            rows: Vec::new(),
+            n_rows: 0,
+            row_err: Vec::new(),
+            pending: Vec::new(),
+            pending_set: Vec::new(),
+            new_names: Vec::new(),
+        }
+    }
+
+    /// Rows of the message.
+    #[must_use]
+    pub fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    /// Resolve pending dictionary values against `dicts` without adding to them: known values
+    /// become their ids; new ones stay pending and count against `max_entries` together, per
+    /// column, in row order, exactly as mapping with the dictionaries at hand counts them (a row
+    /// that would exceed the cap is refused at that column; values of the columns before it
+    /// still count). Needed only for a result mapped without the dictionaries.
+    pub fn resolve(&mut self, dicts: &[Option<SymbolDict>], max_entries: usize) {
+        let ncols = self.schema.fields().len();
+        if self.new_names.len() < ncols {
+            self.new_names.resize_with(ncols, Default::default);
+        }
+        for set in &mut self.new_names {
+            if !set.is_empty() {
+                set.clear();
+            }
+        }
+        for r in 0..self.n_rows {
+            let base = r * ncols;
+            for c in 0..ncols {
+                let idx = base + c;
+                if !self.pending_set[idx] {
+                    continue;
+                }
+                let Some(dict) = dicts.get(c).and_then(Option::as_ref) else {
+                    continue;
+                };
+                let name = self.pending[idx].as_str();
+                if let Some(SymbolId(id)) = dict.get(name) {
+                    self.rows[idx] = Value::U32(id);
+                    self.pending_set[idx] = false;
+                    continue;
+                }
+                let set = &mut self.new_names[c];
+                if !set.contains(name) {
+                    if dict.len() + set.len() >= max_entries {
+                        self.row_err[r] = Some(MapError::Convert {
+                            column: self.schema.fields()[c].name.clone(),
+                            reason: "dictionary is full (max_dict_entries)".to_owned(),
+                        });
+                        break;
+                    }
+                    set.insert(name.into());
+                }
+            }
+        }
+    }
+
+    /// Row `r`: its timestamp and partition key, or why it was refused.
+    pub fn parsed(&self, r: usize) -> Result<Parsed, MapError> {
+        if let Some(e) = self.row_err.get(r).and_then(Option::as_ref) {
+            return Err(e.clone());
+        }
+        let ncols = self.schema.fields().len();
+        let base = r * ncols;
+        let ts = match self.rows.get(base) {
+            Some(Value::I64(t)) => *t,
+            _ => 0,
+        };
+        let key = match self.partition_col {
+            None => Some(0),
+            Some(i) if self.pending_set[base + i] => None,
+            Some(i) => match self.rows[base + i] {
+                Value::U32(k) => Some(k),
+                _ => Some(0),
+            },
+        };
+        Ok(Parsed { ts, key })
+    }
+
+    /// Take row `r`: add its new dictionary values and return its partition key and values.
+    /// Call it only once the row is going to be stored.
+    pub fn finish_row(&mut self, r: usize, dicts: &mut [Option<SymbolDict>]) -> (u32, &[Value]) {
+        let ncols = self.schema.fields().len();
+        let base = r * ncols;
+        for c in 0..ncols {
+            if std::mem::take(&mut self.pending_set[base + c])
+                && let Some(d) = dicts.get_mut(c).and_then(Option::as_mut)
+            {
+                let SymbolId(id) = d.intern(&self.pending[base + c]);
+                self.rows[base + c] = Value::U32(id);
+            }
+        }
+        let key = match self.partition_col {
+            Some(i) => match self.rows[base + i] {
+                Value::U32(k) => k,
+                _ => 0,
+            },
+            None => 0,
+        };
+        (key, &self.rows[base..base + ncols])
     }
 }
 

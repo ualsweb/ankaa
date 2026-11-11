@@ -148,7 +148,7 @@
     <div class="code-card mt-l">
       <header><span>Configuration skeleton</span><span>ankaad.toml · <a href="https://github.com/ualsweb/ankaa/blob/main/deploy/ankaad.example.toml" style="color:var(--code-key)">annotated example</a></span></header>
 <pre><span class="c-key">[server]</span>     flight_addr, metrics_addr, pg_addr, token_env, tls_cert, tls_key, tls_client_ca, query_timeout_s
-<span class="c-key">[storage]</span>    wal_dir, checkpoint_dir, snapshot_ms, ingest_coalesce_us, hot_sealed_chunks, warm_budget_mib, market_retention
+<span class="c-key">[storage]</span>    wal_dir, checkpoint_dir, snapshot_ms, ingest_coalesce_us, ingest_workers, hot_sealed_chunks, warm_budget_mib, market_retention
 <span class="c-key">[resources]</span>  query_memory_mib, memory_budget_mib, memlock_mib
 <span class="c-key">[feed]</span>       enabled, url, streams, depth_snapshots          <span class="c-dim"># built-in exchange feed (optional)</span>
 <span class="c-key">[[tables]]</span>   name, columns, partition_by, max_lateness_ms, retention, max_dict_entries

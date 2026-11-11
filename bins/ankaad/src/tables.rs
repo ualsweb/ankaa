@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use ankaa_ingest::generic::{MapError, RowMapper};
+use ankaa_ingest::generic::{MapError, Mapped, RowMapper};
 use ankaa_ingest::{BookDelta, BookSnapshot, EventBatch, Side, SymbolId};
 use ankaa_store::{ColumnType, Field, Schema, Table, Value};
 use ankaa_ts::{BookSide, BookSync, L2Book, Level};
@@ -305,8 +305,60 @@ impl Tables {
         let t = &mut self.user[src.table];
         // Parse first, decide, then intern: a refused row must not grow a dictionary (and with it
         // the partition list), or bad input could fill it up.
-        let n = match src.mapper.parse(msg, recv_ns, csv, &t.dicts) {
-            Ok(n) => n,
+        if let Err(e) = src.mapper.parse(msg, recv_ns, csv, &t.dicts) {
+            src.rejected += 1;
+            out.rejected = 1;
+            out.error = Some(e);
+            return out;
+        }
+        apply_rows(
+            src.mapper.mapped_mut(),
+            t,
+            &mut self.continuous,
+            self.replaying,
+            recv_ns,
+            &mut out,
+        );
+        src.mapped += out.rows as u64;
+        src.rejected += out.rejected as u64;
+        out
+    }
+
+    /// A mapping worker's copy of every JSON and CSV source's mapper (index = source id), and
+    /// whether it reads CSV. Sparkplug sources are not in it: their BIRTH definitions make each
+    /// message depend on the ones before, so they are mapped in the ingest loop, in log order.
+    pub fn worker_mappers(&self) -> Vec<Option<(RowMapper, bool)>> {
+        self.sources
+            .iter()
+            .map(|s| {
+                s.as_ref()
+                    .filter(|s| s.mapper.sparkplug_definitions().is_none())
+                    .map(|s| (s.mapper.clone(), s.csv))
+            })
+            .collect()
+    }
+
+    /// Apply a message that a worker mapped without the dictionaries: resolve its dictionary
+    /// values against the table's (known ids, the cap for new ones), then store its rows exactly
+    /// as [`Self::ingest_user`] does. `Err` is the worker's refusal of the whole message.
+    pub fn apply_mapped(
+        &mut self,
+        source_id: u16,
+        recv_ns: i64,
+        mapped: Result<&mut Mapped, MapError>,
+    ) -> UserIngest {
+        let mut out = UserIngest::default();
+        let Some(src) = self
+            .sources
+            .get_mut(usize::from(source_id))
+            .and_then(Option::as_mut)
+        else {
+            out.rejected = 1;
+            out.error = Some(MapError::Malformed("unknown source id"));
+            return out;
+        };
+        let m = match mapped {
+            Ok(m) => m,
             Err(e) => {
                 src.rejected += 1;
                 out.rejected = 1;
@@ -314,49 +366,16 @@ impl Tables {
                 return out;
             }
         };
-        let listens = self.continuous.listens(&t.name);
-        if n == 0 {
-            return out;
-        }
-        // one lock for the whole message: the stale check, partition creation and the append
-        // of every row happen under it (the dictionaries live outside the table)
-        let mut w = t.table.writer();
-        let lateness = t.table.max_lateness();
-        for r in 0..n {
-            let parsed = match src.mapper.parsed(r) {
-                Ok(p) => p,
-                Err(e) => {
-                    out.reject(e);
-                    continue;
-                }
-            };
-            if parsed.ts > recv_ns.saturating_add(MAX_FUTURE_NS) {
-                out.reject(MapError::Malformed(
-                    "timestamp is more than a day ahead of the receive time (check ts_unit)",
-                ));
-                continue;
-            }
-            if !self.replaying
-                && let Some(k) = parsed.key
-                && w.partition_watermark(k as usize)
-                    .is_some_and(|wm| parsed.ts < wm.saturating_sub(lateness))
-            {
-                out.reject(MapError::Malformed(STALE));
-                continue;
-            }
-            let (key, row) = src.mapper.finish_row(r, &mut t.dicts);
-            match w.append_row_stored(key, row) {
-                Ok(stored) => {
-                    out.rows += 1;
-                    // rows skipped during recovery are already in a segment: they must not
-                    // feed a continuous query a second time
-                    if stored && listens {
-                        self.continuous.on_row(&t.name, row);
-                    }
-                }
-                Err(_) => out.reject(MapError::Malformed(STALE)),
-            }
-        }
+        let t = &mut self.user[src.table];
+        m.resolve(&t.dicts, src.mapper.max_dict_entries());
+        apply_rows(
+            m,
+            t,
+            &mut self.continuous,
+            self.replaying,
+            recv_ns,
+            &mut out,
+        );
         src.mapped += out.rows as u64;
         src.rejected += out.rejected as u64;
         out
@@ -650,6 +669,63 @@ impl Tables {
     pub fn seal_all(&self) {
         for (_, t) in self.persistent() {
             t.seal_all();
+        }
+    }
+}
+
+/// Store the rows of one mapped message (stale and future checks, then intern and append, all
+/// under one table lock); shared by the sequential path and the parallel one, so both store the
+/// same rows.
+fn apply_rows(
+    mapped: &mut Mapped,
+    table: &mut UserTable,
+    continuous: &mut Continuous,
+    replaying: bool,
+    recv_ns: i64,
+    out: &mut UserIngest,
+) {
+    let rows = mapped.n_rows();
+    if rows == 0 {
+        return;
+    }
+    let listens = continuous.listens(&table.name);
+    // one lock for the whole message: the stale check, partition creation and the append of
+    // every row happen under it (the dictionaries live outside the table)
+    let mut w = table.table.writer();
+    let lateness = table.table.max_lateness();
+    for r in 0..rows {
+        let parsed = match mapped.parsed(r) {
+            Ok(p) => p,
+            Err(e) => {
+                out.reject(e);
+                continue;
+            }
+        };
+        if parsed.ts > recv_ns.saturating_add(MAX_FUTURE_NS) {
+            out.reject(MapError::Malformed(
+                "timestamp is more than a day ahead of the receive time (check ts_unit)",
+            ));
+            continue;
+        }
+        if !replaying
+            && let Some(k) = parsed.key
+            && w.partition_watermark(k as usize)
+                .is_some_and(|wm| parsed.ts < wm.saturating_sub(lateness))
+        {
+            out.reject(MapError::Malformed(STALE));
+            continue;
+        }
+        let (key, row) = mapped.finish_row(r, &mut table.dicts);
+        match w.append_row_stored(key, row) {
+            Ok(stored) => {
+                out.rows += 1;
+                // rows skipped during recovery are already in a segment: they must not feed a
+                // continuous query a second time
+                if stored && listens {
+                    continuous.on_row(&table.name, row);
+                }
+            }
+            Err(_) => out.reject(MapError::Malformed(STALE)),
         }
     }
 }

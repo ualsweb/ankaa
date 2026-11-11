@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod continuous;
+mod map_pool;
 mod metrics;
 mod query;
 mod replication;

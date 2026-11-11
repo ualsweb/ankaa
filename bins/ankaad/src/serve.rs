@@ -19,6 +19,7 @@ use datafusion::prelude::SessionContext;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
+use crate::map_pool::MapPool;
 use crate::metrics::{Metrics, serve_metrics};
 use crate::source_state::SourceStates;
 use crate::tables::Tables;
@@ -110,6 +111,57 @@ impl Ingest {
         self.tables.set_lsn(lsn);
         self.lsn = lsn;
         self.handle_frame(frame);
+    }
+
+    /// Count what one user message did.
+    fn note_user(&mut self, source_id: u16, done: crate::tables::UserIngest) {
+        self.tally.user_rows += done.rows as u64;
+        if done.rejected > 0 {
+            self.tally.user_rejected += done.rejected as u64;
+            if let Some(e) = done.error {
+                tracing::debug!(source_id, rejected = done.rejected, error = %e, "user rows rejected");
+            }
+        }
+    }
+
+    /// Apply a job a mapping worker returned, frame by frame in log order: mapped user messages
+    /// through [`Tables::apply_mapped`], every other frame as [`Self::handle_frame`] would; the
+    /// used buffers go back to the worker.
+    fn apply_mapped_job(&mut self, pool: &crate::map_pool::MapPool, job: crate::map_pool::Done) {
+        let crate::map_pool::Done {
+            worker,
+            frames,
+            first_lsn,
+            step,
+            mapped,
+            ..
+        } = job;
+        let mut lsn = first_lsn;
+        for (frame, m) in frames.iter().zip(mapped) {
+            match (m, ankaa_feeds::capture::split_user_payload(&frame.payload)) {
+                (Some(result), Some((source_id, _))) => {
+                    self.tally.frames += 1;
+                    self.tables.set_lsn(lsn);
+                    self.lsn = lsn;
+                    match result {
+                        Ok(mut m) => {
+                            let done =
+                                self.tables
+                                    .apply_mapped(source_id, frame.recv_ns, Ok(&mut m));
+                            self.note_user(source_id, done);
+                            pool.recycle(worker, m);
+                        }
+                        Err(e) => {
+                            let done = self.tables.apply_mapped(source_id, frame.recv_ns, Err(e));
+                            self.note_user(source_id, done);
+                        }
+                    }
+                }
+                _ => self.handle_frame_lsn_batched(frame, lsn),
+            }
+            lsn += step;
+        }
+        self.flush_tally();
     }
 
     /// Publish the counters gathered since the last call.
@@ -253,13 +305,7 @@ impl Ingest {
                     return;
                 };
                 let done = self.tables.ingest_user(source_id, msg, frame.recv_ns);
-                self.tally.user_rows += done.rows as u64;
-                if done.rejected > 0 {
-                    self.tally.user_rejected += done.rejected as u64;
-                    if let Some(e) = done.error {
-                        tracing::debug!(source_id, rejected = done.rejected, error = %e, "user rows rejected");
-                    }
-                }
+                self.note_user(source_id, done);
             }
             FrameKind::Snapshot => {
                 self.batch.clear();
@@ -745,6 +791,21 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<Frame>(65_536);
     // frames taken from the channel in one wake-up (reused)
     let mut inbox: Vec<Frame> = Vec::with_capacity(INGEST_BATCH);
+    // mapping workers (RFC-0001): only when a source can use them
+    let workers = cfg.storage.ingest_workers.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .saturating_sub(2)
+            .min(32)
+    });
+    let mappers = ingest.tables.worker_mappers();
+    let mut pool: Option<MapPool> = if workers > 0 && mappers.iter().any(Option::is_some) {
+        let p = MapPool::start(workers, &mappers)?;
+        info!(workers = p.workers(), "mapping workers started");
+        Some(p)
+    } else {
+        None
+    };
     let coalesce = Duration::from_micros(cfg.storage.ingest_coalesce_us);
     let mut last_wake = Instant::now()
         .checked_sub(BUSY_GAP)
@@ -938,17 +999,35 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 }
                 metrics.replication_applied_lsn.store(rec.lsn, Ordering::Relaxed);
             }
+            r = async { match pool.as_mut() { Some(p) if p.in_flight() > 0 => p.arrived().await, _ => std::future::pending().await } } => {
+                if let Err(e) = r {
+                    exit_err = Some(e);
+                    break;
+                }
+                if let Some(p) = pool.as_mut() {
+                    while let Some(done) = p.try_next() {
+                        ingest.apply_mapped_job(p, done);
+                    }
+                }
+            }
             n = rx.recv_many(&mut inbox, INGEST_BATCH) => {
                 if n == 0 { warn!("source ended"); break; }
                 let woke = Instant::now();
                 let busy = woke.duration_since(last_wake) < BUSY_GAP;
                 last_wake = woke;
-                let Ok(is_connect) = ingest_frames(&mut ingest, wal.as_ref(), &metrics, &mut inbox) else {
-                    exit_err = Some(anyhow::anyhow!(
-                        "the WAL did not accept a user-source message within {} s; stopping so that the sources read again from their last saved position on restart",
-                        wal_writer::PUSH_WAIT.as_secs()
-                    ));
-                    break;
+                let is_connect = match ingest_frames(&mut ingest, wal.as_ref(), &metrics, &mut inbox, &mut pool).await {
+                    Ok(c) => c,
+                    Err(IngestStop::Lost) => {
+                        exit_err = Some(anyhow::anyhow!(
+                            "the WAL did not accept a user-source message within {} s; stopping so that the sources read again from their last saved position on restart",
+                            wal_writer::PUSH_WAIT.as_secs()
+                        ));
+                        break;
+                    }
+                    Err(IngestStop::Worker(e)) => {
+                        exit_err = Some(e);
+                        break;
+                    }
                 };
                 if fetch_depth {
                     // (re)connect: every depth symbol needs a snapshot; resyncs: the named symbols
@@ -983,6 +1062,12 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 }
             }
             _ = snapshot_tick.tick() => {
+                // everything logged so far is applied before positions, definitions and
+                // checkpoints are looked at
+                if let Err(e) = drain_pool(&mut ingest, &mut pool).await {
+                    exit_err = Some(e);
+                    break;
+                }
                 // dictionaries first: a segment must never reference an id that is not persisted
                 let mut dicts_durable = true;
                 if ingest.dec.symbols().len() != symbols_saved {
@@ -1137,6 +1222,10 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     }
 
     // Orderly shutdown: stop the source (bounded), close the WAL (flush + fsync), stop Flight gracefully.
+    if let Err(e) = drain_pool(&mut ingest, &mut pool).await {
+        warn!(error = %e, "mapping workers: results lost at shutdown");
+    }
+    drop(pool.take());
     let _ = shutdown_tx.send(true);
     drop(tx);
     // Keep taking frames while the sources stop: they deliver what they hold and report their
@@ -1389,71 +1478,75 @@ const INGEST_BATCH: usize = 1024;
 /// (`storage.ingest_coalesce_us`).
 const BUSY_GAP: Duration = Duration::from_millis(1);
 
+/// Runs shorter than this are ingested in the loop itself when no job is out: at a trickle a job
+/// would only add two thread wake-ups per message.
+const MIN_PARALLEL_RUN: usize = 8;
+
 /// Log and ingest the frames in `inbox` (emptied), in order. With a WAL, a frame is ingested
 /// only once the log has taken it (the push waits for the log when it is behind), so tables
-/// and log always agree; the frames go to the log as runs, one hand-off per run. Returns
-/// whether a `connect` frame was among them, or `Err` when a user-source message could not be
-/// logged and the server has to stop (see [`Ingest::frame_not_logged`]).
-fn ingest_frames(
+/// and log always agree; the frames go to the log as runs, one hand-off per run. With mapping
+/// workers a logged run is handed to them and applied when it comes back, in log order.
+/// Returns whether a `connect` frame was among them, or `Err` when a user-source message could
+/// not be logged (the server has to stop, see [`Ingest::frame_not_logged`]) or a worker failed.
+async fn ingest_frames(
     ingest: &mut Ingest,
     wal: Option<&WalHandle>,
     metrics: &Metrics,
     inbox: &mut Vec<Frame>,
-) -> Result<bool, ()> {
+    pool: &mut Option<MapPool>,
+) -> Result<bool, IngestStop> {
     let mut saw_connect = false;
     let mut run: Vec<Frame> = Vec::with_capacity(inbox.len());
-    let mut frames = inbox.drain(..);
-    let result = loop {
-        let Some(f) = frames.next() else {
-            let lost = log_and_ingest(
-                ingest,
-                wal,
-                metrics,
-                std::mem::take(&mut run),
-                &mut saw_connect,
-            );
-            break if lost { Err(()) } else { Ok(saw_connect) };
-        };
+    let frames: Vec<Frame> = std::mem::take(inbox);
+    for f in frames {
         // must not reach the log either: recovery would take it as valid
         if ingest.discard_after_loss(&f) {
             continue;
         }
         // too large for a record: not logged, so not ingested; the run before it goes first
         if wal.is_some_and(|_| WalHandle::too_large(&f, metrics)) {
-            let lost = log_and_ingest(
-                ingest,
-                wal,
-                metrics,
-                std::mem::take(&mut run),
-                &mut saw_connect,
-            );
-            if lost || ingest.frame_not_logged(&f) {
-                break Err(());
+            let r = std::mem::take(&mut run);
+            if log_and_ingest(ingest, wal, metrics, r, &mut saw_connect, pool).await?
+                || ingest.frame_not_logged(&f)
+            {
+                return Err(IngestStop::Lost);
             }
             continue;
         }
         run.push(f);
-    };
-    drop(frames);
+    }
+    if log_and_ingest(ingest, wal, metrics, run, &mut saw_connect, pool).await? {
+        return Err(IngestStop::Lost);
+    }
     ingest.flush_tally();
-    result
+    Ok(saw_connect)
 }
 
-/// Hand `run` to the log in one push, then ingest it under consecutive LSNs. Returns `true`
-/// when the log did not take it and a user-source message was among the frames lost.
-fn log_and_ingest(
+/// Why the ingest loop stops.
+enum IngestStop {
+    /// A user-source message could not be logged.
+    Lost,
+    /// A mapping worker failed.
+    Worker(anyhow::Error),
+}
+
+/// Hand `run` to the log in one push, then ingest it under consecutive LSNs (in the loop, or by
+/// the mapping workers). Returns `true` when the log did not take it and a user-source message
+/// was among the frames lost.
+async fn log_and_ingest(
     ingest: &mut Ingest,
     wal: Option<&WalHandle>,
     metrics: &Metrics,
     run: Vec<Frame>,
     saw_connect: &mut bool,
-) -> bool {
+    pool: &mut Option<MapPool>,
+) -> Result<bool, IngestStop> {
     if run.is_empty() {
-        return false;
+        return Ok(false);
     }
     let run = Arc::new(run);
-    // LSN of the next frame, and its step: 0 and 0 without a log
-    let (mut lsn, step) = match wal {
+    // LSN of the first frame, and the step: 0 and 0 without a log
+    let (first, step) = match wal {
         None => (0, 0),
         Some(w) => {
             let Some(first) = w.push_batch(&run, metrics) else {
@@ -1461,17 +1554,48 @@ fn log_and_ingest(
                 for f in run.iter() {
                     stop |= ingest.frame_not_logged(f);
                 }
-                return stop;
+                return Ok(stop);
             };
             (first, 1)
         }
     };
     for f in run.iter() {
         *saw_connect |= f.kind == FrameKind::Control && f.payload.as_ref() == b"connect";
+    }
+    if let Some(p) = pool.as_mut()
+        && (p.in_flight() > 0 || run.len() >= MIN_PARALLEL_RUN)
+    {
+        // a full set of queues: apply what came back (in order) before handing out more
+        while p.full() {
+            match p.next().await {
+                Ok(Some(done)) => ingest.apply_mapped_job(p, done),
+                Ok(None) => break,
+                Err(e) => return Err(IngestStop::Worker(e)),
+            }
+        }
+        p.dispatch(run, first, step);
+        while let Some(done) = p.try_next() {
+            ingest.apply_mapped_job(p, done);
+        }
+        return Ok(false);
+    }
+    let mut lsn = first;
+    for f in run.iter() {
         ingest.handle_frame_lsn_batched(f, lsn);
         lsn += step;
     }
-    false
+    Ok(false)
+}
+
+/// Apply every job still out, in order (before a checkpoint tick, a definitions frame or
+/// shutdown, which must see everything that was logged).
+async fn drain_pool(ingest: &mut Ingest, pool: &mut Option<MapPool>) -> anyhow::Result<()> {
+    if let Some(p) = pool.as_mut() {
+        while let Some(done) = p.next().await? {
+            ingest.apply_mapped_job(p, done);
+        }
+    }
+    Ok(())
 }
 
 fn describe_join<T: std::fmt::Debug>(

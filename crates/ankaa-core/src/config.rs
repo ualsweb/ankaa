@@ -396,6 +396,10 @@ pub struct StorageConfig {
     /// wake-up takes many frames instead of one each. Rows become queryable at the next
     /// snapshot anyway, so the wait is not visible to queries. 0 turns it off. At most 10,000.
     pub ingest_coalesce_us: u64,
+    /// Threads that map JSON and CSV messages to rows while the ingest loop applies them in log
+    /// order (RFC-0001). Unset: the number of cores minus two (the ingest loop and the log
+    /// thread), at most 32; 0: map in the ingest loop. At most 256.
+    pub ingest_workers: Option<usize>,
     /// Memory budget for warm (encoded, in-memory) chunks in MiB; beyond it the oldest warm
     /// chunks are demoted to cold (segment on disk, decoded on demand). Needs `checkpoint_dir`.
     pub warm_budget_mib: u64,
@@ -510,6 +514,7 @@ impl Default for StorageConfig {
             checkpoint_dir: None,
             snapshot_ms: 50,
             ingest_coalesce_us: 200,
+            ingest_workers: None,
             warm_budget_mib: 512,
             checkpoint_interval_s: 60,
             tier_budget_pct: 5,
@@ -643,6 +648,9 @@ impl Config {
         }
         if self.storage.snapshot_ms < 5 {
             return inv("storage.snapshot_ms must be >= 5");
+        }
+        if self.storage.ingest_workers.is_some_and(|n| n > 256) {
+            return inv("storage.ingest_workers must be <= 256");
         }
         if self.storage.ingest_coalesce_us > 10_000 {
             return inv("storage.ingest_coalesce_us must be <= 10000 (10 ms)");

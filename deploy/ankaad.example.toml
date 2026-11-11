@@ -66,6 +66,9 @@ snapshot_ms = 50
 # between batches so one wake-up takes many messages (invisible to queries, which see rows at
 # the next snapshot). 0 = off, at most 10000.
 ingest_coalesce_us = 200
+# Threads mapping JSON/CSV messages to rows in parallel (applied in log order: same result as one
+# thread). Unset = cores - 2, at most 32; 0 = map in the ingest loop.
+# ingest_workers = 8
 
 [server]
 # Arrow Flight (gRPC) bind address. Binding beyond loopback REQUIRES a bearer token.

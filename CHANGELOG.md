@@ -50,6 +50,12 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   busy, sleeps when idle); dictionaries hashed with foldhash. File ingest 0.68 → 3.2 M rows/s
   (3,350 → 850 ns CPU per row); MQTT 24.6 → 9.9 µs CPU per message.
 - `loadgen --connections`, `--format sparkplug` and `e2e-profile.sh --publishers`, `$ANKAAD` for A/B runs.
+- Parallel ingest, stage 1 (RFC-0001, `docs/rfc/0001-parallel-ingest.md`): JSON and CSV messages are mapped
+  to rows on `storage.ingest_workers` threads (default: cores − 2) that share nothing, and applied in log
+  order by the ingest loop, so tables, dictionaries (values and ids), the dictionary cap, continuous queries
+  and counters are exactly those of one thread (property test over random streams with 1–7 workers).
+- Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
+  could hand the last messages to the next start again.
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on
   `ghcr.io` built from the release binaries), release binaries for Linux arm64/x86-64 and macOS arm64
   (`.github/workflows/release.yml`), and `examples/factory/`: one `docker compose up` for an MQTT plant,

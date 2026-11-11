@@ -19,7 +19,7 @@ pub mod symbols;
 pub use batch::{BookDelta, BookSnapshot, EventBatch, Side, Trade};
 pub use fixed::{ParseError, parse_fixed};
 pub use framing::{FrameError, Framer, LengthPrefixed, Prefix};
-pub use generic::{MapError, RowMapper, TsUnit};
+pub use generic::{MapError, Mapped, RowMapper, TsUnit};
 pub use symbols::{SymbolDict, SymbolId};
 
 /// Crate version string (from Cargo).
