@@ -161,6 +161,10 @@ impl DbnReplay {
                         continue;
                     };
                     let symbol = symbols.intern(&name);
+                    // `side` is a C `char`: unsigned on aarch64 Linux, signed on macOS, so the
+                    // cast is needed on one and redundant on the other
+                    #[allow(clippy::unnecessary_cast)]
+                    let buy = side as u8 == b'B';
                     out.trades.push(Trade {
                         ts_ns: to_i64(ts_event),
                         recv_ns: to_i64(ts_recv),
@@ -168,11 +172,7 @@ impl DbnReplay {
                         price: price / PRICE_DIV,
                         size: i64::from(size) * 100_000_000,
                         // Databento `side` is the aggressor; 'B' buy → bid-side aggressor
-                        side: if side as u8 == b'B' {
-                            Side::Bid
-                        } else {
-                            Side::Ask
-                        },
+                        side: if buy { Side::Bid } else { Side::Ask },
                         seq: i64::from(seq),
                     });
                     self.stats.trades += 1;

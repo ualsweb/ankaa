@@ -25,10 +25,11 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{Column, DFSchemaRef, Result};
+use datafusion::functions::core::expr_fn::coalesce;
 use datafusion::functions_aggregate::expr_fn::{max, min, sum};
 use datafusion::logical_expr::expr::AggregateFunction;
 use datafusion::logical_expr::{
-    Aggregate, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Projection,
+    Aggregate, Expr, JoinType, LogicalPlan, LogicalPlanBuilder, Projection, lit,
 };
 use datafusion::optimizer::{ApplyOrder, OptimizerConfig, OptimizerRule};
 
@@ -223,16 +224,41 @@ fn rewrite(agg: &Aggregate) -> Result<Option<LogicalPlan>> {
         let name = agg.schema.field(group_len + i).name().clone();
         final_aggr.push(combined.alias(name));
     }
-    let rewritten = LogicalPlan::Aggregate(Aggregate::try_new(
+    let combined = LogicalPlan::Aggregate(Aggregate::try_new(
         Arc::new(joined),
         agg.group_expr.clone(),
         final_aggr,
     )?);
-    // the same columns with the same types, or nothing (e.g. a sum of decimals would widen)
-    if !rewritten
+    // a count is a sum of partial counts, which is NULL where the original count is 0 (no row
+    // at all) and is declared nullable: `coalesce(…, 0)` gives back both the value and the
+    // non-null column the original plan promised
+    let outputs: Vec<Expr> = combined
+        .schema()
+        .iter()
+        .enumerate()
+        .map(|(k, (qualifier, field))| {
+            let c = Expr::Column(Column::from((qualifier, field)));
+            match k.checked_sub(group_len).and_then(|i| functions.get(i)) {
+                Some(f) if f.func.name() == "count" => {
+                    coalesce(vec![c, lit(0i64)]).alias(field.name().clone())
+                }
+                _ => c,
+            }
+        })
+        .collect();
+    let rewritten = LogicalPlan::Projection(Projection::try_new(outputs, Arc::new(combined))?);
+    // the same columns with the same types and nullability, or nothing (e.g. a sum of decimals
+    // would widen); every consumer may rely on the schema the original plan declared
+    let same = rewritten
         .schema()
         .logically_equivalent_names_and_types(&agg.schema)
-    {
+        && rewritten
+            .schema()
+            .fields()
+            .iter()
+            .zip(agg.schema.fields())
+            .all(|(a, b)| a.is_nullable() == b.is_nullable());
+    if !same {
         return Ok(None);
     }
     Ok(Some(rewritten))

@@ -111,6 +111,11 @@ const QUERIES: &[(&str, bool)] = &[
         "SELECT count(*), sum(t.size) FROM t JOIN s ON s.symbol = t.symbol",
         true,
     ),
+    // no row survives: the original says count 0 (not NULL), and so must the rewrite
+    (
+        "SELECT count(*), count(t.seq), sum(t.size) FROM t JOIN s ON s.symbol = t.symbol WHERE t.size < 0",
+        true,
+    ),
     (
         "SELECT t.symbol, s.name, min(t.ts) FROM t JOIN s ON s.symbol = t.symbol GROUP BY t.symbol, s.name",
         true,

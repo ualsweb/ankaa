@@ -43,6 +43,6 @@ jobs:
       - name: Branchless-v2 gate on the SVE2 kernels
         run: |
           rlib=$(cargo build -p ankaa-simd --features sve2 --message-format=json 2>/dev/null \
-                 | jq -r 'select(.reason=="compiler-artifact" and .target.name=="ankaa-simd") | .filenames[] | select(endswith(".rlib"))' | tail -1)
+                 | jq -r 'select(.reason=="compiler-artifact" and (.target.name=="ankaa_simd" or .target.name=="ankaa-simd")) | .filenames[] | select(endswith(".rlib"))' | tail -1)
           echo "rlib: $rlib"
           mkdir -p /tmp/rlib && (cd /tmp/rlib && ar x "$rlib") && scripts/branchless-gate.sh /tmp/rlib/*.o
