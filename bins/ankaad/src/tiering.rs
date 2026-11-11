@@ -1072,6 +1072,9 @@ impl Tiering {
             .store(self.moves_to_warm, Ordering::Relaxed);
         tm.moves_to_cold
             .store(self.moves_to_cold, Ordering::Relaxed);
+        tm.encode_jobs
+            .store(self.in_flight.len() as u64, Ordering::Relaxed);
+        tm.errors.store(self.errors, Ordering::Relaxed);
         tm.compactions.store(self.compactions, Ordering::Relaxed);
         tm.compacted_chunks
             .store(self.compacted_chunks, Ordering::Relaxed);

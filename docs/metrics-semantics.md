@@ -140,6 +140,9 @@ All WAL metrics are 0 when `storage.wal_dir` is unset.
 | `ankaa_wal_commits_total` | counter | commits | Group commits performed (write + `fdatasync`). The owner commits every 10 ms when there is pending data, or sooner when the buffer crosses 256 KiB. |
 | `ankaa_wal_dropped_total` | counter | frames | Frames the WAL did not accept. Ingest waits for the log when its queue is full (backpressure), so this only moves when the log does not take a frame within 2 s (stalled or failing disk) or the writer has stopped. Such a frame is dropped entirely, **not ingested**: tables and log always agree. Expected 0. |
 | `ankaa_wal_bytes` | gauge | bytes | Size of the WAL segments on disk, refreshed every 5 s. Above `storage.wal_budget_mib` the partitions holding the oldest unpersisted rows are sealed and persisted so the log can be truncated. With order-book synchronisation on, the log is kept back to the last feed (re)connection (see `docs/deployment.md`, disk layout). |
+| `ankaa_ingest_workers` | gauge | threads | Threads mapping messages to rows (`storage.ingest_workers`); 0 when the ingest loop maps itself. |
+| `ankaa_ingest_map_jobs` | gauge | jobs | Runs of logged frames out on the mapping workers and not yet applied (at most two per worker). At its maximum all the time: mapping is the bottleneck, more workers help; near zero under load: the ingest loop or the sources are. |
+| `ankaa_ingest_map_jobs_total` | counter | jobs | Runs handed to the mapping workers. |
 | `ankaa_wal_oversized_total` | counter | frames | Frames larger than a WAL record may be (64 MiB), dropped before ingest so that memory and log agree. Expected 0. |
 | `ankaa_wal_errors_total` | counter | errors | Failed `append` (payload over 64 MiB) or failed `commit` (I/O error, disk full). Each is logged at `warn`. Expected 0. |
 | `ankaa_wal_recovered_frames` | gauge | frames | Frames replayed from the WAL at start. Constant for the life of the process. |
@@ -162,6 +165,8 @@ Good looks like: `rate(ankaa_wal_durable_lsn[1m]) > 0` whenever `rate(ankaa_fram
 | `ankaa_tier_chunks{tier="hot|warm|cold"}` | gauge | chunks | Sealed chunks per storage tier, set on every snapshot tick by the tiering step. |
 | `ankaa_tier_bytes{tier="hot|warm|cold"}` | gauge | bytes | Bytes per tier (plain for hot, encoded size for warm, file size for cold). |
 | `ankaa_tier_moves_total{to="warm|cold"}` | counter | chunks | Chunk moves hot→warm and warm→cold since start. |
+| `ankaa_tier_encode_jobs` | gauge | chunks | Chunks out on the encode threads (`storage.tier_workers`): being compressed, written as a segment, or merged. Stuck at twice the number of threads while hot bytes grow: the threads do not keep up. |
+| `ankaa_tier_errors_total` | counter | failures | Encodes, segment writes and merges that failed; the chunk stays as it was and the log says why (a full disk, usually). Alert on any increase. |
 | `ankaa_tier_compactions_total` | counter | merges | Runs of small chunks of a partition merged into one chunk (`storage.compact_small_chunks`). |
 | `ankaa_tier_compacted_chunks_total` | counter | chunks | Small chunks replaced by those merges. Divided by the merges: the average run length. |
 | `ankaa_segment_cache_bytes` | gauge | bytes | Cold segment files held in memory by the segment cache (`storage.segment_cache_mib`), compressed as on disk. Updated every snapshot tick. |

@@ -135,6 +135,9 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
 - A table's view for queries is rebuilt only when the table changed (it was rebuilt every snapshot tick,
   a walk over every chunk), and `latest()` finds the newest rows on the pruning index.
 - The part of `warm_budget_mib` the warm tier does not use is lent to the segment cache.
+- Metrics for the threads added lately: `ankaa_ingest_workers`, `ankaa_ingest_map_jobs`,
+  `ankaa_ingest_map_jobs_total` (mapping workers), `ankaa_tier_encode_jobs` and `ankaa_tier_errors_total`
+  (encode threads; failed encodes and segment writes were only in the log).
 - Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
   could hand the last messages to the next start again.
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on

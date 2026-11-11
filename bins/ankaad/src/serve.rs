@@ -1325,6 +1325,11 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 metrics.late_rows.store(st.iter().map(|x| x.late_rows).sum(), Ordering::Relaxed);
                 metrics.sealed_chunks.store(st.iter().map(|x| x.sealed_chunks).sum(), Ordering::Relaxed);
                 metrics.snapshots.fetch_add(1, Ordering::Relaxed);
+                if let Some(p) = &pool {
+                    metrics.ingest_workers.store(p.workers() as u64, Ordering::Relaxed);
+                    metrics.map_jobs.store(p.in_flight() as u64, Ordering::Relaxed);
+                    metrics.map_jobs_total.store(p.jobs_total(), Ordering::Relaxed);
+                }
             }
             _ = log_tick.tick() => {
                 let s = ingest.dec.stats();

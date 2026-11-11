@@ -72,6 +72,10 @@ pub struct TierMetrics {
     pub moves_to_warm: AtomicU64,
     /// Chunks written warm → cold.
     pub moves_to_cold: AtomicU64,
+    /// Chunks out on the encode threads (being compressed, written or merged).
+    pub encode_jobs: AtomicU64,
+    /// Encodes, segment writes and merges that failed (the chunk stays as it was).
+    pub errors: AtomicU64,
     /// Merges of small chunks done, and chunks they replaced.
     pub compactions: AtomicU64,
     /// See [`Self::compactions`].
@@ -176,6 +180,12 @@ pub struct Metrics {
     pub replication_last_receive_ms: AtomicU64,
     /// Frames too large for the WAL (dropped, not ingested).
     pub wal_oversized: AtomicU64,
+    /// Mapping workers, runs of frames out on them, and runs handed out since the start.
+    pub ingest_workers: AtomicU64,
+    /// See [`Self::ingest_workers`].
+    pub map_jobs: AtomicU64,
+    /// See [`Self::ingest_workers`].
+    pub map_jobs_total: AtomicU64,
     /// Values in user-table dictionaries.
     pub dict_entries: AtomicU64,
     /// Source positions saved (file offsets, Kafka offsets).
@@ -225,6 +235,16 @@ impl Metrics {
             s,
             "ankaa_tier_moves_total{{to=\"cold\"}} {}",
             g(&t.moves_to_cold)
+        );
+        let _ = writeln!(
+            s,
+            "# HELP ankaa_tier_encode_jobs Chunks out on the encode threads (compress, write a segment, merge)\n# TYPE ankaa_tier_encode_jobs gauge\nankaa_tier_encode_jobs {}",
+            g(&t.encode_jobs)
+        );
+        let _ = writeln!(
+            s,
+            "# HELP ankaa_tier_errors_total Encodes, segment writes and merges that failed (the chunk stays as it was; see the log)\n# TYPE ankaa_tier_errors_total counter\nankaa_tier_errors_total {}",
+            g(&t.errors)
         );
         let _ = writeln!(
             s,
@@ -382,6 +402,24 @@ impl Metrics {
             "Size of the write-ahead log on disk (refreshed every 5 s)",
             "gauge",
             g(&self.wal_bytes),
+        );
+        m(
+            "ankaa_ingest_workers",
+            "Threads mapping messages to rows (storage.ingest_workers; 0: the ingest loop maps)",
+            "gauge",
+            g(&self.ingest_workers),
+        );
+        m(
+            "ankaa_ingest_map_jobs",
+            "Runs of frames out on the mapping workers, not yet applied",
+            "gauge",
+            g(&self.map_jobs),
+        );
+        m(
+            "ankaa_ingest_map_jobs_total",
+            "Runs of frames handed to the mapping workers",
+            "counter",
+            g(&self.map_jobs_total),
         );
         m(
             "ankaa_wal_oversized_total",

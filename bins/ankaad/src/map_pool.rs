@@ -104,6 +104,11 @@ impl MapPool {
         usize::try_from(self.next_seq - self.apply_seq).unwrap_or(usize::MAX)
     }
 
+    /// Jobs handed out since the start.
+    pub fn jobs_total(&self) -> u64 {
+        self.next_seq
+    }
+
     /// True when another job would exceed the queues: apply results first.
     pub fn full(&self) -> bool {
         self.in_flight() >= self.jobs.len() * JOBS_PER_WORKER
