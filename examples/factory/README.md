@@ -49,10 +49,9 @@ The token of this demo is `demo-token-not-secret` (it is also the Postgres passw
 ```sh
 # any Postgres client
 PGPASSWORD=demo-token-not-secret psql -h 127.0.0.1 -p 55432 -U ankaa -c "
-  SELECT d.name AS machine, count(*) AS readings, count(kw) AS with_kw, max(kw) / 1e8 AS max_kw
-  FROM telemetry t
-  JOIN dictionaries d ON d.\"table\" = 'telemetry' AND d.\"column\" = 'machine' AND d.id = t.machine
-  GROUP BY d.name ORDER BY max_kw DESC LIMIT 5"
+  SELECT machine, count(*) AS readings, count(kw) AS with_kw, max(kw) / 1e8 AS max_kw
+  FROM telemetry
+  GROUP BY machine ORDER BY max_kw DESC LIMIT 5"
 
 # metrics: late readings accepted, readings without a value, nothing dropped
 curl -s -H "Authorization: Bearer demo-token-not-secret" http://127.0.0.1:9100/metrics \

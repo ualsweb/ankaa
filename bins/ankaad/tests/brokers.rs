@@ -253,13 +253,13 @@ width_ns = 60000000000
     // exact decimals survive both paths
     let nats_sum = first_cell(&query(
         &addr,
-        "SELECT sum(s.value) FROM sensors s JOIN dictionaries d ON d.\"table\" = 'sensors' AND d.id = s.device WHERE d.name LIKE 'nats-%'",
+        "SELECT sum(value) FROM sensors WHERE device LIKE 'nats-%'",
     ));
     // Σ (20 + i%5 + 0.25) for i in 0..300 = 300*20.25 + 60*(0+1+2+3+4) = 6075 + 600 = 6675 → ×1e8
     assert_eq!(nats_sum, "667500000000");
     let kafka_sum = first_cell(&query(
         &addr,
-        "SELECT sum(s.value) FROM sensors s JOIN dictionaries d ON d.\"table\" = 'sensors' AND d.id = s.device WHERE d.name LIKE 'kafka-%'",
+        "SELECT sum(value) FROM sensors WHERE device LIKE 'kafka-%'",
     ));
     // per partition Σ (10 + i%3 + 0.5) for i in 0..100 = 100*10.5 + (33*1 + 33*2) = 1050 + 99 = 1149; ×2 partitions
     assert_eq!(kafka_sum, "229800000000");
@@ -542,7 +542,7 @@ map = {{ ts = "t", line = "$topic.1", machine = "$topic.2", kw = "kw" }}
     );
     let line1 = first_cell(&query(
         &addr,
-        "SELECT count(*) FROM power p JOIN dictionaries d ON d.\"table\" = 'power' AND d.\"column\" = 'line' AND d.id = p.line WHERE d.name = 'line1'",
+        "SELECT count(*) FROM power WHERE line = 'line1'",
     ));
     assert_eq!(line1, "200");
     stop(server);
@@ -776,14 +776,14 @@ map = {{ ts = "$timestamp", node = "$node", device = "$device", metric = "$metri
     // dict columns hold "" where the selector does not apply: only State has text
     count_until(
         &addr,
-        "SELECT count(*) FROM scada s JOIN dictionaries d ON d.\"table\" = 'scada' AND d.\"column\" = 'text' AND d.id = s.text WHERE d.name = 'IDLE'",
+        "SELECT count(*) FROM scada WHERE text = 'IDLE'",
         "1",
         wait,
     );
     // an Int32 sent without its datatype keeps its sign
     count_until(
         &addr,
-        "SELECT min(s.value) FROM scada s JOIN dictionaries d ON d.\"table\" = 'scada' AND d.\"column\" = 'metric' AND d.id = s.metric WHERE d.name = 'Offset'",
+        "SELECT min(value) FROM scada WHERE metric = 'Offset'",
         "-49.0",
         wait,
     );

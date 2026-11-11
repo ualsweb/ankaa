@@ -14,7 +14,7 @@ name = "telemetry"
 partition_by = "rack"            # a dict column; ordering and watermarks are per partition
 columns = [
   { name = "ts",   type = "timestamp_ns" },   # the first column must be a timestamp
-  { name = "rack", type = "dict" },           # string → dense u32 id (see `dictionaries`)
+  { name = "rack", type = "dict" },           # a name, stored once; rows keep a dense u32 id
   { name = "temp", type = "fixed8" },         # decimal stored as i64 with 8 decimals, no floats
   { name = "ok",   type = "u8" },
   { name = "load", type = "float64", nullable = true },  # a reading may come without it
@@ -313,20 +313,46 @@ streams = []
 ## Query it
 
 ```sql
-SELECT d.name AS rack, count(*), avg(temp)/1e8 AS avg_temp
-FROM telemetry t JOIN dictionaries d
-  ON d."table" = 'telemetry' AND d."column" = 'rack' AND d.id = t.rack
-GROUP BY d.name;
+SELECT rack, count(*), avg(temp)/1e8 AS avg_temp
+FROM telemetry
+WHERE rack IN ('rack-1', 'rack-2') AND ts > now() - interval '1 hour'
+GROUP BY rack;
 ```
 
-`dictionaries(table, column, id, name)` holds the names behind every `dict` column of every user
-table and is refreshed when a new value appears. Dictionaries are persisted next to the segments
-(`dictionaries.json`) before any segment that uses their ids, so ids keep their names across
-restarts and WAL truncation. User tables take part in the tiers (warm encoding, cold segments,
+### Dictionary columns in SQL
+
+A `dict` column is text in SQL: Arrow type `Dictionary(UInt32, Utf8)`, `text` for Postgres clients, a
+categorical in pandas and polars. You filter, group, sort and read it by name; rows keep storing the
+dense id, and the engine works on the ids:
+
+- `=`, `<>`, `IN`, `NOT IN` and `OR` of those against string literals are translated to ids once per
+  query and decided per chunk from its id range: a chunk without the value is skipped, a chunk that
+  holds nothing else is taken whole, the others are filtered row by row on the ids. A name that was
+  never seen matches nothing without reading a row.
+- `GROUP BY` and joins on the column hash the ids; the names of a result are one shared array per
+  dictionary, referenced by every batch (no string is copied per row).
+- Everything else SQL does with strings (`LIKE`, `<`, `upper()`, `ORDER BY`, comparison with another
+  column) works on the names, row by row.
+- Table functions keyed by a `dict` column (`gapfill`, `ohlcv`, `rolling`, `percentiles`, `asof_join`)
+  and continuous-query tables return the key as names too. `asof_join` between tables that do not
+  share the dictionary is refused, as before.
+
+`dictionaries(table, column, id, name)` still lists the names behind every `dict` column of every user
+table (and `symbols(symbol, name)` those of the market tables), refreshed when a new value appears.
+Dictionaries are persisted next to the segments (`dictionaries.json`) before any segment that uses
+their ids, so ids keep their names across restarts and WAL truncation.
+
+**Coming from 0.x with ids in SQL.** `server.dict_columns = "ids"` (or `ankaad serve --dict-ids`)
+keeps the columns numeric (`UInt32`), exactly as before, for dashboards that still join
+`dictionaries` on `d.id = t.rack`. With the default (`"names"`) such a join stops with an error
+(`Cannot cast string 'rack-1' to value of UInt32 type`) instead of returning something else; drop
+the join and use the column. (Only if the names themselves are numbers, `'1'`, `'2'`, would the old
+join run and compare ids with those numbers: check such tables before upgrading.) `ankaad replay`
+and the in-process Python capture session (`ankaa.open_capture`) show ids. User tables take part in the tiers (warm encoding, cold segments,
 checkpoints) exactly like the market tables and appear under their own name in `checkpoint_dir`.
 
-Equality and range predicates on a `dict` column prune whole chunks (`WHERE rack = 3`), and
-scans run one partition per group of chunks in parallel.
+Equality predicates on a `dict` column prune whole chunks (`WHERE rack = 'rack-3'`), and scans run
+one partition per group of chunks in parallel.
 
 Readings rarely arrive on a regular grid: `gapfill` returns one row per bucket and per key with
 the empty buckets filled (`null`, `locf` or `linear`), ready for a chart or a join on time

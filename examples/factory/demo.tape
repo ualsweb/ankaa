@@ -28,11 +28,11 @@ Type "q 'SELECT count(*) AS readings FROM telemetry'; sleep 2; q 'SELECT count(*
 Sleep 4.5s
 
 Type "# a reading without a value is NULL, not zero: aggregates skip it" Enter
-Type `q "SELECT d.name AS machine, count(*) AS readings, count(kw) AS with_kw, round(avg(kw) / 1e8, 2) AS avg_kw FROM telemetry t JOIN dictionaries d ON d.\"column\" = 'machine' AND d.id = t.machine GROUP BY 1 ORDER BY readings - with_kw DESC LIMIT 4"` Enter
+Type `q "SELECT machine, count(*) AS readings, count(kw) AS with_kw, round(avg(kw) / 1e8, 2) AS avg_kw FROM telemetry GROUP BY 1 ORDER BY readings - with_kw DESC LIMIT 4"` Enter
 Sleep 5s
 
 Type "# live 1-minute bars per machine, maintained as readings arrive (a continuous query)" Enter
-Type `q "SELECT d.name AS machine, t.open / 1e8 AS open_kw, t.high / 1e8 AS high_kw, t.close / 1e8 AS close_kw, t.count FROM cq_power_1m_live t JOIN dictionaries d ON d.\"column\" = 'machine' AND d.id = t.machine WHERE t.ts = (SELECT max(ts) FROM cq_power_1m_live) ORDER BY high_kw DESC LIMIT 4"` Enter
+Type `q "SELECT machine, open / 1e8 AS open_kw, high / 1e8 AS high_kw, close / 1e8 AS close_kw, count FROM cq_power_1m_live WHERE ts = (SELECT max(ts) FROM cq_power_1m_live) ORDER BY high_kw DESC LIMIT 4"` Enter
 Sleep 5s
 
 Type "# line 4's gateway goes offline and sends late: readings are placed in time, nothing is lost" Enter

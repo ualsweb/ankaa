@@ -26,7 +26,7 @@ target/release/ankaad config check ankaad.toml
 target/release/ankaad serve --config ankaad.toml
 
 # 4. Query it from another shell
-target/release/ankaad query --sql "SELECT s.name, count(*) FROM trades t JOIN symbols s ON s.symbol = t.symbol GROUP BY s.name"
+target/release/ankaad query --sql "SELECT symbol, count(*) FROM trades GROUP BY symbol"
 
 # 5. Scrape the metrics
 curl -s http://127.0.0.1:9100/metrics | grep -E '^ankaa_(frames_total|events_total|wal_durable_lsn|ingest_latency_ns)'

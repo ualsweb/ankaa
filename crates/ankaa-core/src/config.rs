@@ -464,6 +464,21 @@ pub struct ServerConfig {
     /// and all data would cross the network in clear text. Only for a private network segment
     /// or behind a TLS-terminating proxy.
     pub allow_plaintext: bool,
+    /// How `dict` columns appear in SQL: `names` (default), dictionary-encoded strings
+    /// (`WHERE host = 'web-1'`, results carry the names); `ids`, the stored numeric ids, with
+    /// the names in the `dictionaries` and `symbols` tables (the behaviour before RFC-0002).
+    pub dict_columns: DictColumns,
+}
+
+/// How `dict` columns appear in SQL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DictColumns {
+    /// Dictionary-encoded strings.
+    #[default]
+    Names,
+    /// Numeric ids.
+    Ids,
 }
 
 /// Shortest bearer token accepted when a listener is reachable beyond loopback.
@@ -556,6 +571,7 @@ impl Default for ServerConfig {
             query_timeout_s: 30,
             max_concurrent_queries: 32,
             allow_plaintext: false,
+            dict_columns: DictColumns::Names,
         }
     }
 }

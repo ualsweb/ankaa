@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod continuous;
+mod dict_names;
 mod map_pool;
 mod metrics;
 mod query;
@@ -120,6 +121,9 @@ enum Cmd {
         /// Snapshot (table swap) interval in milliseconds (`storage.snapshot_ms`).
         #[arg(long)]
         snapshot_ms: Option<u64>,
+        /// Show `dict` columns as numeric ids instead of names (`server.dict_columns = "ids"`).
+        #[arg(long)]
+        dict_ids: bool,
         /// Stop after N seconds (0 = until Ctrl-C).
         #[arg(long, default_value_t = 0)]
         duration_secs: u64,
@@ -454,6 +458,7 @@ async fn main() -> anyhow::Result<()> {
             tls_key,
             tls_client_ca,
             snapshot_ms,
+            dict_ids,
             duration_secs,
             standby_of,
         } => {
@@ -474,6 +479,9 @@ async fn main() -> anyhow::Result<()> {
             if standby_of.is_some() {
                 config.replication.standby_of = standby_of;
                 config.validate()?;
+            }
+            if dict_ids {
+                config.server.dict_columns = ankaa_core::config::DictColumns::Ids;
             }
             let api_key = api_key.or_else(|| {
                 config

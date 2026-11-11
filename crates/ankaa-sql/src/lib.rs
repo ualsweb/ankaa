@@ -17,6 +17,7 @@ pub mod eager_agg;
 pub mod functions;
 pub mod latest;
 pub mod merge;
+pub mod names;
 pub mod plan_cache;
 pub mod provider;
 pub mod swap;
@@ -24,6 +25,7 @@ pub mod vwap;
 
 pub use dense_agg::{DenseAggExec, DenseAggregation};
 pub use functions::{PERCENTILE_ALPHA, PERCENTILE_MAX_BUCKETS, register_functions};
+pub use names::{Names, named_batch};
 pub use plan_cache::PlanCache;
 pub use provider::{ChunkTable, register_chunks, register_snapshot};
 pub use swap::{BatchTables, SwapTable};

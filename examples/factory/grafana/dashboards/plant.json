@@ -233,7 +233,7 @@
           "rawQuery": true,
           "editorMode": "code",
           "format": "time_series",
-          "rawSql": "SELECT date_bin(interval '10 seconds', t.ts) AS time, dm.name AS machine, avg(t.kw) / 1e8 AS kw\nFROM telemetry t\nJOIN dictionaries dm ON dm.\"table\" = 'telemetry' AND dm.\"column\" = 'machine' AND dm.id = t.machine\nJOIN dictionaries da ON da.\"table\" = 'telemetry' AND da.\"column\" = 'area' AND da.id = t.area\nWHERE $__timeFilter(t.ts) AND da.name = 'press-shop'\nGROUP BY 1, 2\nORDER BY 1"
+          "rawSql": "SELECT date_bin(interval '10 seconds', ts) AS time, machine, avg(kw) / 1e8 AS kw\nFROM telemetry\nWHERE $__timeFilter(ts) AND area = 'press-shop'\nGROUP BY 1, 2\nORDER BY 1"
         }
       ],
       "fieldConfig": {
@@ -288,7 +288,7 @@
           "rawQuery": true,
           "editorMode": "code",
           "format": "time_series",
-          "rawSql": "SELECT date_bin(interval '10 seconds', t.ts) AS time, dm.name AS machine, avg(t.kw) / 1e8 AS kw\nFROM telemetry t\nJOIN dictionaries dm ON dm.\"table\" = 'telemetry' AND dm.\"column\" = 'machine' AND dm.id = t.machine\nJOIN dictionaries da ON da.\"table\" = 'telemetry' AND da.\"column\" = 'area' AND da.id = t.area\nWHERE $__timeFilter(t.ts) AND da.name = 'assembly'\nGROUP BY 1, 2\nORDER BY 1"
+          "rawSql": "SELECT date_bin(interval '10 seconds', ts) AS time, machine, avg(kw) / 1e8 AS kw\nFROM telemetry\nWHERE $__timeFilter(ts) AND area = 'assembly'\nGROUP BY 1, 2\nORDER BY 1"
         }
       ],
       "fieldConfig": {
@@ -343,7 +343,7 @@
           "rawQuery": true,
           "editorMode": "code",
           "format": "table",
-          "rawSql": "SELECT dm.name AS machine, t.open / 1e8 AS open_kw, t.high / 1e8 AS high_kw, t.low / 1e8 AS low_kw,\n       t.close / 1e8 AS close_kw, t.count AS readings, t.ts AS bar_start\nFROM cq_power_1m_live t\nJOIN dictionaries dm ON dm.\"table\" = 'telemetry' AND dm.\"column\" = 'machine' AND dm.id = t.machine\nWHERE t.ts = (SELECT max(ts) FROM cq_power_1m_live)\nORDER BY machine"
+          "rawSql": "SELECT machine, open / 1e8 AS open_kw, high / 1e8 AS high_kw, low / 1e8 AS low_kw,\n       close / 1e8 AS close_kw, count AS readings, ts AS bar_start\nFROM cq_power_1m_live\nWHERE ts = (SELECT max(ts) FROM cq_power_1m_live)\nORDER BY machine"
         }
       ],
       "fieldConfig": {
@@ -394,7 +394,7 @@
           "rawQuery": true,
           "editorMode": "code",
           "format": "table",
-          "rawSql": "SELECT dm.name AS machine, t.p50 AS median_c, t.p99 AS p99_c, t.count AS readings, t.ts AS window_start\nFROM cq_temp_5m_live t\nJOIN dictionaries dm ON dm.\"table\" = 'telemetry' AND dm.\"column\" = 'machine' AND dm.id = t.machine\nWHERE t.ts = (SELECT max(ts) FROM cq_temp_5m_live)\nORDER BY p99_c DESC"
+          "rawSql": "SELECT machine, p50 AS median_c, p99 AS p99_c, count AS readings, ts AS window_start\nFROM cq_temp_5m_live\nWHERE ts = (SELECT max(ts) FROM cq_temp_5m_live)\nORDER BY p99_c DESC"
         }
       ],
       "fieldConfig": {

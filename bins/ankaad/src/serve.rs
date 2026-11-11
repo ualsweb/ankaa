@@ -19,6 +19,7 @@ use datafusion::prelude::SessionContext;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 
+use crate::dict_names::DictNames;
 use crate::map_pool::MapPool;
 use crate::metrics::{Metrics, serve_metrics};
 use crate::source_state::SourceStates;
@@ -690,31 +691,61 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         );
     }
 
+    // Dictionary names as queries see them: published before any rows that use them.
+    // `server.dict_columns = "ids"` keeps the columns numeric (no names attached to tables).
+    let dict_names = DictNames::new(&ingest.tables);
+    dict_names.publish(ingest.dec.symbols(), &ingest.tables);
+    let named = cfg.server.dict_columns == ankaa_core::config::DictColumns::Names;
+    let with = |t: ChunkTable, names: Vec<Option<Arc<ankaa_sql::Names>>>| {
+        if named { t.with_names(names) } else { t }
+    };
     // Long-lived providers: registered once, swapped every snapshot interval.
-    let live_trades = Arc::new(ChunkTable::from_snapshot(ingest.tables.trades.snapshot()));
-    let live_deltas = Arc::new(ChunkTable::from_snapshot(ingest.tables.deltas.snapshot()));
-    let live_quotes = Arc::new(ChunkTable::from_snapshot(ingest.tables.quotes.snapshot()));
+    let market = |t: &ankaa_store::Table| {
+        Arc::new(with(
+            ChunkTable::from_snapshot(t.snapshot()),
+            dict_names.market(t.schema()),
+        ))
+    };
+    let live_trades = market(&ingest.tables.trades);
+    let live_deltas = market(&ingest.tables.deltas);
+    let live_quotes = market(&ingest.tables.quotes);
     ctx.register_table("trades", live_trades.clone())?;
     ctx.register_table("book_deltas", live_deltas.clone())?;
     ctx.register_table("quotes", live_quotes.clone())?;
     // small tables that are replaced whole: exchanged in place, never deregistered
     let mut published = ankaa_sql::BatchTables::default();
-    published.publish(&ctx, "symbols", symbols_batch(&ingest.dec)?)?;
+    let symbols = |dec: &BinanceJsonDecoder| -> anyhow::Result<arrow::record_batch::RecordBatch> {
+        let b = symbols_batch(dec)?;
+        // with names, `symbols.symbol` is the name too: `JOIN symbols USING (symbol)` holds
+        Ok(if named {
+            ankaa_sql::named_batch(&b, &[Some(dict_names.symbols().clone())])?
+        } else {
+            b
+        })
+    };
+    published.publish(&ctx, "symbols", symbols(&ingest.dec)?)?;
     register_functions(&ctx);
     let mut symbols_registered = ingest.dec.symbols().len();
     let mut live_extra: Vec<(String, Arc<ChunkTable>)> = Vec::new();
-    for u in &ingest.tables.user {
-        let t = Arc::new(ChunkTable::from_snapshot(u.table.snapshot()));
+    for (i, u) in ingest.tables.user.iter().enumerate() {
+        let t = Arc::new(with(
+            ChunkTable::from_snapshot(u.table.snapshot()),
+            dict_names.user(i),
+        ));
         ctx.register_table(u.name.as_str(), t.clone())?;
         live_extra.push((u.name.clone(), t));
     }
     for q in ingest.tables.continuous.queries() {
-        let t = Arc::new(ChunkTable::from_snapshot(q.out.snapshot()));
+        let t = Arc::new(with(
+            ChunkTable::from_snapshot(q.out.snapshot()),
+            dict_names.derived(&ingest.tables, &q.table, q.out.schema()),
+        ));
         ctx.register_table(q.out.name(), t.clone())?;
         live_extra.push((q.out.name().to_owned(), t));
     }
     published.publish(&ctx, "dictionaries", dictionaries_batch(&ingest.tables)?)?;
-    publish_live_cq(&ctx, &mut published, &ingest.tables)?;
+    let live_names = named.then_some(&dict_names);
+    publish_live_cq(&ctx, &mut published, &ingest.tables, live_names)?;
 
     // Flight with graceful shutdown
     let flight_listener = tokio::net::TcpListener::bind(cfg.server.flight_addr).await?;
@@ -1187,6 +1218,8 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 // source positions whose frames are durable by now
                 let saved = ingest.states.commit(metrics.wal_durable_lsn.load(Ordering::Relaxed), false);
                 metrics.source_positions_saved.fetch_add(saved, Ordering::Relaxed);
+                // names first: every id in the views swapped in below has its name
+                dict_names.publish(ingest.dec.symbols(), &ingest.tables);
                 live_trades.swap_snapshot(ingest.tables.trades.snapshot());
                 live_deltas.swap_snapshot(ingest.tables.deltas.snapshot());
                 live_quotes.swap_snapshot(ingest.tables.quotes.snapshot());
@@ -1206,13 +1239,13 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     dict_values_registered = dict_values;
                 }
                 if registered.is_ok() && !ingest.tables.continuous.queries().is_empty() {
-                    registered = publish_live_cq(&ctx, &mut published, &ingest.tables);
+                    registered = publish_live_cq(&ctx, &mut published, &ingest.tables, live_names);
                     let qs = ingest.tables.continuous.queries();
                     metrics.cq_late_rows.store(qs.iter().map(|q| q.late_rows).sum(), Ordering::Relaxed);
                     metrics.cq_rejected_rows.store(qs.iter().map(|q| q.rejected_rows).sum(), Ordering::Relaxed);
                 }
                 if registered.is_ok() && ingest.dec.symbols().len() != symbols_registered {
-                    registered = symbols_batch(&ingest.dec)
+                    registered = symbols(&ingest.dec)
                         .and_then(|b| Ok(published.publish(&ctx, "symbols", b)?));
                     symbols_registered = ingest.dec.symbols().len();
                 }
@@ -1667,8 +1700,28 @@ fn publish_live_cq(
     ctx: &SessionContext,
     published: &mut ankaa_sql::BatchTables,
     tables: &Tables,
+    names: Option<&DictNames>,
 ) -> anyhow::Result<()> {
     for (name, batch) in tables.continuous.live_batches() {
+        // key columns as names, like the query's closed table (`cq_<name>`)
+        let batch = match names {
+            Some(dict_names) => {
+                let input = tables
+                    .continuous
+                    .queries()
+                    .iter()
+                    .find(|q| name == format!("cq_{}_live", q.name))
+                    .map_or("", |q| q.table.as_str());
+                let per_column: Vec<Option<Arc<ankaa_sql::Names>>> = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| dict_names.column(tables, input, f.name()))
+                    .collect();
+                ankaa_sql::named_batch(&batch, &per_column)?
+            }
+            None => batch,
+        };
         published.publish(ctx, name.as_str(), batch)?;
     }
     Ok(())

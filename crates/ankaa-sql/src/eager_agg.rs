@@ -169,7 +169,7 @@ fn rewrite(agg: &Aggregate) -> Result<Option<LogicalPlan>> {
         let Ok((_, field)) = facts_schema.qualified_field_from_column(k) else {
             return Ok(None);
         };
-        if field.data_type() != &DataType::UInt32 {
+        if field.data_type() != &DataType::UInt32 && !crate::names::is_dict(field.data_type()) {
             return Ok(None);
         }
     }

@@ -33,8 +33,9 @@ Engines and clients:
 
 The scopes differ (the ANKAA replay path has no network between client and engine). The report must
 state them side by side; the Flight path is the like-for-like one. `ankaad serve` can serve a capture
-without network: `ANKAA_TOKEN=... ankaad serve --url file://<capture.ankc> --no-depth-snapshots`, then
-`run.py --engines ankaa-flight --flight grpc://127.0.0.1:50051 --token $ANKAA_TOKEN`.
+without network: `ANKAA_TOKEN=... ankaad serve --dict-ids --url file://<capture.ankc> --no-depth-snapshots`,
+then `run.py --engines ankaa-flight --flight grpc://127.0.0.1:50051 --token $ANKAA_TOKEN`. `--dict-ids` shows
+`symbol` as its id, as the replay export and so the reference data have it (by default `serve` shows names).
 
 ## Reproduce (for a stranger)
 

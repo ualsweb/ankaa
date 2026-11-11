@@ -153,8 +153,8 @@ ANKAA_TOKEN=devtoken cargo run --release -p ankaad -- serve \
 
 # In another terminal
 ANKAA_TOKEN=devtoken cargo run --release -p ankaad -- query \
-  --sql "SELECT s.name, count(*) AS quotes, avg((ask - bid)/1e8) AS avg_spread
-         FROM quotes q JOIN symbols s ON s.symbol = q.symbol GROUP BY s.name"
+  --sql "SELECT symbol, count(*) AS quotes, avg((ask - bid)/1e8) AS avg_spread
+         FROM quotes GROUP BY symbol"
 PGPASSWORD=devtoken psql -h 127.0.0.1 -p 55432 -U ankaa -c "SELECT count(*) FROM trades"
 ```
 
@@ -281,7 +281,7 @@ The project is maintained by an independent engineer with a background in teleco
 | `quotes` | `ts, symbol, bid, bid_size, ask, ask_size, update_id` (top of book after each exchange message) |
 | `symbols` | `symbol, name` |
 
-**Your tables:** whatever `[[tables]]` declares; names behind `dict` columns are in `dictionaries(table, column, id, name)`. Continuous queries appear as `cq_<name>` (closed results) and `cq_<name>_live` (open bar or window per key).
+**Your tables:** whatever `[[tables]]` declares. A `dict` column (and `symbol`) is text in SQL: `WHERE machine = 'press03'`, `GROUP BY line`, results carry the names; the server works on the ids underneath ([how](docs/generic-ingest.md#dictionary-columns-in-sql)). `dictionaries(table, column, id, name)` lists the names. Continuous queries appear as `cq_<name>` (closed results) and `cq_<name>_live` (open bar or window per key).
 
 **Table functions**
 

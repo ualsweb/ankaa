@@ -25,7 +25,8 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use parking_lot::RwLock;
 
-use crate::arrow_conv::{ChunkColumns, arrow_schema};
+use crate::arrow_conv::{ChunkColumns, arrow_schema, arrow_schema_named};
+use crate::names::{Names, is_dict};
 
 /// Inclusive time bounds extracted from pushed-down filters on the timestamp column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +76,55 @@ pub struct ChunkTable {
     ankaa_schema: AnkaaSchema,
     schema: SchemaRef,
     ts_name: String,
+    /// Per column: the published names of a `dict` column shown as strings (`None`: the column
+    /// is not a dictionary, or is shown as ids).
+    names: Vec<Option<Arc<Names>>>,
+}
+
+/// `column = 'name'`, `column <> 'name'` or `column [NOT] IN ('a', 'b')` on a `dict` column
+/// shown as strings, translated to dictionary ids (names nobody ever stored have no id and are
+/// left out: an equality with one matches nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct KeyPred {
+    /// Column index in the table schema.
+    col: usize,
+    ids: Vec<u32>,
+    negated: bool,
+}
+
+/// What a [`KeyPred`] says about a chunk from the range of ids it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    /// No row matches: the chunk is not read.
+    Skip,
+    /// Every row matches: the chunk is read as it is.
+    All,
+    /// Some rows may match: the predicate has to be applied row by row.
+    Rows,
+}
+
+impl KeyPred {
+    fn verdict(&self, range: Option<(u32, u32)>) -> Verdict {
+        let Some((lo, hi)) = range else {
+            return Verdict::Rows;
+        };
+        let any_in = self.ids.iter().any(|&i| lo <= i && i <= hi);
+        match (self.negated, lo == hi, any_in) {
+            (false, _, false) | (true, true, true) => Verdict::Skip,
+            (false, true, true) | (true, _, false) => Verdict::All,
+            (_, false, true) => Verdict::Rows,
+        }
+    }
+}
+
+fn literal_str(v: &ScalarValue) -> Option<&str> {
+    match v {
+        ScalarValue::Utf8(Some(s))
+        | ScalarValue::LargeUtf8(Some(s))
+        | ScalarValue::Utf8View(Some(s)) => Some(s),
+        ScalarValue::Dictionary(_, inner) => literal_str(inner),
+        _ => None,
+    }
 }
 
 impl ChunkTable {
@@ -100,6 +150,101 @@ impl ChunkTable {
             ankaa_schema: schema,
             schema: arrow,
             ts_name,
+            names: Vec::new(),
+        }
+    }
+
+    /// Show `dict` columns as strings: `names[i]` holds the published names of column `i`
+    /// (`None` leaves a column as it is). The column's SQL type becomes a dictionary-encoded
+    /// string whose keys are the stored ids; `=`, `<>` and `IN` with string literals are
+    /// answered on the ids (RFC-0002).
+    #[must_use]
+    pub fn with_names(mut self, mut names: Vec<Option<Arc<Names>>>) -> Self {
+        let fields = self.ankaa_schema.fields();
+        names.resize(fields.len(), None);
+        for (n, f) in names.iter_mut().zip(fields) {
+            if f.ty != ankaa_store::ColumnType::DictU32 {
+                *n = None;
+            }
+        }
+        let as_text: Vec<bool> = names.iter().map(Option::is_some).collect();
+        self.schema = arrow_schema_named(&self.ankaa_schema, &as_text);
+        self.names = names;
+        self
+    }
+
+    /// The published names of column `col`, when it is shown as strings.
+    #[must_use]
+    pub fn names_of(&self, col: usize) -> Option<&Arc<Names>> {
+        self.names.get(col).and_then(Option::as_ref)
+    }
+
+    /// A `dict` column shown as strings behind `e` (also under a cast to a string type, which
+    /// the planner may add around it).
+    fn named_col(&self, e: &Expr) -> Option<(usize, &Arc<Names>)> {
+        let e = match e {
+            Expr::Cast(c) if c.field.data_type().is_string() => c.expr.as_ref(),
+            Expr::TryCast(c) if c.field.data_type().is_string() => c.expr.as_ref(),
+            other => other,
+        };
+        let Expr::Column(c) = e else { return None };
+        let (i, _) = self.schema.column_with_name(&c.name)?;
+        Some((i, self.names_of(i)?))
+    }
+
+    /// `f` as a predicate on dictionary ids, when it has one of the supported shapes.
+    fn key_pred(&self, f: &Expr) -> Option<KeyPred> {
+        match f {
+            Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Or,
+                right,
+            }) => {
+                // the planner writes short IN lists as a chain of ORs
+                let (l, r) = (self.key_pred(left)?, self.key_pred(right)?);
+                if l.col != r.col || l.negated || r.negated {
+                    return None;
+                }
+                let mut ids = l.ids;
+                ids.extend(r.ids);
+                ids.sort_unstable();
+                ids.dedup();
+                Some(KeyPred {
+                    col: l.col,
+                    ids,
+                    negated: false,
+                })
+            }
+            Expr::BinaryExpr(BinaryExpr { left, op, right })
+                if matches!(op, Operator::Eq | Operator::NotEq) =>
+            {
+                // the literal on either side
+                let ((col, names), lit) = match (left.as_ref(), right.as_ref()) {
+                    (c, Expr::Literal(v, _)) | (Expr::Literal(v, _), c) => (self.named_col(c)?, v),
+                    _ => return None,
+                };
+                Some(KeyPred {
+                    col,
+                    ids: names.id_of(literal_str(lit)?).into_iter().collect(),
+                    negated: *op == Operator::NotEq,
+                })
+            }
+            Expr::InList(il) => {
+                let (col, names) = self.named_col(il.expr.as_ref())?;
+                let mut ids = Vec::with_capacity(il.list.len());
+                for e in &il.list {
+                    let Expr::Literal(v, _) = e else { return None };
+                    ids.extend(names.id_of(literal_str(v)?));
+                }
+                ids.sort_unstable();
+                ids.dedup();
+                Some(KeyPred {
+                    col,
+                    ids,
+                    negated: il.negated,
+                })
+            }
+            _ => None,
         }
     }
 
@@ -399,11 +544,14 @@ impl TableProvider for ChunkTable {
     ) -> Result<Vec<TableProviderFilterPushDown>> {
         // A comparison of the timestamp with a literal is applied exactly: the scan cuts every
         // chunk to the time bounds by binary search, so DataFusion need not evaluate it again
-        // on every row. Everything else only prunes chunks and stays in the plan.
+        // on every row. So is `=`, `<>` or `IN` between a dictionary column shown as strings
+        // and string literals: it is answered on the ids, per chunk from the range of ids the
+        // chunk holds (and row by row only in a chunk that mixes matching and other ids).
+        // Everything else only prunes chunks and stays in the plan.
         Ok(filters
             .iter()
             .map(|f| {
-                if self.exact_time_filter(f) {
+                if self.exact_time_filter(f) || self.key_pred(f).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Inexact
@@ -424,17 +572,84 @@ impl TableProvider for ChunkTable {
         let projection: Vec<usize> = projection
             .cloned()
             .unwrap_or_else(|| (0..self.schema.fields().len()).collect());
-        let out_schema = Arc::new(self.schema.project(&projection)?);
+        let preds: Vec<KeyPred> = filters.iter().filter_map(|f| self.key_pred(f)).collect();
         let all = self.chunks.read().clone();
         // prune on statistics now, so the plan shows what will be read and the partitions
         // below only hold chunks that can contribute rows
+        let mut by_row = false;
         let candidates: Vec<ChunkRef> = all
             .iter()
             .filter(|c| c.may_overlap(bounds.lo, bounds.hi))
             .filter(|c| keys.iter().all(|k| c.may_overlap_u32(k.col, k.lo, k.hi)))
+            .filter(|c| {
+                let mut rows = false;
+                for p in &preds {
+                    match p.verdict(c.u32_range(p.col)) {
+                        Verdict::Skip => return false,
+                        Verdict::Rows => rows = true,
+                        Verdict::All => {}
+                    }
+                }
+                by_row |= rows;
+                true
+            })
             .cloned()
             .collect();
         let pruned = all.len() - candidates.len();
+        let dicts_of = |cols: &[usize]| -> Vec<Option<arrow::array::ArrayRef>> {
+            cols.iter()
+                .map(|&c| self.names_of(c).map(|n| n.values()))
+                .collect()
+        };
+        if by_row {
+            // A chunk holds matching and other ids: the name predicates are applied to its
+            // rows by DataFusion's own filter over a scan that also returns their columns.
+            // (Chunks are single-valued on a partition key and on anything that depends on
+            // it, so this is the rare path; the dedicated operators leave such plans alone.)
+            let mut wide = projection.clone();
+            for p in &preds {
+                if !wide.contains(&p.col) {
+                    wide.push(p.col);
+                }
+            }
+            let wide_schema = Arc::new(self.schema.project(&wide)?);
+            let parts = state.config().target_partitions();
+            let groups = match split_by_runs(&candidates, parts) {
+                Some(groups) => groups,
+                None => split_by_rows(candidates, parts),
+            };
+            let dicts = dicts_of(&wide);
+            let scan = ChunkScanExec::new(
+                groups,
+                pruned,
+                wide,
+                bounds,
+                None,
+                wide_schema.clone(),
+                dicts,
+            );
+            let name_filters: Vec<Expr> = filters
+                .iter()
+                .filter(|f| self.key_pred(f).is_some())
+                .cloned()
+                .collect();
+            let Some(predicate) = datafusion::logical_expr::utils::conjunction(name_filters) else {
+                return datafusion::common::internal_err!("row filter without a predicate");
+            };
+            let df_schema = datafusion::common::DFSchema::try_from(wide_schema.as_ref().clone())?;
+            let predicate = state.create_physical_expr(predicate, &df_schema)?;
+            let keep: Vec<usize> = (0..projection.len()).collect();
+            let filter = datafusion::physical_plan::filter::FilterExecBuilder::new(
+                predicate,
+                Arc::new(scan),
+            )
+            .apply_projection(Some(keep))?
+            .with_fetch(limit)
+            .build()?;
+            return Ok(Arc::new(filter));
+        }
+        let out_schema = Arc::new(self.schema.project(&projection)?);
+        let dicts = dicts_of(&projection);
         let parts = state.config().target_partitions();
         // Partitions that are each in time order let the planner merge instead of sorting
         // (`ORDER BY ts`); a table whose chunk list has too many separate time-ordered runs
@@ -444,7 +659,7 @@ impl TableProvider for ChunkTable {
             None => split_by_rows(candidates, parts),
         };
         Ok(Arc::new(ChunkScanExec::new(
-            groups, pruned, projection, bounds, limit, out_schema,
+            groups, pruned, projection, bounds, limit, out_schema, dicts,
         )))
     }
 }
@@ -561,6 +776,8 @@ pub struct ChunkScanExec {
     tie: Option<usize>,
     /// Rows are returned latest first (chunks and rows within them in reverse).
     reverse: bool,
+    /// Per output column: the names of a `dict` column shown as strings.
+    dicts: Arc<Vec<Option<arrow::array::ArrayRef>>>,
 }
 
 impl ChunkScanExec {
@@ -617,6 +834,7 @@ impl ChunkScanExec {
             ordered: self.ordered,
             tie: self.tie,
             reverse: true,
+            dicts: self.dicts.clone(),
         }
     }
 
@@ -627,6 +845,7 @@ impl ChunkScanExec {
         bounds: TimeBounds,
         limit: Option<usize>,
         schema: SchemaRef,
+        dicts: Vec<Option<arrow::array::ArrayRef>>,
     ) -> Self {
         // rows come out in time order when every partition's chunks follow each other in time
         // (and the timestamp is among the columns returned)
@@ -666,6 +885,7 @@ impl ChunkScanExec {
             ordered,
             tie,
             reverse: false,
+            dicts: Arc::new(dicts),
         }
     }
 }
@@ -695,6 +915,11 @@ impl ChunkScanExec {
     pub(crate) fn output_schema(&self) -> &SchemaRef {
         &self.schema
     }
+
+    /// Per output column: the names of a `dict` column shown as strings.
+    pub(crate) fn dicts(&self) -> &Arc<Vec<Option<arrow::array::ArrayRef>>> {
+        &self.dicts
+    }
 }
 
 /// The projected columns of one chunk in any tier, cut to the time bounds (`None`: no row).
@@ -704,10 +929,13 @@ pub(crate) fn chunk_columns(
     bounds: TimeBounds,
     remaining: usize,
     schema: &SchemaRef,
+    dicts: &[Option<arrow::array::ArrayRef>],
 ) -> Result<Option<ChunkColumns>> {
     match chunk {
-        ChunkRef::Hot(c) => hot_columns(c, projection, bounds, remaining, schema),
-        ChunkRef::Encoded(e) => encoded_columns(e.as_ref(), projection, bounds, remaining, schema),
+        ChunkRef::Hot(c) => hot_columns(c, projection, bounds, remaining, schema, dicts),
+        ChunkRef::Encoded(e) => {
+            encoded_columns(e.as_ref(), projection, bounds, remaining, schema, dicts)
+        }
     }
 }
 
@@ -718,6 +946,7 @@ fn hot_columns(
     bounds: TimeBounds,
     remaining: usize,
     schema: &SchemaRef,
+    dicts: &[Option<arrow::array::ArrayRef>],
 ) -> Result<Option<ChunkColumns>> {
     let mut rows = c.time_range_rows(bounds.lo, bounds.hi);
     if rows.is_empty() {
@@ -731,6 +960,7 @@ fn hot_columns(
         projection,
         rows,
         schema.clone(),
+        dicts,
     )?))
 }
 
@@ -742,6 +972,7 @@ fn encoded_columns(
     bounds: TimeBounds,
     remaining: usize,
     schema: &SchemaRef,
+    dicts: &[Option<arrow::array::ArrayRef>],
 ) -> Result<Option<ChunkColumns>> {
     use datafusion::error::DataFusionError;
     // each column decoded once, also when the projection names it twice
@@ -808,7 +1039,12 @@ fn encoded_columns(
         };
         typed.push((f.ty, col, valid));
     }
-    Ok(Some(ChunkColumns::decoded(typed, rows, schema.clone())?))
+    Ok(Some(ChunkColumns::decoded(
+        typed,
+        rows,
+        schema.clone(),
+        dicts,
+    )?))
 }
 
 impl DisplayAs for ChunkScanExec {
@@ -896,14 +1132,18 @@ impl ExecutionPlan for ChunkScanExec {
             }
             // a dictionary-id column: its ids lie in the union of the chunks' ranges, which
             // bounds how many distinct keys there can be
-            if field.data_type() == &arrow::datatypes::DataType::UInt32 {
+            let as_ids = field.data_type() == &arrow::datatypes::DataType::UInt32;
+            if as_ids || is_dict(field.data_type()) {
                 let range = chunks().try_fold(None, |acc: Option<(u32, u32)>, c| {
                     let (lo, hi) = c.u32_range(col)?;
                     Some(Some(acc.map_or((lo, hi), |(a, b)| (a.min(lo), b.max(hi)))))
                 });
                 if let Some(Some((lo, hi))) = range {
-                    stats.min_value = Precision::Inexact(ScalarValue::UInt32(Some(lo)));
-                    stats.max_value = Precision::Inexact(ScalarValue::UInt32(Some(hi)));
+                    // (shown as strings, the ids are not the column's minimum and maximum)
+                    if as_ids {
+                        stats.min_value = Precision::Inexact(ScalarValue::UInt32(Some(lo)));
+                        stats.max_value = Precision::Inexact(ScalarValue::UInt32(Some(hi)));
+                    }
                     let span = usize::try_from(hi - lo)
                         .unwrap_or(usize::MAX)
                         .saturating_add(1);
@@ -962,6 +1202,7 @@ impl ExecutionPlan for ChunkScanExec {
                 ordered: self.ordered,
                 tie: self.tie,
                 reverse: false,
+                dicts: self.dicts.clone(),
             })
         };
         Ok(SortOrderPushdownResult::Exact { inner })
@@ -986,6 +1227,7 @@ impl ExecutionPlan for ChunkScanExec {
         let projection = Arc::clone(&self.projection);
         let bounds = self.bounds;
         let schema = self.schema.clone();
+        let dicts = Arc::clone(&self.dicts);
         let mut remaining = self.limit.unwrap_or(usize::MAX);
         let reverse = self.reverse;
         let mut next = 0usize;
@@ -1026,7 +1268,7 @@ impl ExecutionPlan for ChunkScanExec {
                 // a reverse scan wants the last rows of a chunk: the loader's budget cuts from
                 // the front, so the chunk is loaded whole and the budget applied below
                 let budget = if reverse { usize::MAX } else { remaining };
-                match chunk_columns(c, &projection, bounds, budget, &schema) {
+                match chunk_columns(c, &projection, bounds, budget, &schema, &dicts) {
                     Ok(Some(cols)) => {
                         let rows = cols.num_rows();
                         let skip = if reverse {

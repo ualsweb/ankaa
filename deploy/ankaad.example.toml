@@ -97,6 +97,10 @@ metrics_addr = "127.0.0.1:9100"
 # Wall-clock budget per query (planning + execution + transfer), seconds.
 query_timeout_s = 30
 
+# How `dict` columns (and `symbol`) appear in SQL: "names" = text (WHERE machine = 'press03'),
+# "ids" = the stored numeric ids, names in the `dictionaries` / `symbols` tables.
+# dict_columns = "names"
+
 # Environment variable that holds the bearer token (the value itself is never in this file).
 # `serve --token` and the ANKAA_TOKEN variable take precedence over a custom name here.
 token_env = "ANKAA_TOKEN"

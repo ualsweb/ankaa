@@ -543,8 +543,7 @@ quantiles = [0.5]
         data = data.display(),
     );
     let addr = format!("127.0.0.1:{flight}");
-    let named_rows = "SELECT count(*) FROM telemetry t JOIN dictionaries d ON d.id = t.rack \
-                 WHERE d.\"table\" = 'telemetry' AND d.name = 'rack-2'";
+    let named_rows = "SELECT count(*) FROM telemetry WHERE rack = 'rack-2'";
     let fingerprint = |addr: &str| -> Vec<String> {
         [
             "SELECT count(*) FROM telemetry",
@@ -556,7 +555,7 @@ quantiles = [0.5]
             "SELECT sum(count) FROM cq_temp_p",
             "SELECT count(*) FROM dictionaries",
             named_rows,
-            "SELECT min(temp) FROM telemetry t JOIN dictionaries d ON d.id = t.rack WHERE d.name = 'rack-0'",
+            "SELECT min(temp) FROM telemetry WHERE rack = 'rack-0'",
             "SELECT max(temp) FROM telemetry",
             "SELECT count(*) FROM (SELECT ts, rack FROM telemetry GROUP BY ts, rack) x",
             "SELECT count(humidity) FROM telemetry",
@@ -984,4 +983,170 @@ map = {map}
         refusal.contains("columns can only be added at the end"),
         "{refusal}"
     );
+}
+
+/// `dict` columns are names in SQL (RFC-0002): results and continuous-query tables carry
+/// them, predicates take them, also after a restart; `server.dict_columns = "ids"` keeps the
+/// numeric ids and the `dictionaries` join of earlier versions.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn dict_columns_are_names_in_sql() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("telemetry.ndjson");
+    let mut f = std::fs::File::create(&data).unwrap();
+    let base = 1_762_700_000_000i64; // ms
+    for i in 0..300i64 {
+        for (r, rack) in ["rack-b", "rack-a", "rack-c"].iter().enumerate() {
+            let site = if r == 1 { "north" } else { "south" };
+            writeln!(
+                f,
+                r#"{{"t":{},"rack":"{rack}","site":"{site}","temp":{}}}"#,
+                base + i * 1000,
+                20 + i64::try_from(r).unwrap()
+            )
+            .unwrap();
+        }
+    }
+    drop(f);
+    let (flight, metrics) = (free_port(), free_port());
+    let config = |mode: &str| {
+        format!(
+            r#"
+[feed]
+enabled = false
+streams = []
+[server]
+flight_addr = "127.0.0.1:{flight}"
+metrics_addr = "127.0.0.1:{metrics}"
+{mode}
+[storage]
+snapshot_ms = 100
+wal_dir = "{wal}"
+checkpoint_dir = "{ckpt}"
+
+[[tables]]
+name = "telemetry"
+partition_by = "rack"
+columns = [
+  {{ name = "ts", type = "timestamp_ns" }},
+  {{ name = "rack", type = "dict" }},
+  {{ name = "site", type = "dict" }},
+  {{ name = "temp", type = "int64" }},
+]
+
+[[sources]]
+name = "racks"
+kind = "file"
+url = "{data}"
+format = "json"
+table = "telemetry"
+ts_unit = "millis"
+map = {{ ts = "t", rack = "rack", site = "site", temp = "temp" }}
+
+[[continuous]]
+name = "temp_1m"
+kind = "ohlcv"
+table = "telemetry"
+key = "rack"
+value = "temp"
+width_ns = 60000000000
+"#,
+            wal = dir.path().join("wal").display(),
+            ckpt = dir.path().join("ckpt").display(),
+            data = data.display(),
+        )
+    };
+    let addr = format!("127.0.0.1:{flight}");
+    let long = Duration::from_secs(60);
+    let cell = |sql: &str| first_cell(&query(&addr, sql));
+    let checks = |when: &str| {
+        // names come back, sorted as text (ids were given in arrival order: b, a, c)
+        assert_eq!(
+            cell("SELECT rack FROM telemetry GROUP BY rack ORDER BY rack"),
+            "rack-a",
+            "{when}"
+        );
+        assert_eq!(
+            cell("SELECT count(*) FROM telemetry WHERE rack = 'rack-c'"),
+            "300",
+            "{when}"
+        );
+        assert_eq!(
+            cell("SELECT count(*) FROM telemetry WHERE rack <> 'rack-c'"),
+            "600",
+            "{when}"
+        );
+        assert_eq!(
+            cell("SELECT count(*) FROM telemetry WHERE rack IN ('rack-a', 'rack-b', 'none')"),
+            "600",
+            "{when}"
+        );
+        // a column that is not the partition key, and a name nobody stored
+        assert_eq!(
+            cell("SELECT count(*) FROM telemetry WHERE site = 'north'"),
+            "300",
+            "{when}"
+        );
+        assert_eq!(
+            cell("SELECT count(*) FROM telemetry WHERE site = 'west'"),
+            "0",
+            "{when}"
+        );
+        assert_eq!(
+            cell("SELECT site FROM telemetry WHERE rack = 'rack-a' GROUP BY site"),
+            "north",
+            "{when}"
+        );
+        assert_eq!(
+            cell("SELECT max(temp) FROM telemetry WHERE rack LIKE 'rack-%' AND site = 'south'"),
+            "22",
+            "{when}"
+        );
+        // continuous-query tables carry the names of their input's key
+        assert_eq!(
+            cell("SELECT rack FROM cq_temp_1m GROUP BY rack ORDER BY rack DESC"),
+            "rack-c",
+            "{when}"
+        );
+        assert_eq!(
+            cell("SELECT count(*) FROM cq_temp_1m_live WHERE rack = 'rack-b'"),
+            "1",
+            "{when}"
+        );
+        // table functions too
+        assert_eq!(
+            cell(
+                "SELECT rack FROM gapfill('telemetry', 'temp', 60000000000, 'rack') ORDER BY rack LIMIT 1"
+            ),
+            "rack-a",
+            "{when}"
+        );
+    };
+    let s = start(&config(""), dir.path(), "names", &[]);
+    wait_for(&s.1, "flight listening", long);
+    until(&addr, "SELECT count(*) FROM telemetry", "900", long);
+    checks("first run");
+    stop(s);
+    let s = start(&config(""), dir.path(), "names-again", &[]);
+    wait_for(&s.1, "flight listening", long);
+    until(&addr, "SELECT count(*) FROM telemetry", "900", long);
+    checks("after a restart");
+    stop(s);
+
+    // the setting of earlier versions: ids in the columns, names by a join
+    let s = start(&config("dict_columns = \"ids\""), dir.path(), "ids", &[]);
+    wait_for(&s.1, "flight listening", long);
+    until(&addr, "SELECT count(*) FROM telemetry", "900", long);
+    assert_eq!(
+        cell("SELECT rack FROM telemetry GROUP BY rack ORDER BY rack"),
+        "0"
+    );
+    assert_eq!(
+        cell(
+            "SELECT count(*) FROM telemetry t JOIN dictionaries d ON d.\"table\" = 'telemetry' \
+             AND d.\"column\" = 'rack' AND d.id = t.rack WHERE d.name = 'rack-c'"
+        ),
+        "300"
+    );
+    stop(s);
 }

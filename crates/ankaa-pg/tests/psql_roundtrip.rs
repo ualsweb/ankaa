@@ -203,3 +203,77 @@ async fn psql_client_scram_query_and_read_only() {
         assert_eq!(n, 10);
     }
 }
+
+/// A `dict` column shown as names (RFC-0002) reaches a Postgres client as text, in results,
+/// in predicates and in parameters.
+#[tokio::test]
+async fn dictionary_columns_are_text_for_postgres_clients() {
+    use ankaa_sql::{ChunkTable, Names};
+    use ankaa_store::ChunkRef;
+    let ctx = Arc::new(SessionContext::new());
+    let mut c = Chunk::new(ChunkId(1), Schema::trades());
+    for i in 0..10i64 {
+        c.append_row(&[
+            Value::I64(1_000 + i),
+            Value::U32(u32::try_from(i % 2).unwrap()),
+            Value::I64(50 + i),
+            Value::I64(1),
+            Value::U8(0),
+            Value::I64(i),
+        ])
+        .unwrap();
+    }
+    c.seal();
+    let table = ChunkTable::from_shared(Schema::trades(), vec![ChunkRef::Hot(Arc::new(c))])
+        .with_names(vec![None, Some(Names::of(&["BTCUSDT", "ETHUSDT"]))]);
+    ctx.register_table("trades", Arc::new(table)).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handlers = Arc::new(PgHandlers::new(ctx.clone(), "s3cret"));
+    tokio::spawn(async move {
+        serve(listener, handlers, std::future::pending())
+            .await
+            .unwrap();
+    });
+    let conn = format!(
+        "host={} port={} user=ankaa password=s3cret dbname=ankaa",
+        addr.ip(),
+        addr.port()
+    );
+    let (client, connection) = tokio_postgres::connect(&conn, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let rows = client
+        .query(
+            "SELECT symbol, count(*) AS n FROM trades GROUP BY symbol ORDER BY symbol",
+            &[],
+        )
+        .await
+        .unwrap();
+    let got: Vec<(String, i64)> = rows.iter().map(|r| (r.get("symbol"), r.get("n"))).collect();
+    assert_eq!(
+        got,
+        vec![("BTCUSDT".to_owned(), 5), ("ETHUSDT".to_owned(), 5)]
+    );
+    let rows = client
+        .query(
+            "SELECT symbol, price FROM trades WHERE symbol = 'ETHUSDT' ORDER BY ts LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+    let (symbol, price): (String, i64) = (rows[0].get(0), rows[0].get(1));
+    assert_eq!((symbol.as_str(), price), ("ETHUSDT", 51));
+    let rows = client
+        .query(
+            "SELECT count(*) AS n FROM trades WHERE symbol = $1",
+            &[&"BTCUSDT"],
+        )
+        .await
+        .unwrap();
+    let n: i64 = rows[0].get("n");
+    assert_eq!(n, 5);
+}

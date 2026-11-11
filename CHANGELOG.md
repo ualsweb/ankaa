@@ -65,6 +65,16 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   and write their segments; the tick hands over every chunk that is due and swaps in the finished ones.
   Before, tiering had 5 % of one core (about 60 MB/s of rows), far below what ingest produces under load.
   A segment finished for a chunk that retention dropped meanwhile is deleted, never attached.
+- **Breaking: `dict` columns (and `symbol`) are text in SQL** (RFC-0002,
+  `docs/rfc/0002-dictionary-columns-as-names.md`). `WHERE machine = 'press03'`, `GROUP BY line` and results
+  with names, without joining `dictionaries` or `symbols`: the column's Arrow type is `Dictionary(UInt32, Utf8)`
+  (`text` for Postgres clients). The engine still works on the ids: `=`, `<>`, `IN`, `NOT IN` against string
+  literals are translated to ids and decided per chunk from its id range, grouping hashes ids, and every batch
+  references one shared array of names per dictionary. Table functions and continuous-query tables return
+  their key as names. A query that joined `dictionaries`/`symbols` on the id now stops with a cast
+  error: drop the join, or set `server.dict_columns = "ids"` (`ankaad serve --dict-ids`) to keep numeric
+  columns. `ankaad replay` and the Python capture session still show ids. Storage, log and segment formats are
+  unchanged.
 - Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
   could hand the last messages to the next start again.
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on

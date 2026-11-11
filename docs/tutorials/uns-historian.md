@@ -74,8 +74,9 @@ map = { ts = "t", site = "$topic.1", area = "$topic.2", line = "$topic.3", machi
         kw = "kw", temp_c = "temp_c", state = "state" }
 ```
 
-- `dict` columns store each distinct name once and keep a dense integer id per row; the names are in
-  the `dictionaries` table. A new machine appears as a new name, with no schema change.
+- `dict` columns store each distinct name once and keep a dense integer id per row. In SQL they are
+  text: you filter, group and read them by name. A new machine appears as a new name, with no schema
+  change.
 - `partition_by = "machine"` gives every machine its own ordering, watermark and late-data window.
 - The subscription uses MQTT QoS 1 with a persistent session: readings published while ANKAA is
   restarting are delivered when it comes back.
@@ -83,10 +84,8 @@ map = { ts = "t", site = "$topic.1", area = "$topic.2", line = "$topic.3", machi
 Readings per area and line:
 
 ```sql
-SELECT da.name AS area, dl.name AS line, count(*) AS readings
-FROM telemetry t
-JOIN dictionaries da ON da."table" = 'telemetry' AND da."column" = 'area' AND da.id = t.area
-JOIN dictionaries dl ON dl."table" = 'telemetry' AND dl."column" = 'line' AND dl.id = t.line
+SELECT area, line, count(*) AS readings
+FROM telemetry
 GROUP BY 1, 2 ORDER BY 1, 2;
 ```
 
@@ -97,13 +96,12 @@ Sensors drop values. In the demo about 2 % of readings come without `kw`. Becaus
 gaps.
 
 ```sql
-SELECT dm.name AS machine,
+SELECT machine,
        count(*)              AS readings,
        count(kw)             AS with_kw,
        count(*) - count(kw)  AS missing_kw,
        avg(kw) / 1e8         AS avg_kw
-FROM telemetry t
-JOIN dictionaries dm ON dm."table" = 'telemetry' AND dm."column" = 'machine' AND dm.id = t.machine
+FROM telemetry
 GROUP BY 1 ORDER BY missing_kw DESC LIMIT 5;
 ```
 
@@ -150,18 +148,16 @@ quantiles = [0.5, 0.99]
 
 ```sql
 -- the current minute, per machine (bars stay open for the late-data window, so take the newest)
-SELECT dm.name AS machine, t.open / 1e8 AS open_kw, t.high / 1e8 AS high_kw, t.close / 1e8 AS close_kw, t.count
-FROM cq_power_1m_live t
-JOIN dictionaries dm ON dm."table" = 'telemetry' AND dm."column" = 'machine' AND dm.id = t.machine
-WHERE t.ts = (SELECT max(ts) FROM cq_power_1m_live)
+SELECT machine, open / 1e8 AS open_kw, high / 1e8 AS high_kw, close / 1e8 AS close_kw, count
+FROM cq_power_1m_live
+WHERE ts = (SELECT max(ts) FROM cq_power_1m_live)
 ORDER BY high_kw DESC LIMIT 5;
 
 -- the hottest machines in the current five-minute window
-SELECT dm.name AS machine, t.p50, t.p99
-FROM cq_temp_5m_live t
-JOIN dictionaries dm ON dm."table" = 'telemetry' AND dm."column" = 'machine' AND dm.id = t.machine
-WHERE t.ts = (SELECT max(ts) FROM cq_temp_5m_live)
-ORDER BY t.p99 DESC LIMIT 5;
+SELECT machine, p50, p99
+FROM cq_temp_5m_live
+WHERE ts = (SELECT max(ts) FROM cq_temp_5m_live)
+ORDER BY p99 DESC LIMIT 5;
 ```
 
 Bars respect the late-data window: a bar closes five minutes after its end, so late gateway readings
@@ -175,19 +171,16 @@ The raw table answers ad-hoc questions with standard SQL (Apache DataFusion):
 ```sql
 -- when did robot09 stop, in the last 30 minutes?
 SELECT date_bin(interval '1 minute', ts) AS minute, count(*) FILTER (WHERE state = 0) AS stopped_readings
-FROM telemetry t
-JOIN dictionaries dm ON dm."table" = 'telemetry' AND dm."column" = 'machine' AND dm.id = t.machine
-WHERE dm.name = 'robot09' AND ts > now() - interval '30 minutes'
+FROM telemetry
+WHERE machine = 'robot09' AND ts > now() - interval '30 minutes'
 GROUP BY 1 HAVING count(*) FILTER (WHERE state = 0) > 0 ORDER BY 1;
 
 -- press03 against the average of its line, per minute: the anomaly the simulator injects
-SELECT date_bin(interval '1 minute', t.ts) AS minute,
-       avg(t.kw) FILTER (WHERE dm.name = 'press03') / 1e8 AS press03_kw,
-       avg(t.kw) / 1e8                                     AS line1_avg_kw
-FROM telemetry t
-JOIN dictionaries dm ON dm."table" = 'telemetry' AND dm."column" = 'machine' AND dm.id = t.machine
-JOIN dictionaries dl ON dl."table" = 'telemetry' AND dl."column" = 'line'    AND dl.id = t.line
-WHERE dl.name = 'line1' AND t.ts > now() - interval '30 minutes'
+SELECT date_bin(interval '1 minute', ts) AS minute,
+       avg(kw) FILTER (WHERE machine = 'press03') / 1e8 AS press03_kw,
+       avg(kw) / 1e8                                     AS line1_avg_kw
+FROM telemetry
+WHERE line = 'line1' AND ts > now() - interval '30 minutes'
 GROUP BY 1 ORDER BY 1;
 ```
 

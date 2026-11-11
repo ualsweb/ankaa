@@ -101,6 +101,7 @@ The schema is `crates/ankaa-core/src/config.rs`. All fields, with defaults:
 | `tls_client_ca` | unset | `--tls-client-ca` | PEM CA bundle; when set, Flight requires a client certificate signed by it (mutual TLS). Requires `tls_cert`/`tls_key`. |
 | `allow_plaintext` | `false` | — | Accept a Flight listener beyond loopback **without** TLS. Refused by default: the token and all data would cross the network in clear text. Only for a private network segment or behind a TLS-terminating proxy. |
 | `max_concurrent_queries` | `32` | — | Queries executing at once over Flight; further ones wait inside their own timeout and are then refused. |
+| `dict_columns` | `"names"` | `--dict-ids` (sets `"ids"`) | How `dict` columns and `symbol` appear in SQL. `"names"`: dictionary-encoded text (`WHERE machine = 'press03'`, results carry names; RFC-0002). `"ids"`: the stored `UInt32` ids, names in `dictionaries` / `symbols` (the behaviour before RFC-0002, for dashboards written against it). Storage is the same in both: the setting can be changed at any restart. |
 
 ### `[resources]`
 

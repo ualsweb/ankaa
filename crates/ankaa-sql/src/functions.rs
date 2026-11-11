@@ -33,9 +33,11 @@ use ankaa_ts::asof::NO_MATCH;
 use ankaa_ts::{AsofDirection, Ohlcv, UddSketch, asof_join, rolling_bars, time_buckets};
 use arrow::array::Float64Array;
 use arrow::array::{
-    Array, ArrayRef, Int64Array, RecordBatch, TimestampNanosecondArray, UInt32Array, UInt64Array,
+    Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, TimestampNanosecondArray,
+    UInt32Array, UInt64Array,
 };
 use arrow::compute::{cast, concat_batches, take};
+use arrow::datatypes::UInt32Type;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatchOptions;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
@@ -398,6 +400,9 @@ fn key_u32<'a>(batch: &'a RecordBatch, name: &str) -> Result<Cow<'a, [u32]>> {
     let a = batch.column(idx);
     if let Some(k) = a.as_any().downcast_ref::<UInt32Array>() {
         Ok(Cow::Borrowed(k.values()))
+    } else if let Some(d) = a.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+        // a dictionary column shown as strings: its ids are the keys, in place
+        Ok(Cow::Borrowed(d.keys().values()))
     } else if let Some(k) = a.as_any().downcast_ref::<Int64Array>() {
         Ok(Cow::Owned(
             k.values()
@@ -406,7 +411,46 @@ fn key_u32<'a>(batch: &'a RecordBatch, name: &str) -> Result<Cow<'a, [u32]>> {
                 .collect(),
         ))
     } else {
-        plan_err!("key column {name} must be UInt32 or Int64")
+        plan_err!("key column {name} must be a dictionary column, UInt32 or Int64")
+    }
+}
+
+/// Type of key column `key` in a function's result: the input column's own type when it is a
+/// dictionary column shown as strings, ids (`UInt32`) otherwise.
+fn key_type(input: &SchemaRef, key: &str) -> Result<DataType> {
+    let t = input.field_with_name(key)?.data_type();
+    Ok(if crate::names::is_dict(t) {
+        t.clone()
+    } else {
+        DataType::UInt32
+    })
+}
+
+/// The names behind key column `key` of the input, when it is shown as strings (every batch
+/// of a scan carries the same names array).
+fn key_names(input: &Input, key: &str) -> Option<ArrayRef> {
+    input.batches.iter().find_map(|b| {
+        b.column_by_name(key)?
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .map(|d| d.values().clone())
+    })
+}
+
+/// A key column of a result from its ids: of type `ty` ([`key_type`]), with `names` behind a
+/// dictionary column.
+fn key_column(ids: Vec<u32>, ty: &DataType, names: Option<&ArrayRef>) -> Result<ArrayRef> {
+    if !crate::names::is_dict(ty) {
+        return Ok(Arc::new(UInt32Array::from(ids)));
+    }
+    match names {
+        Some(names) => Ok(Arc::new(DictionaryArray::<UInt32Type>::try_new(
+            UInt32Array::from(ids),
+            names.clone(),
+        )?)),
+        // no input batch: no row either
+        None if ids.is_empty() => Ok(arrow::array::new_empty_array(ty)),
+        None => plan_err!("key column without its dictionary"),
     }
 }
 
@@ -588,6 +632,17 @@ impl TableFunctionImpl for AsofJoinFn {
                     .collect();
                 let left = collect_columns(&ctx, &left_name, &lcols).await?;
                 let right = collect_columns(&ctx, &right_name, &rcols).await?;
+                // keys are matched by id: both tables must number the same names alike
+                if let (Some(l), Some(r)) =
+                    (key_names(&left, &plan.key), key_names(&right, &plan.key))
+                    && !Arc::ptr_eq(&l, &r)
+                    && l.as_ref() != r.as_ref()
+                {
+                    let k = &plan.key;
+                    return Err(DataFusionError::Plan(format!(
+                        "asof_join: {left_name}.{k} and {right_name}.{k} use different dictionaries (the tables must share the key's dictionary)"
+                    )));
+                }
                 // the inputs (and their reservations) move into the task: they live as long as
                 // the work on them, also when the caller gives up and stops waiting for it
                 blocking(move || {
@@ -949,7 +1004,7 @@ impl TableFunctionImpl for OhlcvFn {
         // orders rows with equal timestamps (seq / update id)
         let ts_col = input.field(0).name().clone();
         let tie_col = input.field(input.fields().len() - 1).name().clone();
-        let schema = ohlcv_schema(&key);
+        let schema = ohlcv_schema(&key, &key_type(&input, &key)?);
         let ctx = self.ctx.clone();
         let out = schema.clone();
         let compute: Compute = Arc::new(move |projection| {
@@ -966,12 +1021,13 @@ impl TableFunctionImpl for OhlcvFn {
                     .unwrap_or(0);
                 let input = collect_values(&ctx, &table, &cols).await?;
                 blocking(move || {
+                    let names = key_names(&input, &key);
                     let bars = match ohlcv_in_order(&input, &key, width, tie)? {
                         Some(bars) => bars,
                         None => ohlcv_sorted(&input.concat()?, &key, width, tie)?,
                     };
                     Ok(vec![project(
-                        ohlcv_batch(&out, &bars)?,
+                        ohlcv_batch(&out, &bars, names.as_ref())?,
                         projection.as_deref(),
                     )?])
                 })
@@ -987,9 +1043,9 @@ impl TableFunctionImpl for OhlcvFn {
     }
 }
 
-fn ohlcv_schema(key: &str) -> SchemaRef {
+fn ohlcv_schema(key: &str, key_ty: &DataType) -> SchemaRef {
     Arc::new(Schema::new(vec![
-        Field::new(key, DataType::UInt32, false),
+        Field::new(key, key_ty.clone(), false),
         Field::new(
             "bucket",
             DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
@@ -1089,7 +1145,7 @@ fn ohlcv_sorted(batch: &RecordBatch, key: &str, width: i64, tie_col: usize) -> R
     Ok(out)
 }
 
-fn ohlcv_batch(schema: &SchemaRef, bars: &Bars) -> Result<RecordBatch> {
+fn ohlcv_batch(schema: &SchemaRef, bars: &Bars, names: Option<&ArrayRef>) -> Result<RecordBatch> {
     let n: usize = bars.iter().map(|b| b.1.len()).sum();
     let (mut out_key, mut out_start) = (Vec::with_capacity(n), Vec::with_capacity(n));
     let (mut open, mut high) = (Vec::with_capacity(n), Vec::with_capacity(n));
@@ -1112,7 +1168,7 @@ fn ohlcv_batch(schema: &SchemaRef, bars: &Bars) -> Result<RecordBatch> {
     let out = RecordBatch::try_new(
         schema.clone(),
         vec![
-            Arc::new(UInt32Array::from(out_key)),
+            key_column(out_key, schema.field(0).data_type(), names)?,
             Arc::new(TimestampNanosecondArray::from(out_start).with_timezone("UTC")),
             Arc::new(Int64Array::from(open)),
             Arc::new(Int64Array::from(high)),
@@ -1170,7 +1226,7 @@ impl TableFunctionImpl for RollingFn {
         }
         let ts_col = input.field(0).name().clone();
         let tie_col = input.field(input.fields().len() - 1).name().clone();
-        let schema = rolling_schema(&key);
+        let schema = rolling_schema(&key, &key_type(&input, &key)?);
         let ctx = self.ctx.clone();
         let out = schema.clone();
         let compute: Compute = Arc::new(move |projection| {
@@ -1187,6 +1243,7 @@ impl TableFunctionImpl for RollingFn {
                     .unwrap_or(0);
                 let input = collect_values(&ctx, &table, &cols).await?;
                 blocking(move || {
+                    let names = key_names(&input, &key);
                     let steps = match ohlcv_in_order(&input, &key, step, tie)? {
                         Some(bars) => bars,
                         None => ohlcv_sorted(&input.concat()?, &key, step, tie)?,
@@ -1198,7 +1255,7 @@ impl TableFunctionImpl for RollingFn {
                         windows.push((*k, rolled));
                     }
                     Ok(vec![project(
-                        ohlcv_batch(&out, &windows)?,
+                        ohlcv_batch(&out, &windows, names.as_ref())?,
                         projection.as_deref(),
                     )?])
                 })
@@ -1215,8 +1272,8 @@ impl TableFunctionImpl for RollingFn {
 }
 
 /// As [`ohlcv_schema`], with the window's exclusive end in place of the bucket start.
-fn rolling_schema(key: &str) -> SchemaRef {
-    let bars = ohlcv_schema(key);
+fn rolling_schema(key: &str, key_ty: &DataType) -> SchemaRef {
+    let bars = ohlcv_schema(key, key_ty);
     let fields: Vec<Field> = bars
         .fields()
         .iter()
@@ -1288,7 +1345,8 @@ impl TableFunctionImpl for PercentilesFn {
         if let Some(k) = &key {
             input.index_of(k)?;
         }
-        let schema = percentiles_schema(key.as_deref(), &qs);
+        let key_ty = key.as_deref().map(|k| key_type(&input, k)).transpose()?;
+        let schema = percentiles_schema(key.as_deref().zip(key_ty.as_ref()), &qs);
         let ctx = self.ctx.clone();
         let out = schema.clone();
         let compute: Compute = Arc::new(move |projection| {
@@ -1397,7 +1455,8 @@ impl TableFunctionImpl for GapfillFn {
         if !matches!(input.field(0).data_type(), DataType::Timestamp(..)) {
             return plan_err!("gapfill: the first column of {table} is not its timestamp");
         }
-        let schema = gapfill_schema(key.as_deref());
+        let key_ty = key.as_deref().map(|k| key_type(&input, k)).transpose()?;
+        let schema = gapfill_schema(key.as_deref().zip(key_ty.as_ref()));
         let ctx = self.ctx.clone();
         let out = schema.clone();
         let compute: Compute = Arc::new(move |projection| {
@@ -1449,10 +1508,10 @@ fn time_range(ts_col: &str, (start, end): (i64, i64)) -> Expr {
         .and(datafusion::prelude::col(ts_col).lt(at(end)))
 }
 
-fn gapfill_schema(key: Option<&str>) -> SchemaRef {
+fn gapfill_schema(key: Option<(&str, &DataType)>) -> SchemaRef {
     let mut fields = Vec::new();
-    if let Some(k) = key {
-        fields.push(Field::new(k, DataType::UInt32, false));
+    if let Some((k, ty)) = key {
+        fields.push(Field::new(k, ty.clone(), false));
     }
     fields.push(Field::new(
         "bucket",
@@ -1559,8 +1618,12 @@ fn gapfill_compute(
         }
     }
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(4);
-    if spec.key.is_some() {
-        columns.push(Arc::new(UInt32Array::from(keys)));
+    if let Some(k) = spec.key {
+        columns.push(key_column(
+            keys,
+            schema.field(0).data_type(),
+            key_names(input, k).as_ref(),
+        )?);
     }
     columns.push(Arc::new(
         TimestampNanosecondArray::from(filled.bucket).with_timezone("UTC"),
@@ -1573,10 +1636,10 @@ fn gapfill_compute(
     Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 
-fn percentiles_schema(key: Option<&str>, qs: &[f64]) -> SchemaRef {
+fn percentiles_schema(key: Option<(&str, &DataType)>, qs: &[f64]) -> SchemaRef {
     let mut fields = Vec::new();
-    if let Some(k) = key {
-        fields.push(Field::new(k, DataType::UInt32, false));
+    if let Some((k, ty)) = key {
+        fields.push(Field::new(k, ty.clone(), false));
     }
     fields.push(Field::new("count", DataType::UInt64, false));
     fields.push(Field::new("min", DataType::Float64, false));
@@ -1644,10 +1707,12 @@ fn percentiles_compute(
         })
         .collect();
     let mut columns: Vec<ArrayRef> = Vec::new();
-    if key.is_some() {
-        columns.push(Arc::new(UInt32Array::from(
+    if let Some(k) = key {
+        columns.push(key_column(
             per_key.keys().copied().collect::<Vec<_>>(),
-        )));
+            schema.field(0).data_type(),
+            key_names(input, k).as_ref(),
+        )?);
     }
     columns.push(Arc::new(UInt64Array::from(
         per_key.values().map(|e| e.0.count()).collect::<Vec<_>>(),

@@ -203,11 +203,9 @@ with `date_bin`). ANKAA and DuckDB use standard SQL (`date_bin`, `date_trunc`).
 - **Float fields.** The pinned TSBS writes the CPU fields as integers (`usage_user=58i`). Every engine stores them
   as float64 (the values are small integers and convert exactly); InfluxDB and QuestDB receive `cpu.lp`, the
   original lines with the `i` suffix removed.
-- **ANKAA names, not ids.** A `dict` column holds a dense integer id per row; names are in `dictionaries`. The
-  ANKAA queries take host names and return names (`IN (SELECT id FROM dictionaries WHERE … name IN (…))`, then
-  joins for output columns), never ids resolved by the client: the same work every other engine does with
-  strings. Aggregates group on the id and join the names after aggregating — the shape TSBS uses for TimescaleDB
-  with a tags table. ANKAA's `lastpoint` is `max(ts)` per host joined back (measured faster on ankaad than
+- **ANKAA runs the same statements.** A `dict` column is a dictionary-encoded string in SQL (RFC-0002), so the
+  ANKAA queries filter, group and return host names like every other engine; nothing is resolved by the client.
+  The only shape of its own is `lastpoint`: `max(ts)` per host joined back (measured faster on ankaad than
   `DISTINCT ON` and `row_number()`); TSBS points are unique per (host, ts), and DuckDB's `DISTINCT ON` answer would
   expose any duplicate.
 

@@ -22,10 +22,11 @@ use std::sync::Arc;
 
 use ankaa_store::{ChunkRef, ColumnStats};
 use arrow::array::{
-    Array, ArrayRef, Int64Array, RecordBatch, TimestampNanosecondArray, UInt8Array, UInt32Array,
+    Array, ArrayRef, DictionaryArray, Int64Array, RecordBatch, TimestampNanosecondArray,
+    UInt8Array, UInt32Array,
 };
 use arrow::compute::cast;
-use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
+use arrow::datatypes::{DataType, SchemaRef, TimeUnit, UInt32Type};
 use datafusion::common::config::ConfigOptions;
 use datafusion::common::runtime::SpawnedTask;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
@@ -70,6 +71,9 @@ struct Key {
     /// `Some(width)`: the key is `date_bin(width, ts)`. Its value is `lo + n * width` for
     /// bucket number `n`, and `lo` is the start of the first bucket that can hold a row.
     bucket: Option<i64>,
+    /// A dictionary column shown as strings: the names of its ids (the groups are still
+    /// counted on the ids; the result carries the same names array).
+    names: Option<ArrayRef>,
 }
 
 /// An aggregate a chunk can answer without producing rows.
@@ -249,6 +253,7 @@ impl ExecutionPlan for DenseAggExec {
                         projection: scan.projection().clone(),
                         bounds: scan.bounds(),
                         scan_schema: scan.output_schema().clone(),
+                        dicts: scan.dicts().clone(),
                         cols: direct.cols.clone(),
                         simple: direct.simple.clone(),
                     };
@@ -419,7 +424,12 @@ impl Partial {
                     outside |= d >= key.size as u64;
                     *slot = slot.wrapping_add((d as usize).wrapping_mul(key.stride));
                 }
-            } else if let Some(v) = col.as_any().downcast_ref::<UInt32Array>() {
+            } else if let Some(v) = col.as_any().downcast_ref::<UInt32Array>().or_else(|| {
+                // shown as strings: the ids are the dictionary keys
+                col.as_any()
+                    .downcast_ref::<DictionaryArray<UInt32Type>>()
+                    .map(DictionaryArray::keys)
+            }) {
                 for (slot, &x) in self.idx.iter_mut().zip(v.values().iter()) {
                     let d = (i64::from(x) - key.lo) as u64;
                     outside |= d >= key.size as u64;
@@ -522,6 +532,15 @@ impl Partial {
                 DataType::UInt32 => Arc::new(UInt32Array::from_iter_values(
                     values.map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
                 )),
+                t if crate::names::is_dict(t) => {
+                    let ids = UInt32Array::from_iter_values(
+                        values.map(|v| u32::try_from(v).unwrap_or(u32::MAX)),
+                    );
+                    let Some(names) = &key.names else {
+                        return internal_err!("dense aggregation: dictionary key without names");
+                    };
+                    Arc::new(DictionaryArray::<UInt32Type>::try_new(ids, names.clone())?)
+                }
                 DataType::UInt8 => Arc::new(UInt8Array::from_iter_values(
                     values.map(|v| u8::try_from(v).unwrap_or(u8::MAX)),
                 )),
@@ -549,6 +568,7 @@ struct ChunkWork {
     projection: Arc<Vec<usize>>,
     bounds: TimeBounds,
     scan_schema: SchemaRef,
+    dicts: Arc<Vec<Option<ArrayRef>>>,
     cols: Vec<usize>,
     simple: Option<Vec<Simple>>,
 }
@@ -587,6 +607,7 @@ impl ChunkWork {
                 self.bounds,
                 usize::MAX,
                 &self.scan_schema,
+                &self.dicts,
             )?
             else {
                 continue;
@@ -893,7 +914,7 @@ fn group_key(
             }
         }
         (None, DataType::UInt8) => (0, 256),
-        (None, DataType::UInt32) => {
+        (None, t) if *t == DataType::UInt32 || crate::names::is_dict(t) => {
             let mut range: Option<(u32, u32)> = None;
             for chunk in chunks() {
                 let (lo, hi) = chunk.u32_range(table_col)?;
@@ -914,6 +935,7 @@ fn group_key(
         size,
         stride,
         bucket: width,
+        names: scan.dicts().get(scan_col).cloned().flatten(),
     })
 }
 

@@ -6,7 +6,7 @@
 | `TimestampNs` | `i64` | nanoseconds since the Unix epoch, UTC; always column 0; non-decreasing within a partition |
 | `FixedPoint { scale }` | `i64` | value = ticks / 10^scale; feeds are parsed from decimal strings without floating point; more fractional digits than `scale` is an error, not a rounding |
 | `Int64` | `i64` | sizes, sequence numbers, exchange update ids |
-| `DictU32` | `u32` | dictionary code (symbols, venues); dictionary ids are assigned first-seen and stable for the process |
+| `DictU32` | `u32` | dictionary code (symbols, venues, devices); ids are assigned first-seen, persisted and never change. In SQL the column is the name (`Dictionary(UInt32, Utf8)`): the ids are the keys, used in place (RFC-0002) |
 | `U8` | `u8` | flags and enums (e.g. side: 0 = bid/buy, 1 = ask/sell) |
 | `Float64` | `f64` | derived features; ALP-encoded when cold |
 

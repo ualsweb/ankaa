@@ -237,9 +237,8 @@ scan order (key by key for a partitioned table), **not** in global time order: a
 Complexity is O(n + m).
 
 ```sql
-SELECT t.ts, s.name, t.price/1e8 px, (quotes_ask - quotes_bid)/1e8 spread
-FROM asof_join('trades', 'quotes', 'symbol', 500000000) t          -- within 500 ms
-JOIN symbols s ON s.symbol = t.symbol
+SELECT ts, symbol, price/1e8 px, (quotes_ask - quotes_bid)/1e8 spread
+FROM asof_join('trades', 'quotes', 'symbol', 500000000)            -- within 500 ms
 ```
 
 **`gapfill(table, column, width_ns [, key [, agg [, method [, start_ns, end_ns]]]])`**
@@ -259,9 +258,8 @@ per key; an interpolated value is computed from the two ends of its gap, so long
 
 ```sql
 -- per machine, one value a minute over the last day, gaps interpolated
-SELECT d.name AS machine, bucket, value AS kw, filled
-FROM gapfill('power', 'kw', 60000000000, 'machine', 'avg', 'linear', 1762646400000000000, 1762732800000000000) g
-JOIN dictionaries d ON d."table" = 'power' AND d."column" = 'machine' AND d.id = g.machine
+SELECT machine, bucket, value AS kw, filled
+FROM gapfill('power', 'kw', 60000000000, 'machine', 'avg', 'linear', 1762646400000000000, 1762732800000000000)
 ORDER BY machine, bucket;
 ```
 
@@ -276,8 +274,8 @@ so `high`/`low` cost the same as sums): a one-hour window that moves every secon
 one-second one. The continuous query kind `rolling` maintains the same windows as rows arrive (see docs/continuous-queries.md).
 
 ```sql
-SELECT window_end, s.name, close/1e8 AS last, high/1e8 AS high_5m, volume/1e8 AS volume_5m
-FROM rolling('trades', 300000000000, 1000000000) r JOIN symbols s ON s.symbol = r.symbol   -- 5 min, every second
+SELECT window_end, symbol, close/1e8 AS last, high/1e8 AS high_5m, volume/1e8 AS volume_5m
+FROM rolling('trades', 300000000000, 1000000000)                   -- 5 min, every second
 ```
 
 **`ohlcv(table, width_ns [, key])`**
@@ -291,8 +289,8 @@ again for a decimal value; VWAP = `notional / volume`), `count`. `open`/`close` 
 order. The table must have `price` and `size` columns.
 
 ```sql
-SELECT s.name, bucket, open/1e8 o, high/1e8 h, low/1e8 l, close/1e8 c, volume/1e8 v, notional::double/volume vwap
-FROM ohlcv('trades', 60000000000) b JOIN symbols s ON s.symbol = b.symbol ORDER BY bucket
+SELECT symbol, bucket, open/1e8 o, high/1e8 h, low/1e8 l, close/1e8 c, volume/1e8 v, notional::double/volume vwap
+FROM ohlcv('trades', 60000000000) ORDER BY bucket
 ```
 
 This agrees with `GROUP BY date_bin(INTERVAL '1 minute', ts, TIMESTAMP '1970-01-01')` (tested).
@@ -309,8 +307,8 @@ happened. NaN and infinities are skipped; zeros and negative values are handled 
 mirrored store). The sketch is not order-dependent, so the input is not sorted.
 
 ```sql
-SELECT s.name, count, p50/1e8, p99/1e8, p99_9/1e8, collapses
-FROM percentiles('trades', 'size', '0.5,0.99,0.999', 'symbol') p JOIN symbols s ON s.symbol = p.symbol
+SELECT symbol, count, p50/1e8, p99/1e8, p99_9/1e8, collapses
+FROM percentiles('trades', 'size', '0.5,0.99,0.999', 'symbol')
 ```
 
 **`vwap(price, size)`** (an aggregate, used like `sum`): `Σ price·size / Σ size` with exact integer sums and one
@@ -323,8 +321,10 @@ SELECT symbol, vwap(price, size) / 1e8 AS vwap FROM trades WHERE ts >= '2026-11-
 **Aggregating before a join.** `SELECT s.name, count(*), min(t.price) ... FROM trades t JOIN symbols s ON s.symbol =
 t.symbol GROUP BY s.name` is planned as `(trades GROUP BY symbol) JOIN symbols`, grouped again by name: the trades
 become one row per symbol (answered from statistics) before the join. The rewrite is made for `count`, `sum`, `min` and
-`max` of the columns of one side of an inner equi-join on dictionary ids, and is exact whatever the other side holds
-(a key with two names, two keys with one name); `EXPLAIN` shows `__ankaa_partial_` columns when it applies.
+`max` of the columns of one side of an inner equi-join on a dictionary column, and is exact whatever the other side
+holds (a key with two names, two keys with one name); `EXPLAIN` shows `__ankaa_partial_` columns when it applies. The
+join itself is rarely needed: `symbol` and every `dict` column already read as their names (see "Dictionary columns
+in SQL" below).
 
 **Merging sorted partitions.** `ORDER BY` on one or two integer or timestamp columns over partitions that are already
 in that order (`ORDER BY ts, seq`) is merged by `OrderedMergeExec`, which compares the keys as numbers and copies rows

@@ -15,21 +15,33 @@ use std::sync::Arc;
 
 use ankaa_store::{Chunk, Column, ColumnType, Schema as AnkaaSchema};
 use arrow::array::{
-    ArrayRef, Float64Array, Int64Array, TimestampNanosecondArray, UInt8Array, UInt32Array,
+    ArrayRef, DictionaryArray, Float64Array, Int64Array, TimestampNanosecondArray, UInt8Array,
+    UInt32Array,
 };
 use arrow::buffer::{Buffer, NullBuffer, ScalarBuffer};
+use arrow::datatypes::UInt32Type;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::{DataFusionError, Result};
 
 /// Arrow schema for an ANKAA schema. Fixed-point columns are exposed as `Int64` ticks with the
 /// scale recorded in field metadata (`ankaa.scale`); a `Decimal128` view is a later option.
+/// `dict` columns are their ids (`UInt32`); see [`arrow_schema_named`] for the string view.
 #[must_use]
 pub fn arrow_schema(s: &AnkaaSchema) -> SchemaRef {
+    arrow_schema_named(s, &[])
+}
+
+/// [`arrow_schema`] where the `dict` columns flagged in `named` (by column index; missing =
+/// false) are dictionary-encoded strings ([`crate::names::dict_type`]): the ids are the keys
+/// and the dictionary's published names the values.
+#[must_use]
+pub fn arrow_schema_named(s: &AnkaaSchema, named: &[bool]) -> SchemaRef {
     let fields = s
         .fields()
         .iter()
-        .map(|f| {
+        .enumerate()
+        .map(|(i, f)| {
             let (dt, meta) = match f.ty {
                 ColumnType::TimestampNs => (
                     DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
@@ -40,6 +52,9 @@ pub fn arrow_schema(s: &AnkaaSchema) -> SchemaRef {
                     Some(("ankaa.scale".to_string(), scale.to_string())),
                 ),
                 ColumnType::Int64 => (DataType::Int64, None),
+                ColumnType::DictU32 if named.get(i).copied().unwrap_or(false) => {
+                    (crate::names::dict_type(), None)
+                }
                 ColumnType::DictU32 => (DataType::UInt32, None),
                 ColumnType::U8 => (DataType::UInt8, None),
                 ColumnType::Float64 => (DataType::Float64, None),
@@ -114,6 +129,8 @@ struct Col {
     phys: Phys,
     bytes: bytes::Bytes,
     nulls: Option<NullBuffer>,
+    /// A `dict` column shown as strings: the names of its ids.
+    dict: Option<ArrayRef>,
 }
 
 fn null_buffer(valid: Option<&[bool]>) -> Option<NullBuffer> {
@@ -138,15 +155,17 @@ impl std::fmt::Debug for ChunkColumns {
 }
 
 impl ChunkColumns {
-    /// Columns `projection` of a hot chunk, shared with the chunk.
+    /// Columns `projection` of a hot chunk, shared with the chunk. `dicts[n]` (missing = none)
+    /// is the names array of projected column `n` when it is a `dict` column shown as strings.
     pub fn hot(
         chunk: &Arc<Chunk>,
         projection: &[usize],
         rows: core::ops::Range<usize>,
         schema: SchemaRef,
+        dicts: &[Option<ArrayRef>],
     ) -> Result<Self> {
         let mut cols = Vec::with_capacity(projection.len());
-        for &ci in projection {
+        for (n, &ci) in projection.iter().enumerate() {
             let col = chunk
                 .column(ci)
                 .ok_or_else(|| DataFusionError::Internal(format!("column {ci} missing")))?;
@@ -158,20 +177,22 @@ impl ChunkColumns {
                 phys: Phys::of(col),
                 bytes,
                 nulls: null_buffer(chunk.validity(ci)),
+                dict: dicts.get(n).cloned().flatten(),
             });
         }
         Ok(Self { cols, rows, schema })
     }
 
     /// Already-selected `(type, column, validity)` triples (the decoded columns of an encoded
-    /// chunk), taken over without a copy of the values.
+    /// chunk), taken over without a copy of the values. `dicts` as for [`Self::hot`].
     pub fn decoded(
         columns: Vec<(ColumnType, Column, Option<Vec<bool>>)>,
         rows: core::ops::Range<usize>,
         schema: SchemaRef,
+        dicts: &[Option<ArrayRef>],
     ) -> Result<Self> {
         let mut cols = Vec::with_capacity(columns.len());
-        for (ty, col, valid) in columns {
+        for (n, (ty, col, valid)) in columns.into_iter().enumerate() {
             check_rows(&rows, col.len())?;
             if valid.as_ref().is_some_and(|v| v.len() != col.len()) {
                 return Err(DataFusionError::Internal(
@@ -183,6 +204,7 @@ impl ChunkColumns {
                 phys: Phys::of(&col),
                 nulls: null_buffer(valid.as_deref()),
                 bytes: bytes::Bytes::from_owner(Owner::Decoded(col)),
+                dict: dicts.get(n).cloned().flatten(),
             });
         }
         Ok(Self { cols, rows, schema })
@@ -225,7 +247,18 @@ impl ChunkColumns {
                         .with_timezone("UTC"),
                 ),
                 (Phys::I64, _) => Arc::new(Int64Array::new(ScalarBuffer::from(buf), nulls)),
-                (Phys::U32, _) => Arc::new(UInt32Array::new(ScalarBuffer::from(buf), nulls)),
+                (Phys::U32, _) => {
+                    let ids = UInt32Array::new(ScalarBuffer::from(buf), nulls);
+                    match &c.dict {
+                        // the checked constructor: an id without a published name is an
+                        // error here, never an out-of-range key in a kernel
+                        Some(names) => Arc::new(
+                            DictionaryArray::<UInt32Type>::try_new(ids, names.clone())
+                                .map_err(DataFusionError::from)?,
+                        ),
+                        None => Arc::new(ids),
+                    }
+                }
                 (Phys::U8, _) => Arc::new(UInt8Array::new(ScalarBuffer::from(buf), nulls)),
                 (Phys::F64, _) => Arc::new(Float64Array::new(ScalarBuffer::from(buf), nulls)),
             };
@@ -254,7 +287,7 @@ pub fn chunk_to_batch(
     rows: core::ops::Range<usize>,
     out_schema: SchemaRef,
 ) -> Result<RecordBatch> {
-    let cols = ChunkColumns::hot(chunk, projection, rows, out_schema)?;
+    let cols = ChunkColumns::hot(chunk, projection, rows, out_schema, &[])?;
     cols.batch(0, cols.num_rows())
 }
 
@@ -290,7 +323,7 @@ mod tests {
     fn batches_share_the_chunk_and_report_their_own_size() {
         let c = chunk(1_000);
         let schema = arrow_schema(c.schema());
-        let cols = ChunkColumns::hot(&c, &[0, 1, 2, 3], 100..900, schema).unwrap();
+        let cols = ChunkColumns::hot(&c, &[0, 1, 2, 3], 100..900, schema, &[]).unwrap();
         assert_eq!(cols.num_rows(), 800);
         let b = cols.batch(10, 50).unwrap();
         assert_eq!(b.num_rows(), 50);
@@ -329,15 +362,21 @@ mod tests {
     fn clamps_and_rejects_bad_ranges() {
         let c = chunk(100);
         let schema = arrow_schema(c.schema());
-        let cols =
-            ChunkColumns::hot(&c, &[0], 0..100, Arc::new(schema.project(&[0]).unwrap())).unwrap();
+        let cols = ChunkColumns::hot(
+            &c,
+            &[0],
+            0..100,
+            Arc::new(schema.project(&[0]).unwrap()),
+            &[],
+        )
+        .unwrap();
         assert_eq!(cols.batch(90, 50).unwrap().num_rows(), 10);
         assert_eq!(cols.batch(500, 50).unwrap().num_rows(), 0);
-        assert!(ChunkColumns::hot(&c, &[0], 0..101, schema.clone()).is_err());
-        assert!(ChunkColumns::hot(&c, &[9], 0..10, schema.clone()).is_err());
+        assert!(ChunkColumns::hot(&c, &[0], 0..101, schema.clone(), &[]).is_err());
+        assert!(ChunkColumns::hot(&c, &[9], 0..10, schema.clone(), &[]).is_err());
         // no columns: the row count survives
-        let none =
-            ChunkColumns::hot(&c, &[], 0..100, Arc::new(schema.project(&[]).unwrap())).unwrap();
+        let none = ChunkColumns::hot(&c, &[], 0..100, Arc::new(schema.project(&[]).unwrap()), &[])
+            .unwrap();
         assert_eq!(none.batch(0, 64).unwrap().num_rows(), 64);
     }
 
@@ -348,6 +387,7 @@ mod tests {
             vec![(ColumnType::Int64, Column::I64((0..1_000).collect()), None)],
             10..20,
             schema,
+            &[],
         )
         .unwrap();
         let b = cols.batch(0, 100).unwrap();
