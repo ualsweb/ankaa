@@ -212,7 +212,7 @@ impl Wal {
             .open(&segment_path)?;
         let segment_len = file.metadata()?.len();
         // Make the directory entry durable too (new file creation).
-        File::open(dir)?.sync_all()?;
+        sync_dir(dir)?;
         Ok((
             Self {
                 dir: dir.to_path_buf(),
@@ -300,7 +300,7 @@ impl Wal {
             .create_new(true)
             .append(true)
             .open(&path)?;
-        if let Err(e) = File::open(&self.dir).and_then(|d| d.sync_all()) {
+        if let Err(e) = sync_dir(&self.dir) {
             // keep writing to the current segment; an empty file with a higher first LSN
             // would make the names lie about where records are
             drop(file);
@@ -359,7 +359,7 @@ impl Wal {
             }
         }
         if removed > 0 {
-            File::open(&self.dir)?.sync_all()?;
+            sync_dir(&self.dir)?;
         }
         Ok(removed)
     }
@@ -530,6 +530,17 @@ impl Iterator for Replay {
             return Some(Ok(rec));
         }
     }
+}
+
+/// Make the entries of `dir` durable: a created, renamed or removed file survives a power loss
+/// only once its directory is synced.
+fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    // Miri (the interpreter CI runs the unsafe-code checks in) cannot fsync a directory.
+    // Durability is verified by the power-loss rig (scripts/power-loss-rig.sh), never by Miri.
+    if cfg!(miri) {
+        return Ok(());
+    }
+    File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]
