@@ -15,7 +15,6 @@ jobs:
   fuzz:
     name: cargo-fuzz smoke (5 min per target)
     runs-on: ubuntu-24.04-arm
-    if: ${{ hashFiles('fuzz/Cargo.toml') != '' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
