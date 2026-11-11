@@ -66,6 +66,22 @@ Tables and SQL functions are the ones `ankaad` exposes (`docs/data-model.md`):
 `asof_join('trades', 'quotes', 'symbol'[, tolerance_ns])`,
 `percentiles('trades', 'size', '0.5,0.99'[, 'symbol'])`.
 
+## Without the package: ADBC over Flight SQL
+
+`ankaad` also answers Flight SQL on the Flight port, read-only, so the ADBC driver works against it
+with nothing from this repository installed:
+
+```sh
+pip install adbc-driver-flightsql pyarrow
+ANKAA_TOKEN=... python examples/python/flight_sql_adbc.py grpc://127.0.0.1:50051
+```
+
+`flight_sql_adbc.py` is a smoke test for a running server (it is not part of CI): it connects with the
+token as a bearer header and as a password, runs queries through the DB-API cursor (which prepares
+every statement), reads the server info, the table list and a table schema, and checks that writes
+and wrong tokens are refused. Statement parameters are not supported: write the values in the SQL
+text. `docs/deployment.md` (§4, "Flight SQL clients") has the connection options, TLS included.
+
 ## Threads
 
 `Dataset.sql` and `Client.sql` release the GIL while the engine or the network runs, so

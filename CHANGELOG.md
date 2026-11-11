@@ -75,6 +75,19 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   error: drop the join, or set `server.dict_columns = "ids"` (`ankaad serve --dict-ids`) to keep numeric
   columns. `ankaad replay` and the Python capture session still show ids. Storage, log and segment formats are
   unchanged.
+- Flight SQL on the Flight port, read-only, so ADBC drivers and the Flight SQL JDBC driver can connect. The
+  existing service recognises Flight SQL commands (a protobuf `Any` in the descriptor, ticket or action body)
+  and answers them; plain Flight (`ankaad query`, the Python package) is unchanged. Supported: statements,
+  prepared statements without parameters, `GetSchema`, and the metadata calls `GetSqlInfo`, `GetCatalogs`,
+  `GetDbSchemas`, `GetTables` (with or without table schemas) and `GetTableTypes`. Statements run through the
+  same planning and execution as plain Flight, with the same read-only check, query timeout, cap on concurrent
+  queries and memory pool; tickets and prepared-statement handles are the SQL text, so the server keeps
+  nothing per client. Refused with a status: updates, bulk ingest, statement parameters, transactions,
+  Substrait plans, `CancelQuery`, and the metadata calls for keys and type info.
+- `Handshake` is implemented (it answered "unimplemented" before): it takes the token as a bearer header or
+  as the password of Basic authentication with any user name, and answers with `authorization: Bearer
+  <token>`. This is what ADBC and the JDBC driver use when given a user name and a password. `DoPut`,
+  `DoAction` and `ListActions` now check the token before they answer.
 - Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
   could hand the last messages to the next start again.
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on

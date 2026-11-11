@@ -1,6 +1,6 @@
 [package]
 name = "ankaa-flight"
-description = "Arrow Flight server: SQL over DoGet/GetFlightInfo with bearer-token auth."
+description = "Arrow Flight and Flight SQL server: read-only SQL with bearer-token auth."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,7 +15,10 @@ ankaa-wal.workspace = true
 ankaa-sql.workspace = true
 parking_lot.workspace = true
 arrow = { workspace = true, features = ["ipc"] }
-arrow-flight = { version = "59.2", default-features = false }
+arrow-flight = { version = "59.2", default-features = false, features = ["flight-sql"] }
+# both are already dependencies of arrow-flight: `Any` decoding and the Basic handshake header
+prost = { version = "0.14", default-features = false }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 datafusion = { workspace = true, features = ["nested_expressions", "sql", "unicode_expressions"] }
 tonic = { version = "0.14", default-features = false, features = ["codegen", "router", "server", "transport", "channel", "tls-aws-lc"] }
 tokio.workspace = true

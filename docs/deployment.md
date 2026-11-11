@@ -93,14 +93,14 @@ The schema is `crates/ankaa-core/src/config.rs`. All fields, with defaults:
 
 | Key | Default | CLI | Meaning |
 |---|---|---|---|
-| `flight_addr` | `"127.0.0.1:50051"` | `--flight-addr` | Arrow Flight (gRPC) bind address. |
+| `flight_addr` | `"127.0.0.1:50051"` | `--flight-addr` | Arrow Flight (gRPC) bind address. The same port answers Flight SQL (ADBC, JDBC; see §4). |
 | `metrics_addr` | `"127.0.0.1:9100"` | `--metrics-addr` | Prometheus `/metrics` bind address. |
 | `token_env` | `"ANKAA_TOKEN"` | `--token` / env `ANKAA_TOKEN` | Name of the environment variable that holds the bearer token. The token itself is never written in the file (see §3). |
 | `tls_cert` | unset | `--tls-cert` | PEM certificate chain for Flight. Must be set together with `tls_key`. |
 | `tls_key` | unset | `--tls-key` | PEM private key (PKCS#8 or SEC1). |
 | `tls_client_ca` | unset | `--tls-client-ca` | PEM CA bundle; when set, Flight requires a client certificate signed by it (mutual TLS). Requires `tls_cert`/`tls_key`. |
 | `allow_plaintext` | `false` | — | Accept a Flight listener beyond loopback **without** TLS. Refused by default: the token and all data would cross the network in clear text. Only for a private network segment or behind a TLS-terminating proxy. |
-| `max_concurrent_queries` | `32` | — | Queries executing at once over Flight; further ones wait inside their own timeout and are then refused. |
+| `max_concurrent_queries` | `32` | — | Queries executing at once over Flight (plain Flight and Flight SQL together); further ones wait inside their own timeout and are then refused. |
 | `dict_columns` | `"names"` | `--dict-ids` (sets `"ids"`) | How `dict` columns and `symbol` appear in SQL. `"names"`: dictionary-encoded text (`WHERE machine = 'press03'`, results carry names; RFC-0002). `"ids"`: the stored `UInt32` ids, names in `dictionaries` / `symbols` (the behaviour before RFC-0002, for dashboards written against it). Storage is the same in both: the setting can be changed at any restart. |
 
 ### `[resources]`
@@ -156,7 +156,8 @@ printf 'ANKAA_TOKEN=%s\n' "$(openssl rand -hex 32)" | sudo tee -a /etc/ankaa/ank
 
 The unit in `deploy/systemd/ankaad.service` loads it with `EnvironmentFile=`. Put `BINANCE_API_KEY` in the same file
 if you use the SBE endpoint. Rotate by editing the file and restarting; clients send the token as
-`authorization: Bearer <token>` on every Flight call and on `/metrics`.
+`authorization: Bearer <token>` on every Flight call and on `/metrics`. Flight SQL clients that only take a user name
+and a password send the token as the password (§4, "Flight SQL clients").
 
 Without a token (loopback only) Flight and `/metrics` are open to any local process. That is the development mode.
 
@@ -211,6 +212,49 @@ ANKAA_TOKEN=… ankaad query --addr 10.0.0.12:50051 --tls-ca ca.pem --tls-domain
 `--tls-ca` switches the client to `https://`; the server certificate must chain to that CA and match the host part of
 `--addr` (or `--tls-domain`). pyarrow clients use `flight.connect("grpc+tls://host:50051", tls_root_certs=open("ca.pem","rb").read())`
 with `FlightCallOptions(headers=[(b"authorization", b"Bearer …")])`.
+
+### Flight SQL clients (ADBC, JDBC)
+
+The Flight port also answers Flight SQL, read-only, with the same token, TLS settings, query timeout, cap on concurrent
+queries and memory limit. Nothing has to be configured for it.
+
+ADBC (Python shown; `pip install adbc-driver-flightsql pyarrow`):
+
+```python
+import adbc_driver_flightsql.dbapi as flight_sql
+from adbc_driver_flightsql import DatabaseOptions
+
+conn = flight_sql.connect(
+    "grpc+tls://ankaad.internal:50051",                      # grpc:// without TLS (loopback)
+    db_kwargs={
+        DatabaseOptions.AUTHORIZATION_HEADER.value: "Bearer <token>",
+        DatabaseOptions.TLS_ROOT_CERTS.value: open("/etc/ankaa/tls/ca.pem").read(),
+    },
+    autocommit=True,                                         # there are no transactions
+)
+with conn.cursor() as cur:
+    cur.execute("SELECT count(*) FROM trades")
+    print(cur.fetch_arrow_table())
+```
+
+JDBC (Arrow Flight SQL JDBC driver): `jdbc:arrow-flight-sql://ankaad.internal:50051/?token=<token>&tlsRootCerts=/etc/ankaa/tls/ca.pem`
+(`useEncryption=false` for a loopback listener without TLS).
+
+Authentication, as these clients do it:
+
+- **Token.** ADBC's `adbc.flight.sql.authorization_header` and JDBC's `token` put `authorization: Bearer <token>` on
+  every call; the JDBC driver first makes a `Handshake` call with that header, which the server accepts.
+- **User name and password.** ADBC's `username`/`password` and JDBC's `user`/`password` make one `Handshake` call with
+  `authorization: Basic base64(user:password)` and use the bearer token from the response headers afterwards. The
+  server accepts any user name with the token as the password and answers with `authorization: Bearer <token>`.
+  `Basic` is accepted on `Handshake` only.
+
+Supported: queries (`CommandStatementQuery`), prepared statements without parameters, `GetSchema`, and the metadata
+calls `GetSqlInfo`, `GetCatalogs`, `GetDbSchemas`, `GetTables` (with or without the table schemas) and `GetTableTypes`.
+Refused with an error: updates and bulk ingest (the server is read-only), statement parameters (`$1`, `?`: write the
+values in the SQL text), transactions, Substrait plans, `CancelQuery`, and the metadata calls for keys and type info.
+`examples/python/flight_sql_adbc.py` checks a running server through ADBC (run by hand with `adbc_driver_flightsql`
+1.13; not part of CI). The JDBC driver has not been run against ANKAA yet.
 
 ### Mutual TLS (server also verifies clients)
 

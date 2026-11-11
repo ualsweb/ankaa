@@ -27,7 +27,7 @@ Optional, developer experience: **P0-09 streaming-SVE harness on Apple Silicon**
 | P1-06 | Sealing, zone-map pruning, warm tier (Vortex: ALP/FoR/FastLanes/dict), cold segment files, budgeted tiering, persisted dictionary | done |
 | P1-07 | Operators: streaming ASOF, time buckets, L2 book, UDDSketch + fixed-point histogram | done (KLL: not needed yet) |
 | P1-08 | Operators in SQL: `asof_join`, `ohlcv`, `percentiles`; DuckDB/Polars oracle 31/31 (`bench/oracle`) | done (incremental versions: later) |
-| P1-09 | Arrow Flight server with bearer auth, read-only SQL, TLS + mutual TLS | done (Flight SQL extension: later) |
+| P1-09 | Arrow Flight server with bearer auth, read-only SQL, TLS + mutual TLS; Flight SQL on the same port for ADBC and JDBC | done (Flight SQL statement parameters: later) |
 | P1-10 | Python package (`maturin`, Arrow C Data Interface, GIL released), notebook | done |
 | P1-11 | `ankaad replay`, `serve`, `query`, `config`; graceful shutdown (SIGINT/SIGTERM), WAL recovery, TOML config with fail-fast checks | done |
 | P1-12 | Security: no-unwrap lints, 8 fuzz targets, `docs/security.md`, read-only Flight/Postgres, constant-time tokens, systemd supervision unit | done |

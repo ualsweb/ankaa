@@ -75,7 +75,7 @@ flowchart LR
 | **Durability** | Write-ahead log with CRC32C and group commit, crash recovery, checkpoints that truncate the log. **1,000 simulated power cuts, zero acknowledged writes lost** |
 | **Replication** | A standby streams the primary's log over Arrow Flight, serves read-only queries and can be promoted ([guide](docs/replication.md)) |
 | **Query** | SQL through Apache DataFusion with time-range and key pruning and parallel scans · hash-free aggregation over symbols, flags and time buckets that answers from per-block statistics where it can · `asof_join`, `ohlcv`, `rolling` and `percentiles` table functions |
-| **Interfaces** | Arrow Flight (TLS, mutual TLS, tokens, read-only SQL), PostgreSQL wire protocol (`psql`, BI tools), Python with zero-copy Arrow, Prometheus metrics and a Grafana dashboard |
+| **Interfaces** | Arrow Flight and Flight SQL on one port (ADBC and JDBC drivers; TLS, mutual TLS, tokens, read-only SQL), PostgreSQL wire protocol (`psql`, BI tools), Python with zero-copy Arrow, Prometheus metrics and a Grafana dashboard |
 | **Arm-native compute** | Scan kernels for scalar, NEON and **SVE2**, vector-length agnostic, checked on 128-, 256- and 512-bit vectors |
 | **Operations** | One binary, one TOML file, systemd unit, alert rules, fail-fast config checks, bounded query memory and timeouts |
 
@@ -207,6 +207,24 @@ power = live.sql("SELECT * FROM cq_power_1m_live").to_pandas()
 ```
 
 Build the package with `pip install maturin && maturin develop` in `crates/ankaa-py`; the notebook is in [`examples/python/`](examples/python/).
+
+### From ADBC or JDBC (Flight SQL)
+
+The Flight port also answers Flight SQL, read-only, so standard drivers connect without the `ankaa` package:
+
+```python
+import adbc_driver_flightsql.dbapi as flight_sql        # pip install adbc-driver-flightsql pyarrow
+
+conn = flight_sql.connect("grpc://127.0.0.1:50051", autocommit=True,
+                          db_kwargs={"adbc.flight.sql.authorization_header": "Bearer devtoken"})
+with conn.cursor() as cur:
+    cur.execute("SELECT count(*) FROM trades")
+    print(cur.fetch_arrow_table())
+```
+
+JDBC: `jdbc:arrow-flight-sql://127.0.0.1:50051/?useEncryption=false&token=devtoken`. Queries, prepared statements
+without parameters and the catalog metadata calls are supported; what is refused is listed in
+[`docs/deployment.md`](docs/deployment.md) (§4, "Flight SQL clients").
 
 ---
 

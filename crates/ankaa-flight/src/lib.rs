@@ -1,18 +1,35 @@
 //! Arrow Flight server for ANKAA (P1-09a).
 //!
-//! Protocol (plain Flight, not the Flight SQL extension yet):
+//! One service speaks two dialects on the same port.
+//!
+//! Plain Flight (`ankaad query`, the Python package, the benchmark harness):
 //! - `GetFlightInfo` with a `FlightDescriptor::Cmd` whose bytes are a SQL string returns the
 //!   result schema and one endpoint whose ticket is the same SQL.
 //! - `DoGet(ticket = SQL bytes)` executes the query on the shared `SessionContext` and streams
 //!   the record batches as Flight data.
 //! - `ListFlights` lists registered tables.
+//!
+//! Flight SQL (ADBC, the Flight SQL JDBC driver, `FlightSqlServiceClient`): a descriptor,
+//! ticket or action body that is a protobuf `Any` with a
+//! `type.googleapis.com/arrow.flight.protocol.sql.*` type URL is handled by the `flight_sql`
+//! module: statements, prepared statements without parameters and the catalog metadata
+//! commands. It ends in the same planning and execution functions as plain Flight, so the
+//! read-only check, the query timeout, the cap on concurrent queries and the memory pool are
+//! the same ones.
+//!
+//! Both:
 //! - Auth: when a token is configured, every call must carry `authorization: Bearer <token>`.
+//!   `Handshake` exists for the clients that insist on one (JDBC, ADBC with a user name and
+//!   password): it takes the token as a bearer header or as the password of a Basic header and
+//!   answers with the bearer header to send from then on.
 //! - TLS: [`TlsFiles`] (PEM cert chain + key, optional client CA for mutual TLS) via [`serve`];
 //!   clients use [`client_endpoint`].
 //!
 //! The `SessionContext` is shared with the ingest side, which re-registers table snapshots
 //! periodically; queries therefore see data up to the last snapshot.
 #![forbid(unsafe_code)]
+
+mod flight_sql;
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -497,10 +514,11 @@ impl AnkaaFlight {
             .with_allow_statements(false)
     }
 
-    async fn plan_schema(&self, sql: &str) -> Result<SchemaRef, Status> {
+    /// Plan `sql` (read-only, inside the query timeout) without executing it.
+    async fn plan(&self, sql: &str) -> Result<datafusion::prelude::DataFrame, Status> {
         use std::sync::atomic::Ordering::Relaxed;
         self.metrics.queries.fetch_add(1, Relaxed);
-        let df = tokio::time::timeout(
+        tokio::time::timeout(
             self.query_timeout,
             self.ctx.sql_with_options(sql, Self::sql_options()),
         )
@@ -512,9 +530,110 @@ impl AnkaaFlight {
         .map_err(|e| {
             self.metrics.errors.fetch_add(1, Relaxed);
             Status::invalid_argument(format!("sql: {e}"))
-        })?;
+        })
+    }
+
+    async fn plan_schema(&self, sql: &str) -> Result<SchemaRef, Status> {
+        let df = self.plan(sql).await?;
         Ok(Arc::new(df.schema().as_arrow().clone()))
     }
+
+    /// Execute `sql` and stream the result: a query slot for the whole life of the query, the
+    /// read-only check, the plan cache and the deadline. Every query of both dialects runs
+    /// through here.
+    async fn run_query(&self, sql: &str) -> Result<BoxStream<FlightData>, Status> {
+        use std::sync::atomic::Ordering::Relaxed;
+        tracing::debug!(%sql, "do_get");
+        let m = self.metrics.clone();
+        let t0 = std::time::Instant::now();
+        m.queries.fetch_add(1, Relaxed);
+        let deadline = t0 + self.query_timeout;
+        // a slot for the whole life of the query; waiting for one counts against its deadline
+        let slot =
+            tokio::time::timeout_at(deadline.into(), self.query_slots.clone().acquire_owned())
+                .await
+                .map_err(|_| {
+                    m.errors.fetch_add(1, Relaxed);
+                    Status::resource_exhausted(
+                        "too many queries are running (server.max_concurrent_queries); try again",
+                    )
+                })?
+                .map_err(|_| Status::internal("query slots closed"))?;
+        // a statement seen before is not parsed and optimised again; the physical plan is
+        // always built here, on the chunks that exist now
+        let plan = tokio::time::timeout_at(
+            deadline.into(),
+            self.plans
+                .physical_plan(&self.ctx, sql, Self::sql_options()),
+        )
+        .await
+        .map_err(|_| {
+            m.errors.fetch_add(1, Relaxed);
+            Status::deadline_exceeded("query planning exceeded the server's query timeout")
+        })?
+        .map_err(|e| {
+            m.errors.fetch_add(1, Relaxed);
+            Status::invalid_argument(format!("sql: {e}"))
+        })?;
+        let schema: SchemaRef = plan.schema();
+        let stream =
+            datafusion::physical_plan::execute_stream(plan, self.ctx.task_ctx()).map_err(|e| {
+                m.errors.fetch_add(1, Relaxed);
+                Status::internal(format!("execute: {e}"))
+            })?;
+        Ok(Box::pin(stream_with_deadline(
+            stream, schema, deadline, t0, m, slot,
+        )))
+    }
+
+    /// The token a `Handshake` call proved it knows; it is sent back as the bearer token.
+    ///
+    /// Flight SQL clients authenticate in two ways. Given a token, they send `authorization:
+    /// Bearer …` on every call, and the JDBC driver opens with a `Handshake` carrying that
+    /// header. Given a user name and a password, the JDBC driver and ADBC send `authorization:
+    /// Basic base64(user:password)` on `Handshake` and take the bearer token for the following
+    /// calls from the response headers. The user name is free and the password is the server
+    /// token, as on the Postgres listener.
+    fn handshake_token<T>(&self, req: &Request<T>) -> Result<String, Status> {
+        let Some(want) = &self.token else {
+            return Ok("anonymous".to_owned()); // no authentication: any credentials do
+        };
+        let header = req
+            .metadata()
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let got = ankaa_core::bearer_token(header)
+            .map(str::to_owned)
+            .or_else(|| basic_password(header));
+        if got.is_some_and(|g| ankaa_core::constant_time_eq(g.as_bytes(), want.as_bytes())) {
+            Ok(want.to_string())
+        } else {
+            self.metrics
+                .unauthenticated
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Err(Status::unauthenticated(
+                "handshake: send the token as a bearer token or as the password of basic authentication",
+            ))
+        }
+    }
+}
+
+/// The password of an `Authorization: Basic base64(user:password)` header value.
+///
+/// Padding is optional: the Go client behind ADBC encodes without it.
+fn basic_password(header_value: &str) -> Option<String> {
+    use base64::Engine;
+    let (scheme, rest) = header_value.trim().split_once(char::is_whitespace)?;
+    if !scheme.eq_ignore_ascii_case("basic") {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(rest.trim().trim_end_matches('='))
+        .ok()?;
+    let credentials = String::from_utf8(decoded).ok()?;
+    let (_user, password) = credentials.split_once(':')?;
+    Some(password.to_owned())
 }
 
 /// gRPC status for a WAL tail error: a follower that cannot continue from this log gets a
@@ -674,11 +793,22 @@ impl FlightService for AnkaaFlight {
 
     async fn handshake(
         &self,
-        _req: Request<Streaming<HandshakeRequest>>,
+        req: Request<Streaming<HandshakeRequest>>,
     ) -> Result<Response<Self::HandshakeStream>, Status> {
-        Err(Status::unimplemented(
-            "use a bearer token in the authorization header",
-        ))
+        // the credentials are in the headers; the request stream carries nothing we need
+        let token = self.handshake_token(&req)?;
+        let bearer =
+            tonic::metadata::MetadataValue::try_from(format!("Bearer {token}")).map_err(|_| {
+                Status::failed_precondition("the server token cannot be sent as a header value")
+            })?;
+        let reply = HandshakeResponse {
+            protocol_version: 0,
+            payload: Vec::new().into(),
+        };
+        let mut resp: Response<Self::HandshakeStream> =
+            Response::new(Box::pin(futures::stream::iter([Ok(reply)])));
+        resp.metadata_mut().insert("authorization", bearer);
+        Ok(resp)
     }
 
     async fn list_flights(
@@ -714,6 +844,9 @@ impl FlightService for AnkaaFlight {
     ) -> Result<Response<FlightInfo>, Status> {
         self.check_auth(&req)?;
         let d = req.into_inner();
+        if let Some(any) = flight_sql::command_of(&d) {
+            return self.sql_flight_info(any, d).await.map(Response::new);
+        }
         let sql = sql_from_descriptor(&d)?;
         let schema = self.plan_schema(&sql).await?;
         let info = FlightInfo::new()
@@ -736,8 +869,12 @@ impl FlightService for AnkaaFlight {
         req: Request<FlightDescriptor>,
     ) -> Result<Response<SchemaResult>, Status> {
         self.check_auth(&req)?;
-        let sql = sql_from_descriptor(req.get_ref())?;
-        let schema = self.plan_schema(&sql).await?;
+        let schema = if let Some(any) = flight_sql::command_of(req.get_ref()) {
+            self.sql_schema(any).await?
+        } else {
+            let sql = sql_from_descriptor(req.get_ref())?;
+            self.plan_schema(&sql).await?
+        };
         let opts = arrow::ipc::writer::IpcWriteOptions::default();
         let res: SchemaResult = arrow_flight::SchemaAsIpc::new(&schema, &opts)
             .try_into()
@@ -746,7 +883,6 @@ impl FlightService for AnkaaFlight {
     }
 
     async fn do_get(&self, req: Request<Ticket>) -> Result<Response<Self::DoGetStream>, Status> {
-        use std::sync::atomic::Ordering::Relaxed;
         if req
             .get_ref()
             .ticket
@@ -756,7 +892,12 @@ impl FlightService for AnkaaFlight {
         } else {
             self.check_auth(&req)?;
         }
-        let sql = String::from_utf8(req.into_inner().ticket.to_vec())
+        let ticket = req.into_inner().ticket;
+        // a Flight SQL ticket is a protobuf `Any`: it never starts with the WAL prefix
+        if let Some(any) = flight_sql::any_of(&ticket) {
+            return self.sql_do_get(any).await.map(Response::new);
+        }
+        let sql = String::from_utf8(ticket.to_vec())
             .map_err(|_| Status::invalid_argument("ticket is not utf-8"))?;
         if let Some(rest) = sql.strip_prefix(WAL_TICKET_PREFIX) {
             let from: u64 = rest
@@ -765,52 +906,30 @@ impl FlightService for AnkaaFlight {
                 .map_err(|_| Status::invalid_argument("wal ticket: bad lsn"))?;
             return Ok(Response::new(self.wal_stream(from)?));
         }
-        tracing::debug!(%sql, "do_get");
-        let m = self.metrics.clone();
-        let t0 = std::time::Instant::now();
-        m.queries.fetch_add(1, Relaxed);
-        let deadline = t0 + self.query_timeout;
-        // a slot for the whole life of the query; waiting for one counts against its deadline
-        let slot =
-            tokio::time::timeout_at(deadline.into(), self.query_slots.clone().acquire_owned())
-                .await
-                .map_err(|_| {
-                    m.errors.fetch_add(1, Relaxed);
-                    Status::resource_exhausted(
-                        "too many queries are running (server.max_concurrent_queries); try again",
-                    )
-                })?
-                .map_err(|_| Status::internal("query slots closed"))?;
-        // a statement seen before is not parsed and optimised again; the physical plan is
-        // always built here, on the chunks that exist now
-        let plan = tokio::time::timeout_at(
-            deadline.into(),
-            self.plans
-                .physical_plan(&self.ctx, &sql, Self::sql_options()),
-        )
-        .await
-        .map_err(|_| {
-            m.errors.fetch_add(1, Relaxed);
-            Status::deadline_exceeded("query planning exceeded the server's query timeout")
-        })?
-        .map_err(|e| {
-            m.errors.fetch_add(1, Relaxed);
-            Status::invalid_argument(format!("sql: {e}"))
-        })?;
-        let schema: SchemaRef = plan.schema();
-        let stream =
-            datafusion::physical_plan::execute_stream(plan, self.ctx.task_ctx()).map_err(|e| {
-                m.errors.fetch_add(1, Relaxed);
-                Status::internal(format!("execute: {e}"))
-            })?;
-        let flight = stream_with_deadline(stream, schema, deadline, t0, m, slot);
-        Ok(Response::new(Box::pin(flight)))
+        Ok(Response::new(self.run_query(&sql).await?))
     }
 
     async fn do_put(
         &self,
-        _req: Request<Streaming<FlightData>>,
+        req: Request<Streaming<FlightData>>,
     ) -> Result<Response<Self::DoPutStream>, Status> {
+        self.check_auth(&req)?;
+        // Nothing is ever written through Flight. Only the first message is read, to tell a
+        // Flight SQL client what exactly was refused.
+        let mut stream = req.into_inner();
+        let first = tokio::time::timeout(self.query_timeout, stream.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("do_put: no message arrived in time"))??;
+        if let Some(any) = first
+            .and_then(|m| m.flight_descriptor)
+            .as_ref()
+            .and_then(flight_sql::command_of)
+        {
+            self.metrics
+                .errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Err(flight_sql::refuse_put(any));
+        }
         Err(Status::unimplemented(
             "do_put (ingest goes through feeds, not Flight)",
         ))
@@ -818,16 +937,22 @@ impl FlightService for AnkaaFlight {
 
     async fn do_action(
         &self,
-        _req: Request<Action>,
+        req: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        Err(Status::unimplemented("do_action"))
+        self.check_auth(&req)?;
+        self.sql_do_action(req.into_inner())
+            .await
+            .map(Response::new)
     }
 
     async fn list_actions(
         &self,
-        _req: Request<Empty>,
+        req: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        Ok(Response::new(Box::pin(futures::stream::empty())))
+        self.check_auth(&req)?;
+        Ok(Response::new(Box::pin(futures::stream::iter(
+            flight_sql::action_types().into_iter().map(Ok),
+        ))))
     }
 
     async fn do_exchange(

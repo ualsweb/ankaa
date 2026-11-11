@@ -13,8 +13,8 @@ ANKAA is a single-process engine (today) with four planes:
                       │                                              │
                       │ watermark per partition                      │ periodic snapshot (sealed Arcs + copy of open chunk)
                       ▼                                              ▼
-   WAL owner (group commit, fdatasync)                     DataFusion SessionContext ◄── Arrow Flight (SQL in ticket)
-                                                                                     ◄── ankaad query / pyarrow.flight / ADBC
+   WAL owner (group commit, fdatasync)                     DataFusion SessionContext ◄── Arrow Flight (SQL in ticket) ◄── ankaad query / pyarrow.flight
+                                                                                     ◄── Flight SQL, same port     ◄── ADBC / JDBC
 ```
 
 ## Crates
@@ -30,7 +30,7 @@ ANKAA is a single-process engine (today) with four planes:
 | `ankaa-feeds` | Binance JSON decoder, `.ankc` capture format, live WebSocket source, `ankaa-capture` | forbidden |
 | `ankaa-ts` | streaming ASOF join, time buckets, L2 order book | forbidden |
 | `ankaa-sql` | DataFusion `TableProvider` / `ExecutionPlan` with pushdown | forbidden |
-| `ankaa-flight` | Arrow Flight server with bearer auth | forbidden |
+| `ankaa-flight` | Arrow Flight and Flight SQL server (one service, one port) with bearer auth, read-only | forbidden |
 | `ankaad` | CLI and server: `replay`, `serve`, `query` | forbidden |
 
 ## Design rules

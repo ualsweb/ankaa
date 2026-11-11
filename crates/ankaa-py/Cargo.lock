@@ -72,9 +72,11 @@ dependencies = [
  "ankaa-wal",
  "arrow",
  "arrow-flight",
+ "base64 0.23.1",
  "datafusion",
  "futures",
  "parking_lot",
+ "prost",
  "rustls",
  "tokio",
  "tokio-stream",
@@ -87,7 +89,8 @@ name = "ankaa-ingest"
 version = "0.1.0"
 dependencies = [
  "ankaa-store",
- "serde_json",
+ "foldhash 0.2.0",
+ "memchr",
  "thiserror",
 ]
 
@@ -291,15 +294,21 @@ version = "59.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "43f998a8cc9ffdc37731b66c0414dccf4f4f11a03d9136d383ef10f95181cd7d"
 dependencies = [
+ "arrow-arith",
  "arrow-array",
  "arrow-buffer",
  "arrow-cast",
  "arrow-data",
  "arrow-ipc",
+ "arrow-ord",
+ "arrow-row",
  "arrow-schema",
+ "arrow-select",
+ "arrow-string",
  "base64 0.23.1",
  "bytes",
  "futures",
+ "once_cell",
  "prost",
  "prost-types",
  "tonic",
