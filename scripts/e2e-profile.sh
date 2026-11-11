@@ -2,7 +2,7 @@
 # End-to-end ingest profile on Linux (the Axion bench VM): broker → ankaad (WAL + segments) → rows.
 #
 #   scripts/e2e-profile.sh <scenario> [--transport mqtt|file] [--format json|json-array]
-#                          [--batch B] [--messages N] [--devices D] [--tls]
+#                          [--batch B] [--messages N] [--devices D] [--tls] [--publishers P]
 #
 # Needs: target/release/ankaad, bench/target/release/loadgen, mosquitto (for mqtt), perf.
 # Writes target/e2e/<scenario>/: summary.txt, perf-stat.txt, perf-report.txt, ankaad.log.
@@ -12,7 +12,7 @@
 set -euo pipefail
 export LC_ALL=C
 scenario="${1:?scenario name}"; shift
-transport=mqtt; format=json; batch=10; messages=1000000; devices=1000; tls=0
+transport=mqtt; format=json; batch=10; messages=1000000; devices=1000; tls=0; publishers=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --transport) transport="$2"; shift 2;;
@@ -21,6 +21,7 @@ while [ $# -gt 0 ]; do
     --messages) messages="$2"; shift 2;;
     --devices) devices="$2"; shift 2;;
     --tls) tls=1; shift;;
+    --publishers) publishers="$2"; shift 2;;
     *) echo "unknown argument $1" >&2; exit 2;;
   esac
 done
@@ -134,7 +135,7 @@ sudo perf stat -e cycles,instructions,cache-references,cache-misses,branch-instr
 sudo perf record -F 499 -g -p "$apid" -o "$work/perf.data" > /dev/null 2>&1 &
 t_start=$(date +%s.%N)
 if [ "$transport" = mqtt ]; then
-  "$loadgen" --messages "$messages" --devices "$devices" --format "$format" --batch "$batch" --mqtt "$broker_url" --qos 1 2> "$out/loadgen.log" &
+  "$loadgen" --messages "$messages" --devices "$devices" --format "$format" --batch "$batch" --mqtt "$broker_url" --qos 1 --connections "$publishers" 2> "$out/loadgen.log" &
   lpid=$!
 fi
 first=""
@@ -162,7 +163,7 @@ sudo perf report -i "$work/perf.data" --no-children --stdio -g none --sort comm 
 wall=$(echo "$t_end - ${first:-$t_start}" | bc -l)
 cpu_s=$(echo "($c1 - $c0) / $hz" | bc -l)
 {
-  echo "scenario:        $scenario ($transport, $format, batch $batch, $devices devices, tls $tls)"
+  echo "scenario:        $scenario ($transport, $format, batch $batch, $devices devices, tls $tls, publishers $publishers)"
   echo "host:            $(uname -m) $(lscpu 2>/dev/null | awk -F: '/Model name/ {gsub(/^ +/,"",$2); print $2; exit}') $(nproc) vCPU"
   echo "commit:          $(cat "$root/.source-commit" 2>/dev/null | cut -c1-12 || git -C "$root" rev-parse --short HEAD)"
   echo "rows stored:     $rows of $expected (rejected ${rejected:-0})"
@@ -170,6 +171,7 @@ cpu_s=$(echo "($c1 - $c0) / $hz" | bc -l)
   printf "rows per second: %.0f\n" "$(echo "$rows / $wall" | bc -l)"
   printf "ankaad CPU:      %.3f s = %.0f ns per row\n" "$cpu_s" "$(echo "$cpu_s * 1000000000 / $rows" | bc -l)"
   echo "peak RSS:        $((hwm_kb / 1024)) MiB"
+  [ -f "$out/loadgen.log" ] && tail -1 "$out/loadgen.log"
 } | tee "$out/summary.txt"
 echo "--- perf stat"; grep -E 'cycles|instructions|misses|references' "$out/perf-stat.txt" | head -10
 echo "--- CPU by thread"; cat "$out/perf-threads.txt"

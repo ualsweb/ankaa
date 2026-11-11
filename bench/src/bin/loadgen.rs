@@ -32,12 +32,16 @@ struct Args {
     file: Option<String>,
     qos: QoS,
     prefix: String,
+    /// MQTT connections publishing in parallel (one client publishes about 30 k messages/s:
+    /// rumqttc writes every request on its own).
+    connections: u64,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: loadgen --messages N [--devices D] [--format json|json-array] [--batch B]\n\
-         \x20              (--mqtt mqtt://host:port | --file path) [--qos 0|1] [--prefix bench]"
+         \x20              (--mqtt mqtt://host:port | --file path) [--qos 0|1] [--prefix bench]\n\
+         \x20              [--connections C]   (C must divide D: a device stays on one connection)"
     );
     std::process::exit(2)
 }
@@ -52,6 +56,7 @@ fn parse_args() -> Args {
         file: None,
         qos: QoS::AtLeastOnce,
         prefix: "bench".into(),
+        connections: 1,
     };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
@@ -77,10 +82,17 @@ fn parse_args() -> Args {
                 }
             }
             "--prefix" => a.prefix = v(),
+            "--connections" => a.connections = v().parse().unwrap_or_else(|_| usage()),
             _ => usage(),
         }
     }
-    if a.messages == 0 || a.devices == 0 || a.batch == 0 || a.mqtt.is_some() == a.file.is_some() {
+    if a.messages == 0
+        || a.devices == 0
+        || a.batch == 0
+        || a.mqtt.is_some() == a.file.is_some()
+        || a.connections == 0
+        || !a.devices.is_multiple_of(a.connections)
+    {
         usage();
     }
     a
@@ -113,7 +125,7 @@ fn reading(out: &mut Vec<u8>, rng: &mut Rng, ts_ms: u64, with_device: bool, d: u
     write!(
         out,
         "\"t\":{ts_ms},\"temp\":{temp:.2},\"kw\":{kw:.3},\"ok\":{}}}",
-        u8::from(rng.next() % 50 != 0)
+        u8::from(!rng.next().is_multiple_of(50))
     )
     .unwrap();
 }
@@ -168,20 +180,21 @@ fn to_file(a: &Args, path: &str) {
     );
 }
 
-async fn to_mqtt(a: &Args, url: &str) {
-    let rest = url.strip_prefix("mqtt://").expect("mqtt:// URL");
-    let (host, port) = rest.rsplit_once(':').map_or((rest, 1883), |(h, p)| (h, p.parse().unwrap()));
-    let mut o = MqttOptions::new(format!("loadgen-{}", std::process::id()), host, port);
+/// Publish messages `m ≡ c (mod connections)` on connection `c`; returns how many were
+/// acknowledged (QoS 1) or sent (QoS 0). A device's messages all go through one connection, so
+/// they arrive in order.
+async fn publish(a: std::sync::Arc<Args>, host: String, port: u16, c: u64) -> u64 {
+    let mut o = MqttOptions::new(format!("loadgen-{}-{c}", std::process::id()), host, port);
     o.set_keep_alive(Duration::from_secs(30));
     o.set_inflight(1000);
     o.set_max_packet_size(1 << 20, 1 << 20);
     let (client, mut events) = AsyncClient::new(o, 10_000);
-    let target = a.messages;
+    let target = (a.messages + a.connections - 1 - c) / a.connections;
     let qos = a.qos;
     // the event loop counts acknowledgements (QoS 1) or sent publishes (QoS 0)
     let done = tokio::spawn(async move {
         let mut acked = 0u64;
-        loop {
+        while acked < target {
             match events.poll().await {
                 Ok(Event::Incoming(Packet::PubAck(_))) if qos == QoS::AtLeastOnce => acked += 1,
                 Ok(Event::Outgoing(Outgoing::Publish(_))) if qos == QoS::AtMostOnce => acked += 1,
@@ -191,26 +204,44 @@ async fn to_mqtt(a: &Args, url: &str) {
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
             }
-            if acked >= target {
-                return acked;
-            }
         }
+        acked
     });
-    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ c.wrapping_mul(0x2545_F491_4F6C_DD1D));
     let mut payload = Vec::with_capacity(4096);
-    let t0 = Instant::now();
-    for m in 0..a.messages {
-        let topic = message(a, m, &mut rng, &mut payload);
-        client.publish(topic, qos, false, payload.clone()).await.unwrap();
+    for m in (c..a.messages).step_by(a.connections as usize) {
+        let topic = message(&a, m, &mut rng, &mut payload);
+        client
+            .publish(topic, qos, false, payload.clone())
+            .await
+            .unwrap();
     }
     let acked = done.await.unwrap();
+    let _ = client.disconnect().await;
+    acked
+}
+
+async fn to_mqtt(a: Args, url: &str) {
+    let rest = url.strip_prefix("mqtt://").expect("mqtt:// URL");
+    let (host, port) = rest
+        .rsplit_once(':')
+        .map_or((rest, 1883), |(h, p)| (h, p.parse().unwrap()));
+    let a = std::sync::Arc::new(a);
+    let t0 = Instant::now();
+    let tasks: Vec<_> = (0..a.connections)
+        .map(|c| tokio::spawn(publish(a.clone(), host.to_owned(), port, c)))
+        .collect();
+    let mut acked = 0;
+    for t in tasks {
+        acked += t.await.unwrap();
+    }
     let secs = t0.elapsed().as_secs_f64();
     eprintln!(
-        "loadgen: published {acked} messages ({} readings) in {secs:.2} s: {:.0} msg/s",
-        acked * readings_per_message(a),
+        "loadgen: published {acked} messages ({} readings) in {secs:.2} s over {} connection(s): {:.0} msg/s",
+        acked * readings_per_message(&a),
+        a.connections,
         acked as f64 / secs
     );
-    let _ = client.disconnect().await;
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -219,6 +250,6 @@ async fn main() {
     if let Some(path) = a.file.clone() {
         to_file(&a, &path);
     } else if let Some(url) = a.mqtt.clone() {
-        to_mqtt(&a, &url).await;
+        to_mqtt(a, &url).await;
     }
 }
