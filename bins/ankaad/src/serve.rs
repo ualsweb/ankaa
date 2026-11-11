@@ -400,7 +400,17 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             start_earliest: s.start == ankaa_core::config::SourceStart::Earliest,
             resume: None, // filled in after recovery
             client_id: Some(format!("ankaa-{}", s.name)),
+            tls: ankaa_feeds::sources::TlsFiles {
+                ca: s.tls_ca.clone(),
+                cert: s.tls_cert.clone(),
+                key: s.tls_key.clone(),
+            },
         };
+        // a bad certificate file stops the start, with the reason, rather than the source later
+        if s.kind == SourceKind::Mqtt && s.url.starts_with("mqtts://") {
+            ankaa_feeds::sources::mqtt::tls_config(&opts.tls)
+                .map_err(|e| anyhow::anyhow!("source {}: TLS: {e}", s.name))?;
+        }
         source_transports.push((id, s.name.clone(), transport, opts));
     }
     // validate the continuous queries now (fail fast); they are attached after recovery

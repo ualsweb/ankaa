@@ -44,6 +44,18 @@ persistence false
 max_queued_messages 0
 max_inflight_messages 0
 EOF
+  if [ "$tls" = 1 ]; then
+    # ankaad subscribes over TLS (the cost measured); the generator publishes on the plain port
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+      -subj "/CN=e2e CA" -keyout "$work/ca.key" -out "$work/ca.pem" 2>/dev/null
+    openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=e2e broker" \
+      -keyout "$work/server.key" -out "$work/server.csr" 2>/dev/null
+    printf 'subjectAltName=IP:127.0.0.1\n' > "$work/server.ext"
+    openssl x509 -req -in "$work/server.csr" -CA "$work/ca.pem" -CAkey "$work/ca.key" \
+      -CAcreateserial -days 1 -extfile "$work/server.ext" -out "$work/server.pem" 2>/dev/null
+    printf 'listener 18884 127.0.0.1\ncafile %s\ncertfile %s\nkeyfile %s\n' \
+      "$work/ca.pem" "$work/server.pem" "$work/server.key" >> "$work/mosquitto.conf"
+  fi
   mosquitto -c "$work/mosquitto.conf" > "$work/mosquitto.log" 2>&1 & mpid=$!
   sleep 0.5
 fi
@@ -58,6 +70,11 @@ if [ "$transport" = file ]; then
   "$loadgen" --messages "$messages" --devices "$devices" --format "$format" --batch "$batch" --file "$work/input.ndjson"
   source="kind = \"file\"
 url = \"$work/input.ndjson\""
+elif [ "$tls" = 1 ]; then
+  source="kind = \"mqtt\"
+url = \"mqtts://127.0.0.1:18884\"
+tls_ca = \"$work/ca.pem\"
+subject = \"bench/#\""
 else
   source="kind = \"mqtt\"
 url = \"$broker_url\"

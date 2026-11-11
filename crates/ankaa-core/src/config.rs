@@ -215,6 +215,15 @@ pub struct SourceConfig {
     /// Use the host receive time when the message has no timestamp field.
     #[serde(default)]
     pub ts_from_receive: bool,
+    /// `mqtts://` only: PEM file of the CA(s) to trust instead of the public roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_ca: Option<PathBuf>,
+    /// `mqtts://` only: PEM client certificate chain (with `tls_key`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_cert: Option<PathBuf>,
+    /// `mqtts://` only: PEM private key of `tls_cert`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_key: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for SourceConfig {
@@ -860,9 +869,11 @@ impl Config {
                         s.name
                     ));
                 }
-                SourceKind::Mqtt if !s.url.starts_with("mqtt://") => {
+                SourceKind::Mqtt
+                    if !s.url.starts_with("mqtt://") && !s.url.starts_with("mqtts://") =>
+                {
                     return inv(format!(
-                        "sources.{}: MQTT url must start with mqtt:// (put TLS in front with a local proxy for now)",
+                        "sources.{}: MQTT url must start with mqtt:// or mqtts:// (TLS)",
                         s.name
                     ));
                 }
@@ -870,6 +881,19 @@ impl Config {
                     return inv(format!("sources.{}: subject/topic is required", s.name));
                 }
                 _ => {}
+            }
+            let has_tls = s.tls_ca.is_some() || s.tls_cert.is_some() || s.tls_key.is_some();
+            if has_tls && !(s.kind == SourceKind::Mqtt && s.url.starts_with("mqtts://")) {
+                return inv(format!(
+                    "sources.{}: tls_ca / tls_cert / tls_key need an mqtts:// source",
+                    s.name
+                ));
+            }
+            if s.tls_cert.is_some() != s.tls_key.is_some() {
+                return inv(format!(
+                    "sources.{}: tls_cert and tls_key must be set together",
+                    s.name
+                ));
             }
             if s.kind != SourceKind::Mqtt && s.map.values().any(|v| v.trim().starts_with("$topic"))
             {
@@ -1339,8 +1363,47 @@ standby_of = "10.0.0.1:50051"
             map: std::collections::BTreeMap::new(),
             ts_unit: TimeUnit::Nanos,
             ts_from_receive: true,
+            tls_ca: None,
+            tls_cert: None,
+            tls_key: None,
         };
         assert!(!format!("{s:?}").contains("s3cret"));
+    }
+
+    #[test]
+    fn mqtt_tls_settings() {
+        let cfg = |url: &str, tls: &str| {
+            format!(
+                r#"
+[feed]
+enabled = false
+streams = []
+[[tables]]
+name = "t"
+columns = [{{ name = "ts", type = "timestamp_ns" }}, {{ name = "v", type = "float64" }}]
+[[sources]]
+name = "plant"
+kind = "mqtt"
+url = "{url}"
+subject = "a/#"
+format = "json"
+table = "t"
+map = {{ ts = "t", v = "v" }}
+{tls}
+"#
+            )
+        };
+        Config::from_toml(&cfg("mqtts://broker:8883", "")).unwrap();
+        Config::from_toml(&cfg("mqtts://broker", "tls_ca = \"/etc/ankaa/ca.pem\"")).unwrap();
+        Config::from_toml(&cfg(
+            "mqtts://broker",
+            "tls_cert = \"c.pem\"\ntls_key = \"k.pem\"",
+        ))
+        .unwrap();
+        let err = |url: &str, tls: &str| Config::from_toml(&cfg(url, tls)).unwrap_err().to_string();
+        assert!(err("mqtt://broker", "tls_ca = \"ca.pem\"").contains("need an mqtts://"));
+        assert!(err("mqtts://broker", "tls_cert = \"c.pem\"").contains("together"));
+        assert!(err("ssl://broker", "").contains("mqtts://"));
     }
 
     #[test]

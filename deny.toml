@@ -7,6 +7,15 @@ yanked = "deny"
 ignore = [
     { id = "RUSTSEC-2024-0436", reason = "paste is a proc-macro used at build time only (via vortex-fastlanes); no runtime exposure" },
     { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile is pulled by datafusion-postgres for PEM parsing of operator-supplied files; upstream replacement tracked" },
+    # rumqttc 0.25.1 links rustls-webpki 0.102.8 only for its error type (src/tls.rs:
+    # `WebPki(#[from] webpki::Error)`). ANKAA passes rumqttc a rustls 0.23 ClientConfig, so every
+    # certificate check runs in rustls-webpki 0.103.16 (patched); no 0.102 validation code runs.
+    # Remove when rumqttc moves to webpki 0.103.
+    { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102 via rumqttc: error type only, validation runs in 0.103.16" },
+    { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102 via rumqttc: error type only, validation runs in 0.103.16" },
+    { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102 via rumqttc: error type only, validation runs in 0.103.16" },
+    { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102 via rumqttc: error type only, validation runs in 0.103.16" },
+    { id = "RUSTSEC-2026-0382", reason = "rustls-webpki 0.102 via rumqttc: error type only, validation runs in 0.103.16" },
 ]
 
 [licenses]

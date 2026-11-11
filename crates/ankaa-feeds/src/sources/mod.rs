@@ -54,6 +54,19 @@ pub struct SourceOpts {
     pub resume: Option<String>,
     /// MQTT client id (the broker keeps the session under it); `ankaa-<source id>` when unset.
     pub client_id: Option<String>,
+    /// TLS files of an `mqtts://` source.
+    pub tls: TlsFiles,
+}
+
+/// TLS material of a source, as paths to PEM files (read when the source starts).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TlsFiles {
+    /// CA certificates to trust *instead of* the public (Mozilla) roots: a plant's private PKI.
+    pub ca: Option<std::path::PathBuf>,
+    /// Client certificate chain (brokers that authenticate clients by certificate).
+    pub cert: Option<std::path::PathBuf>,
+    /// Private key of the client certificate.
+    pub key: Option<std::path::PathBuf>,
 }
 
 impl Default for SourceOpts {
@@ -63,6 +76,7 @@ impl Default for SourceOpts {
             start_earliest: false,
             resume: None,
             client_id: None,
+            tls: TlsFiles::default(),
         }
     }
 }
@@ -192,7 +206,7 @@ pub enum Transport {
     },
     /// MQTT broker URL + topic filter.
     Mqtt {
-        /// `mqtt://[user:password@]host[:port]`.
+        /// `mqtt://[user:password@]host[:port]` or `mqtts://…` (TLS, port 8883 by default).
         url: String,
         /// Topic filter (`+` / `#` wildcards allowed).
         topic: String,

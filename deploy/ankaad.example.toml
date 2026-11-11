@@ -103,7 +103,7 @@ token_env = "ANKAA_TOKEN"
 # columns = [ { name = "ts", type = "timestamp_ns" }, { name = "rack", type = "dict" },
 #             { name = "temp", type = "fixed8" } ]
 #
-# [[sources]]                      # NATS / Kafka / file → that table
+# [[sources]]                      # MQTT / NATS / Kafka / file → that table
 # name = "racks"
 # kind = "nats"
 # url = "nats://127.0.0.1:4222"
@@ -114,6 +114,19 @@ token_env = "ANKAA_TOKEN"
 # map = { ts = "meta.time", rack = "meta.id", temp = "temp" }   # every column must be mapped
 # max_message_bytes = 1048576     # larger messages are dropped and counted
 # start = "latest"                # kafka: latest | earliest, when no position is saved yet
+#
+# [[sources]]                      # MQTT over TLS, with the line and machine taken from the topic
+# name = "plant1"
+# kind = "mqtt"
+# url = "mqtts://broker.plant1:8883"
+# tls_ca = "/etc/ankaa/plant-ca.pem"        # optional: trust only this CA (else the public roots)
+# tls_cert = "/etc/ankaa/client.pem"        # optional, with tls_key: client certificate
+# tls_key = "/etc/ankaa/client.key"
+# subject = "plant1/+/+/power"
+# format = "json"
+# table = "telemetry"
+# ts_unit = "millis"
+# map = { ts = "t", line = "$topic.1", machine = "$topic.2", temp = "temp" }
 #
 # [[continuous]]                   # incrementally maintained: cq_btc_1s and cq_btc_1s_live
 # name = "btc_1s"

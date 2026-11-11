@@ -203,9 +203,10 @@ and their files deleted; nothing has to be scheduled.
 ## 8. Point it at your plant
 
 1. Copy `examples/factory/ankaad.toml`.
-2. In `[[sources]]`, set `url` to your broker (`mqtt://user:password@host:1883`) and `subject` to your
-   topic filter. If the broker needs TLS, put a local TLS proxy in front for now; built-in MQTT TLS is
-   on the roadmap.
+2. In `[[sources]]`, set `url` to your broker and `subject` to your topic filter:
+   `mqtt://user:password@host:1883`, or `mqtts://host:8883` for TLS. With TLS, `tls_ca` makes ANKAA
+   trust only your own CA, and `tls_cert` + `tls_key` present a client certificate to brokers that
+   ask for one ([details](../generic-ingest.md)).
 3. Adjust the `$topic.N` positions to your hierarchy and the column list and JSON paths to your
    payload. A reading that does not match is counted in `ankaa_user_rejected_total` and logged at debug
    level, never fatal.

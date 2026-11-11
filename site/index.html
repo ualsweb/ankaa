@@ -238,7 +238,7 @@ map     = { ts = <span class="c-str">"t"</span>, line = <span class="c-str">"$to
     <h2>What ships in the binary.</h2>
     <p class="sub">Everything below is implemented and covered by tests in the repository today.</p>
     <div class="grid g3">
-      <div class="card"><h3>Ingest</h3><ul><li>MQTT with topic-segment mapping</li><li>Kafka (all partitions, saved offsets) and NATS</li><li>Binance JSON and SBE, REST depth snapshots</li><li>Databento DBN, Parquet, CSV, NDJSON replay</li></ul></div>
+      <div class="card"><h3>Ingest</h3><ul><li>MQTT over TLS (private CA, client certificates) with topic-segment mapping</li><li>Kafka (all partitions, saved offsets) and NATS</li><li>Binance JSON and SBE, REST depth snapshots</li><li>Databento DBN, Parquet, CSV, NDJSON replay</li></ul></div>
       <div class="card"><h3>Time semantics</h3><ul><li>Per-key watermarks and ordering</li><li>Bounded lateness: late rows inserted in time order</li><li>Event-time continuous queries, deterministic on rebuild</li><li>Nanosecond event and receive times kept apart</li></ul></div>
       <div class="card"><h3>Storage</h3><ul><li>64k-row columnar chunks, 1,024-row block statistics</li><li>Vortex warm and cold tiers (ALP, FastLanes, dictionary)</li><li>Nullable columns with validity bitmaps in every tier</li><li>Retention per table, measured in event time</li></ul></div>
       <div class="card"><h3>Durability</h3><ul><li>Write-ahead log with CRC32C and group commit</li><li>Exact crash recovery, checkpoints truncate the log</li><li>Segments restore without the WAL</li><li>Standby replication over Arrow Flight</li></ul></div>

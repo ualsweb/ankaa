@@ -1,6 +1,7 @@
 name: brokers
-# Generic sources against real NATS, Kafka (service containers) and MQTT (Mosquitto, started
-# with its no-auth listener config, which a service container cannot pass).
+# Generic sources against real NATS, Kafka (service containers) and MQTT: Mosquitto plain (its
+# no-auth listener config, which a service container cannot pass) and with TLS and mutual TLS
+# (scripts/mqtt-tls-broker.sh, certificates from a throw-away CA).
 on:
   pull_request:
     paths:
@@ -42,8 +43,10 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
       - name: Start Mosquitto
         run: docker run -d --name mqtt -p 1883:1883 eclipse-mosquitto:2 mosquitto -c /mosquitto-no-auth.conf
+      - name: Start Mosquitto with TLS (throw-away CA)
+        run: scripts/mqtt-tls-broker.sh "$RUNNER_TEMP/mqtt-tls"
       - name: Wait for Kafka and Mosquitto
         run: |
           for i in $(seq 1 60); do (echo > /dev/tcp/127.0.0.1/9092) 2>/dev/null && break; sleep 1; done
           for i in $(seq 1 30); do (echo > /dev/tcp/127.0.0.1/1883) 2>/dev/null && break; sleep 1; done
-      - run: ANKAA_BROKER_TESTS=1 cargo test -p ankaad --test brokers -- --nocapture
+      - run: ANKAA_BROKER_TESTS=1 ANKAA_MQTT_TLS_DIR="$RUNNER_TEMP/mqtt-tls" cargo test -p ankaad --test brokers -- --nocapture

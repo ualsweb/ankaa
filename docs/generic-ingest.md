@@ -115,7 +115,7 @@ accepted).
 |---|---|---|
 | `file` | Every non-empty line is a message (NDJSON or CSV), read as a stream. The task idles after the file so the data stays queryable. | **At least once.** The read position is saved; a restart continues after the last durable line, and lines appended while the server was down are ingested on the next start. A file replaced by a different one is read from the beginning. |
 | `kafka` | Verified with Apache Kafka 3.9 (KRaft). All partitions of the topic are read concurrently, without a consumer group: the server keeps the next offset of every partition itself. Records of different partitions are merged by their Kafka timestamp before they are delivered, so a multi-partition topic arrives in time order (see below). Partitions added to the topic are picked up within 30 s and read from their beginning. Backpressure waits (nothing is dropped). | **At least once.** A restart resumes from the saved offsets, so messages published while the server was down are ingested. If the broker no longer retains a saved offset the source continues from the earliest retained one and `ankaa_kafka_offset_resets_total` increases. |
-| `mqtt` | MQTT 3.1.1, QoS 1, persistent session (client id `ankaa-<source name>`, `clean_session = false`). A message is acknowledged once it is in the ingest channel; a full channel slows the broker down instead of dropping. `url` may carry `user:password@`; TLS is not built in yet (use a local TLS proxy). | **At least once across outages and restarts** for what the broker keeps for the session (its queue limits apply); a crash loses the messages acknowledged but not yet in the WAL group commit (milliseconds). |
+| `mqtt` | MQTT 3.1.1, QoS 1, persistent session (client id `ankaa-<source name>`, `clean_session = false`). A message is acknowledged once it is in the ingest channel; a full channel slows the broker down instead of dropping. `url` may carry `user:password@`; `mqtts://` connects with TLS (see below). | **At least once across outages and restarts** for what the broker keeps for the session (its queue limits apply); a crash loses the messages acknowledged but not yet in the WAL group commit (milliseconds). |
 | `nats` | Core NATS subscription; the client reconnects, reconnections are counted. | **At most once.** Core NATS has no replay: messages published while the server is down, or arriving while the ingest channel is full (`ankaa_source_dropped_full_total`), are lost. |
 
 **Order across Kafka partitions.** A table accepts rows in timestamp order per table partition,
@@ -137,9 +137,32 @@ the segments when there is no WAL) and only advance once the messages before the
 without `storage.wal_dir` and `storage.checkpoint_dir` nothing persists and every start begins
 from scratch.
 
+**MQTT over TLS.** `url = "mqtts://broker:8883"` (8883 when no port is given) connects with TLS
+1.3 or 1.2 (rustls with the aws-lc-rs provider: AES-GCM runs on the Arm AES and PMULL
+instructions). The broker certificate is checked against the public (Mozilla) roots, or, when
+`tls_ca` names a PEM file, against those CAs only: a plant's private PKI is then not also trusting
+every public CA. `tls_cert` and `tls_key` add a client certificate for brokers that authenticate
+clients that way (AWS IoT Core, mutual-TLS listeners):
+
+```toml
+[[sources]]
+name = "plant1"
+kind = "mqtt"
+url = "mqtts://broker.plant1:8883"
+tls_ca = "/etc/ankaa/plant-ca.pem"         # optional: trust only this CA
+tls_cert = "/etc/ankaa/ankaa-client.pem"   # optional, with tls_key: client certificate
+tls_key = "/etc/ankaa/ankaa-client.key"
+subject = "plant1/#"
+# … format, table, map as above
+```
+
+The files are read and checked when the server starts: a missing file, a file without a
+certificate, a key that does not match its certificate or a certificate without its key stops the
+start with the file named. `tls_*` on anything but an `mqtts://` source is a configuration error.
+
 Not supported yet: Kafka consumer groups (`group` is rejected), SASL and TLS options for Kafka,
-and NATS credentials files. A NATS URL may carry `user:password@`; it is never logged. Connect
-to brokers over a trusted network or a local TLS proxy until transport security lands.
+TLS for NATS, and NATS credentials files. A NATS or MQTT URL may carry `user:password@`; it is
+never logged. Connect to Kafka and NATS over a trusted network or a local TLS proxy.
 
 An MQTT example, one table per plant measurement with the line and machine taken from the topic:
 

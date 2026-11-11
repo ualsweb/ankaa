@@ -556,3 +556,163 @@ map = {{ ts = "t", line = "$topic.1", machine = "$topic.2", kw = "kw" }}
     count_until(&addr, "SELECT count(kw) FROM power", "630", wait);
     pump.abort();
 }
+
+/// MQTT over TLS against a real broker (`scripts/mqtt-tls-broker.sh`): a source that trusts the
+/// broker's private CA connects, one that also presents a client certificate connects to the
+/// mutual-TLS listener, and one that trusts only the public roots is refused and stores nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn mqtt_tls_sources_verify_the_broker_and_present_a_client_certificate() {
+    let Ok(certs) = std::env::var("ANKAA_MQTT_TLS_DIR") else {
+        eprintln!("skipped: run scripts/mqtt-tls-broker.sh <dir> and set ANKAA_MQTT_TLS_DIR=<dir>");
+        return;
+    };
+    let certs = std::path::PathBuf::from(certs);
+    let run = std::process::id();
+    let dir = tempfile::tempdir().unwrap();
+    let (flight, metrics) = (free_port(), free_port());
+    let p = |f: &str| certs.join(f).display().to_string();
+    let config = format!(
+        r#"
+[feed]
+enabled = false
+streams = []
+[server]
+flight_addr = "127.0.0.1:{flight}"
+metrics_addr = "127.0.0.1:{metrics}"
+
+[[tables]]
+name = "readings"
+partition_by = "dev"
+columns = [
+  {{ name = "ts", type = "timestamp_ns" }},
+  {{ name = "dev", type = "dict" }},
+  {{ name = "v", type = "float64" }},
+]
+
+[[sources]]
+name = "tls-{run}"
+kind = "mqtt"
+url = "mqtts://127.0.0.1:18883"
+subject = "tls-{run}/#"
+tls_ca = "{ca}"
+format = "json"
+table = "readings"
+ts_unit = "millis"
+map = {{ ts = "t", dev = "$topic.1", v = "v" }}
+
+[[sources]]
+name = "mtls-{run}"
+kind = "mqtt"
+url = "mqtts://127.0.0.1:18884"
+subject = "mtls-{run}/#"
+tls_ca = "{ca}"
+tls_cert = "{cert}"
+tls_key = "{key}"
+format = "json"
+table = "readings"
+ts_unit = "millis"
+map = {{ ts = "t", dev = "$topic.1", v = "v" }}
+
+[[sources]]
+name = "public-roots-{run}"
+kind = "mqtt"
+url = "mqtts://127.0.0.1:18883"
+subject = "nothing-{run}/#"
+format = "json"
+table = "readings"
+ts_unit = "millis"
+map = {{ ts = "t", dev = "$topic.1", v = "v" }}
+"#,
+        ca = p("ca.pem"),
+        cert = p("client.pem"),
+        key = p("client.key"),
+    );
+    let cfg_path = dir.path().join("tls.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let log = dir.path().join("tls.log");
+    let _server = Server(
+        Command::new(bin())
+            .args(["serve", "--config"])
+            .arg(&cfg_path)
+            .args(["--duration-secs", "60"])
+            .env("ANKAA_TOKEN", "t0k3n")
+            .env("RUST_LOG", "info")
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    // the log is coloured: drop the escape sequences before reading it
+    let plain = |path: &std::path::Path| {
+        let raw = std::fs::read_to_string(path).unwrap_or_default();
+        let mut out = String::with_capacity(raw.len());
+        let mut chars = raw.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for d in chars.by_ref() {
+                    if d == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    };
+    // both verified sources connect (the log line carries tls=true)
+    let t0 = Instant::now();
+    loop {
+        let text = plain(&log);
+        if text.matches("mqtt connected").count() >= 2 {
+            assert!(text.contains("tls=true"), "{text}");
+            break;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "TLS sources did not connect:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let mut opts = rumqttc::MqttOptions::new(format!("tls-pub-{run}"), "127.0.0.1", 11883);
+    opts.set_keep_alive(Duration::from_secs(10));
+    let (client, mut events) = rumqttc::AsyncClient::new(opts, 1_000);
+    let pump = tokio::spawn(async move { while events.poll().await.is_ok() {} });
+    let base_ms: i64 = 1_762_700_000_000;
+    for i in 0..100i64 {
+        for prefix in ["tls", "mtls", "nothing"] {
+            let msg = format!(r#"{{"t":{},"v":{i}.5}}"#, base_ms + i);
+            client
+                .publish(
+                    format!("{prefix}-{run}/dev-{prefix}"),
+                    rumqttc::QoS::AtLeastOnce,
+                    false,
+                    msg,
+                )
+                .await
+                .unwrap();
+        }
+    }
+    let addr = format!("127.0.0.1:{flight}");
+    count_until(
+        &addr,
+        "SELECT count(*) FROM readings",
+        "200",
+        Duration::from_secs(20),
+    );
+    // the source that trusts only the public roots never got in: nothing of it is stored
+    let text = plain(&log);
+    assert_eq!(text.matches("mqtt connected").count(), 2, "{text}");
+    assert!(
+        text.contains("mqtt connection lost"),
+        "the untrusted connection must fail:\n{text}"
+    );
+    let devices = first_cell(&query(
+        &addr,
+        "SELECT count(*) FROM dictionaries WHERE \"table\" = 'readings'",
+    ));
+    assert_eq!(devices, "2");
+    pump.abort();
+}

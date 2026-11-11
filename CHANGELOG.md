@@ -18,6 +18,10 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   - **Many devices.** The schema is shared rather than copied per partition and chunk; a scale test with 100,000
     devices in one table is in `crates/ankaa-store/tests/scale.rs`.
 - Project website under `site/`, published by GitHub Pages (`.github/workflows/pages.yml`).
+- MQTT over TLS: `mqtts://` sources with TLS 1.3/1.2 (rustls, aws-lc-rs), the broker checked against the
+  public roots or only a private CA (`tls_ca`), and client certificates (`tls_cert`, `tls_key`); files
+  checked at start. Tested against Mosquitto with TLS and mutual TLS in CI
+  (`scripts/mqtt-tls-broker.sh`).
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on
   `ghcr.io` built from the release binaries), release binaries for Linux arm64/x86-64 and macOS arm64
   (`.github/workflows/release.yml`), and `examples/factory/`: one `docker compose up` for an MQTT plant,
