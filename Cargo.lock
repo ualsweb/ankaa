@@ -199,6 +199,7 @@ dependencies = [
  "datafusion",
  "futures",
  "parking_lot",
+ "proptest",
  "tempfile",
  "tokio",
 ]

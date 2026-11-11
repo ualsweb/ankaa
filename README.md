@@ -39,6 +39,7 @@ SELECT * FROM ohlcv('trades', 1000000000);                          -- 1 s bars
 -- any feed, declared in the config and fed from MQTT / Kafka / NATS
 SELECT * FROM cq_power_1m_live;                                     -- live 1-minute bars, maintained as data arrives
 SELECT * FROM percentiles('power', 'kw', '0.5,0.99', 'machine');    -- streaming quantiles per machine
+SELECT * FROM gapfill('power', 'kw', 60000000000, 'machine', 'avg', 'linear'); -- one value a minute, gaps interpolated
 SELECT count(*) FROM power WHERE kw IS NULL;                        -- readings that came without a value
 ```
 

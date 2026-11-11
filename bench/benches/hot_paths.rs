@@ -221,6 +221,38 @@ fn store(c: &mut Criterion) {
 }
 
 fn operators(c: &mut Criterion) {
+    // gap filling: 1,000 keys × 1,000 readings in long runs (stored order), one reading per
+    // second with every tenth second missing, into 1 s buckets filled linearly
+    {
+        use ankaa_ts::gapfill::{Agg, Fill, Filled, Series, bucket_of};
+        let keys = 1000u32;
+        let per_key = 1000i64;
+        let rows: Vec<(u32, i64, f64)> = (0..keys)
+            .flat_map(|k| {
+                (0..per_key)
+                    .filter(|i| i % 10 != 3)
+                    .map(move |i| (k, i * 1_000_000_000 + 17, f64::from(k) + i as f64 * 0.5))
+            })
+            .collect();
+        let mut g = c.benchmark_group("gapfill");
+        g.throughput(Throughput::Elements(rows.len() as u64));
+        g.bench_function("linear_1000_keys_x_1000", |b| {
+            let width = 1_000_000_000;
+            b.iter(|| {
+                let mut series: Vec<Series> = (0..keys).map(|_| Series::default()).collect();
+                for &(k, ts, v) in black_box(&rows) {
+                    series[k as usize].push(bucket_of(ts, width), ts, v);
+                }
+                let mut out = Filled::default();
+                for s in &mut series {
+                    let (lo, hi) = s.span().unwrap();
+                    out.extend(s, lo, hi, width, Agg::Avg, Fill::Linear);
+                }
+                out.len()
+            });
+        });
+        g.finish();
+    }
     let n = 100_000usize;
     let lt: Vec<i64> = (0..n).map(|i| i as i64 * 20 + 5).collect();
     let rt: Vec<i64> = (0..2 * n).map(|i| i as i64 * 10).collect();

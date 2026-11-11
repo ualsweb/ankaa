@@ -121,6 +121,7 @@
               <tr><td><code>ohlcv(table, width_ns [, key])</code></td><td class="wrap-ok">Open, high, low, close, volume, notional and count per bucket</td></tr>
               <tr><td><code>rolling(table, window_ns, step_ns [, key])</code></td><td class="wrap-ok">Bars over a trailing window at every step</td></tr>
               <tr><td><code>percentiles(table, column, 'q1,q2' [, key])</code></td><td class="wrap-ok">Streaming quantiles, 1 % relative error</td></tr>
+              <tr><td><code>gapfill(table, column, width_ns [, key [, agg [, method [, start_ns, end_ns]]]])</code></td><td class="wrap-ok">One value per bucket and key, empty buckets filled: <code>null</code>, <code>locf</code> or <code>linear</code></td></tr>
               <tr><td><code>vwap(price, size)</code></td><td class="wrap-ok">Volume-weighted average price, exact integer sums</td></tr>
             </tbody>
           </table>

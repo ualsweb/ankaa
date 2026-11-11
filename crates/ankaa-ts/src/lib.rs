@@ -8,6 +8,7 @@
 pub mod asof;
 pub mod book;
 pub mod bucket;
+pub mod gapfill;
 pub mod incremental;
 pub mod sketch;
 pub mod sliding;
@@ -16,6 +17,7 @@ pub mod sync;
 pub use asof::{AsofDirection, asof_join, asof_join_keyed};
 pub use book::{BookSide, L2Book, Level, TopOfBook};
 pub use bucket::{Ohlcv, time_buckets};
+pub use gapfill::{Agg, Fill, Filled, Series};
 pub use incremental::{
     IncrementalAsof, IncrementalOhlcv, IncrementalPercentiles, IncrementalRolling, QuantileRow,
 };

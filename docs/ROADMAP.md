@@ -69,7 +69,8 @@ Profiling passes are recorded under `docs/benchmarks/`. Pass 1 (2026-11-09): dec
 | Sparkplug B: one row per metric, BIRTH definitions (datatypes, aliases, transient flags) kept in the write-ahead log across restarts and truncation, opt-in rebirth requests; decoder checked against a reference protobuf codec and fuzzed; end to end against Mosquitto | done (2026-11-11) |
 | Ingest engine: batched hand-off to the write-ahead log, one table lock per message, interrupt moderation of the ingest loop and the log thread (profiled end to end on Google Axion) | done (2026-11-11) |
 | Adding nullable columns to a table (and making a column nullable) without losing its history: old segments read as the new schema, nothing rewritten | done (2026-11-11) |
-| Next for telemetry: gap filling and interpolation in SQL (`time_bucket_gapfill`-style), downsampled continuous-query outputs that outlive raw retention | planned |
+| Gap filling and interpolation in SQL: `gapfill()` with `null`, `locf` and `linear` fills, seven aggregates, optional range; verified against DataFusion's own grouping | done (2026-11-11) |
+| Next for telemetry: downsampled continuous-query outputs that outlive raw retention; a TSBS-shaped comparison with InfluxDB 3, TimescaleDB and QuestDB | planned |
 | Continuous queries: incremental OHLCV, quantiles, rolling windows, ASOF as `cq_*` tables (`docs/continuous-queries.md`) | done; event time with the table's lateness window; no retraction of closed results (rows later than that are counted) |
 | Replication: WAL shipping over Flight to a read-only standby, manual promotion (`docs/replication.md`) | done; asynchronous, no election, no split-brain protection |
 | Distributed queries across nodes | design note only: scale up on one Arm socket first |

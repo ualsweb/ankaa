@@ -27,6 +27,7 @@ ankaa-tier.workspace = true
 tempfile = "3"
 ankaa-feeds.workspace = true
 ankaa-ingest.workspace = true
+proptest.workspace = true
 
 [lints]
 workspace = true

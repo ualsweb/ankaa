@@ -328,6 +328,14 @@ checkpoints) exactly like the market tables and appear under their own name in `
 Equality and range predicates on a `dict` column prune whole chunks (`WHERE rack = 3`), and
 scans run one partition per group of chunks in parallel.
 
+Readings rarely arrive on a regular grid: `gapfill` returns one row per bucket and per key with
+the empty buckets filled (`null`, `locf` or `linear`), ready for a chart or a join on time
+([reference](temporal-architecture.md)):
+
+```sql
+SELECT * FROM gapfill('telemetry', 'temp', 60000000000, 'rack', 'avg', 'linear');
+```
+
 ## Changing a table
 
 A table may gain columns without losing what it holds:

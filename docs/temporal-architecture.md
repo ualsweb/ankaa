@@ -242,6 +242,29 @@ FROM asof_join('trades', 'quotes', 'symbol', 500000000) t          -- within 500
 JOIN symbols s ON s.symbol = t.symbol
 ```
 
+**`gapfill(table, column, width_ns [, key [, agg [, method [, start_ns, end_ns]]]])`**
+
+A regular series per `key`: one row per bucket of `width_ns` (aligned to the Unix epoch, as `date_bin` with its
+default origin), from the key's first to its last bucket that holds a reading, or over `[start_ns, end_ns)` for every
+key with a reading there. `agg` (`avg` by default; `min`, `max`, `sum`, `count`, `first`, `last`) combines a bucket's
+readings; a bucket without any is filled by `method`: `null` (default), `locf` (the previous bucket's value, carried
+forward) or `linear` (on the line between the previous and the next measured buckets; `NULL` where one of them does not
+exist). With `count` an empty bucket is 0. `NULL` readings are skipped. Columns: the key (when given), `bucket`,
+`value` (`Float64`; a `fixed8` column comes out as decimals) and `filled` (true for a bucket that held no reading).
+
+Cost is linear in rows plus buckets: rows of a key in stored order fold into their bucket with one compare (only a
+key whose rows arrive out of order has its buckets, not its rows, sorted), and the dense output is written in one pass
+per key; an interpolated value is computed from the two ends of its gap, so long gaps carry no rounding drift. With
+`start_ns`/`end_ns` only the chunks in that range are read. At most 10,000,000 output rows per call.
+
+```sql
+-- per machine, one value a minute over the last day, gaps interpolated
+SELECT d.name AS machine, bucket, value AS kw, filled
+FROM gapfill('power', 'kw', 60000000000, 'machine', 'avg', 'linear', 1762646400000000000, 1762732800000000000) g
+JOIN dictionaries d ON d."table" = 'power' AND d."column" = 'machine' AND d.id = g.machine
+ORDER BY machine, bucket;
+```
+
 **`rolling(table, window_ns, step_ns [, key])`**
 
 For every `key` (default `symbol`) and every step end `e` on the `step_ns` grid, the bar of the trailing window

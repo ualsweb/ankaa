@@ -5,6 +5,7 @@
 //! SELECT * FROM ohlcv('trades', 60000000000)                           -- bucket width in ns
 //! SELECT * FROM rolling('trades', 300000000000, 1000000000)            -- 5 min window, every second
 //! SELECT * FROM percentiles('trades', 'price', '0.5,0.99,0.999', 'symbol') -- UDDSketch, 1 % rel. error
+//! SELECT * FROM gapfill('power', 'kw', 60000000000, 'machine', 'avg', 'linear') -- every minute, gaps filled
 //! ```
 //! They read the named tables from the session (a consistent snapshot of what is registered),
 //! run the streaming operators from `ankaa-ts` on plain columns, and return the result as an
@@ -61,13 +62,14 @@ pub const PERCENTILE_ALPHA: f64 = 0.01;
 /// Bucket budget per sketch; past it the sketch collapses (error bound doubles, reported).
 pub const PERCENTILE_MAX_BUCKETS: usize = 2048;
 
-/// Register the table functions `asof_join`, `ohlcv`, `rolling` and `percentiles` and the
-/// aggregate `vwap` on a session.
+/// Register the table functions `asof_join`, `ohlcv`, `rolling`, `percentiles` and `gapfill`
+/// and the aggregate `vwap` on a session.
 pub fn register_functions(ctx: &SessionContext) {
     ctx.register_udtf("asof_join", Arc::new(AsofJoinFn { ctx: ctx.clone() }));
     ctx.register_udtf("ohlcv", Arc::new(OhlcvFn { ctx: ctx.clone() }));
     ctx.register_udtf("percentiles", Arc::new(PercentilesFn { ctx: ctx.clone() }));
     ctx.register_udtf("rolling", Arc::new(RollingFn { ctx: ctx.clone() }));
+    ctx.register_udtf("gapfill", Arc::new(GapfillFn { ctx: ctx.clone() }));
     ctx.register_udaf(datafusion::logical_expr::AggregateUDF::from(
         crate::vwap::Vwap::default(),
     ));
@@ -125,13 +127,13 @@ impl Input {
 /// vectors an operator builds, its working space, the result), and the reservation lives as
 /// long as the [`Input`].
 async fn collect_columns(ctx: &SessionContext, table: &str, columns: &[&str]) -> Result<Input> {
-    collect(ctx, table, columns, false).await
+    collect(ctx, table, columns, false, None).await
 }
 
 /// [`collect_columns`] without the rows where one of the columns is `NULL`: the input of an
 /// aggregate (bars, quantiles, windows), which, like SQL aggregates, skips missing values.
 async fn collect_values(ctx: &SessionContext, table: &str, columns: &[&str]) -> Result<Input> {
-    collect(ctx, table, columns, true).await
+    collect(ctx, table, columns, true, None).await
 }
 
 /// The rows of `batch` where no column is `NULL` (the batch itself when there is none).
@@ -160,8 +162,14 @@ async fn collect(
     table: &str,
     columns: &[&str],
     skip_nulls: bool,
+    filter: Option<Expr>,
 ) -> Result<Input> {
-    let df = ctx.table(table).await?.select_columns(columns)?;
+    let mut df = ctx.table(table).await?;
+    // a time range reaches the scan, which skips whole chunks outside it
+    if let Some(f) = filter {
+        df = df.filter(f)?;
+    }
+    let df = df.select_columns(columns)?;
     let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
     let task_ctx = Arc::new(df.task_ctx());
     let plan = df.create_physical_plan().await?;
@@ -1307,6 +1315,262 @@ impl TableFunctionImpl for PercentilesFn {
             compute,
         }))
     }
+}
+
+struct GapfillFn {
+    ctx: SessionContext,
+}
+
+impl std::fmt::Debug for GapfillFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GapfillFn")
+    }
+}
+
+/// Most rows one `gapfill` call may return (buckets × keys).
+pub const MAX_GAPFILL_ROWS: u64 = 10_000_000;
+
+/// `gapfill('table', 'value', width_ns [, 'key' [, 'agg' [, 'method' [, start_ns, end_ns]]]])`:
+/// one row per bucket of `width_ns` (aligned to the epoch, as `date_bin` with the default
+/// origin) and per key, from each key's first to its last bucket with a reading, or over
+/// `[start_ns, end_ns)` for every key that has a reading there. `agg` (default `avg`) is
+/// applied to a bucket's readings; a bucket without readings is filled by `method` (`null`,
+/// `locf`, `linear`; default `null`; with `count` it is 0). `NULL` readings are skipped.
+/// Columns: the key (when given), `bucket`, `value` (`Float64`; `fixed8` values as decimals),
+/// `filled` (true for a filled bucket).
+impl TableFunctionImpl for GapfillFn {
+    fn call(&self, args: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+        use ankaa_ts::gapfill::{Agg, Fill, bucket_count, bucket_of};
+        let table = arg_str(args, 0, "gapfill")?;
+        let column = arg_str(args, 1, "gapfill")?;
+        let width = arg_i64(args, 2)?
+            .ok_or_else(|| DataFusionError::Plan("gapfill: width_ns is required".into()))?;
+        if width <= 0 {
+            return plan_err!("gapfill: width_ns must be positive");
+        }
+        let opt_str = |i: usize| {
+            args.get(i)
+                .map(|_| arg_str(args, i, "gapfill"))
+                .transpose()
+                .map(|s| s.filter(|s| !s.is_empty()))
+        };
+        let key = opt_str(3)?;
+        let agg_name = opt_str(4)?.unwrap_or_else(|| "avg".into());
+        let agg = Agg::parse(&agg_name).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "gapfill: aggregate {agg_name:?} is not one of avg, min, max, sum, count, first, last"
+            ))
+        })?;
+        let method_name = opt_str(5)?.unwrap_or_else(|| "null".into());
+        let fill = Fill::parse(&method_name).ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "gapfill: method {method_name:?} is not one of null, locf, linear"
+            ))
+        })?;
+        let range = match (arg_i64(args, 6)?, arg_i64(args, 7)?) {
+            (None, None) => None,
+            (Some(a), Some(b)) if a < b => Some((a, b)),
+            _ => return plan_err!("gapfill: start_ns and end_ns come together, start before end"),
+        };
+        if let Some((a, b)) = range
+            && bucket_count(bucket_of(a, width), bucket_of(b - 1, width), width) > MAX_GAPFILL_ROWS
+        {
+            return plan_err!(
+                "gapfill: the range holds more than {MAX_GAPFILL_ROWS} buckets; use wider buckets"
+            );
+        }
+        let input = table_schema(&self.ctx, &table)?;
+        let value_field = input.field(input.index_of(&column)?);
+        if !value_field.data_type().is_numeric() {
+            return plan_err!("gapfill: column {column} is not numeric");
+        }
+        // fixed-point columns hold ticks: the output is the decimal value
+        let scale: i32 = value_field
+            .metadata()
+            .get("ankaa.scale")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        if let Some(k) = &key {
+            input.index_of(k)?;
+        }
+        let ts_col = input.field(0).name().clone();
+        if !matches!(input.field(0).data_type(), DataType::Timestamp(..)) {
+            return plan_err!("gapfill: the first column of {table} is not its timestamp");
+        }
+        let schema = gapfill_schema(key.as_deref());
+        let ctx = self.ctx.clone();
+        let out = schema.clone();
+        let compute: Compute = Arc::new(move |projection| {
+            let (ctx, out, table) = (ctx.clone(), out.clone(), table.clone());
+            let (column, key, ts_col) = (column.clone(), key.clone(), ts_col.clone());
+            async move {
+                let mut cols: Vec<&str> = vec![ts_col.as_str(), column.as_str()];
+                if let Some(k) = key.as_deref() {
+                    cols.push(k);
+                }
+                let filter = range.map(|r| time_range(&ts_col, r));
+                let input = collect(&ctx, &table, &cols, true, filter).await?;
+                let pool = ctx.runtime_env().memory_pool.clone();
+                blocking(move || {
+                    let spec = GapfillSpec {
+                        key: key.as_deref(),
+                        width,
+                        agg,
+                        fill,
+                        range,
+                        scale,
+                    };
+                    let mut held = MemoryConsumer::new("gapfill output").register(&pool);
+                    let batch = gapfill_compute(&out, &input, &spec, &mut held)?;
+                    Ok(vec![project(batch, projection.as_deref())?])
+                })
+                .await
+            }
+            .boxed()
+        });
+        Ok(Arc::new(LazyTable {
+            name: "gapfill",
+            schema,
+            compute,
+        }))
+    }
+}
+
+/// `ts_col >= start AND ts_col < end`, as the scan's time-range pushdown recognises it.
+fn time_range(ts_col: &str, (start, end): (i64, i64)) -> Expr {
+    let at = |ns| {
+        Expr::Literal(
+            ScalarValue::TimestampNanosecond(Some(ns), Some("UTC".into())),
+            None,
+        )
+    };
+    datafusion::prelude::col(ts_col)
+        .gt_eq(at(start))
+        .and(datafusion::prelude::col(ts_col).lt(at(end)))
+}
+
+fn gapfill_schema(key: Option<&str>) -> SchemaRef {
+    let mut fields = Vec::new();
+    if let Some(k) = key {
+        fields.push(Field::new(k, DataType::UInt32, false));
+    }
+    fields.push(Field::new(
+        "bucket",
+        DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        false,
+    ));
+    fields.push(Field::new("value", DataType::Float64, true));
+    fields.push(Field::new("filled", DataType::Boolean, false));
+    Arc::new(Schema::new(fields))
+}
+
+struct GapfillSpec<'a> {
+    key: Option<&'a str>,
+    width: i64,
+    agg: ankaa_ts::gapfill::Agg,
+    fill: ankaa_ts::gapfill::Fill,
+    range: Option<(i64, i64)>,
+    scale: i32,
+}
+
+/// Fold the readings into per-key series (rows of a key in stored order fold into the last
+/// bucket with one compare; a key's runs are handed over as slices), then write the dense,
+/// filled buckets of every key in key order.
+fn gapfill_compute(
+    schema: &SchemaRef,
+    input: &Input,
+    spec: &GapfillSpec<'_>,
+    held: &mut MemoryReservation,
+) -> Result<RecordBatch> {
+    use ankaa_ts::gapfill::{Agg, Filled, Series, bucket_count, bucket_of};
+    let width = spec.width;
+    let mut slot_of: HashMap<u32, usize> = HashMap::new();
+    let mut series: Vec<(u32, Series)> = Vec::new();
+    for batch in &input.batches {
+        let ts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<TimestampNanosecondArray>()
+            .ok_or_else(|| DataFusionError::Plan("gapfill: timestamp column".into()))?
+            .values();
+        let values = cast(batch.column(1), &DataType::Float64)?;
+        let values = values
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .ok_or_else(|| DataFusionError::Plan("gapfill: cast failed".into()))?
+            .values();
+        let keys = spec.key.map(|k| key_u32(batch, k)).transpose()?;
+        let mut a = 0;
+        while a < ts.len() {
+            let (k, b) = match &keys {
+                Some(ks) => (ks[a], run_end(ks, a)),
+                None => (0, ts.len()),
+            };
+            let slot = *slot_of.entry(k).or_insert_with(|| {
+                series.push((k, Series::default()));
+                series.len() - 1
+            });
+            let s = &mut series[slot].1;
+            for i in a..b {
+                s.push(bucket_of(ts[i], width), ts[i], values[i]);
+            }
+            a = b;
+        }
+    }
+    series.sort_unstable_by_key(|(k, _)| *k);
+    // the buckets of each key, and their total, before anything is written
+    let mut spans: Vec<(i64, i64)> = Vec::with_capacity(series.len());
+    let mut total: u64 = 0;
+    for (_, s) in &mut series {
+        let span = match spec.range {
+            Some((a, b)) => (bucket_of(a, width), bucket_of(b - 1, width)),
+            None => s.span().unwrap_or((0, -1)),
+        };
+        total = total.saturating_add(bucket_count(span.0, span.1, width));
+        spans.push(span);
+    }
+    if total > MAX_GAPFILL_ROWS {
+        return Err(DataFusionError::ResourcesExhausted(format!(
+            "gapfill: {total} buckets exceed {MAX_GAPFILL_ROWS}; use wider buckets or start_ns/end_ns"
+        )));
+    }
+    let rows = usize::try_from(total).unwrap_or(usize::MAX);
+    // bucket, value, key: 8 + 8 + 4 bytes; validity and filled flags: 2
+    held.try_grow(rows.saturating_mul(22))?;
+    let mut filled = Filled {
+        bucket: Vec::with_capacity(rows),
+        value: Vec::with_capacity(rows),
+        valid: Vec::with_capacity(rows),
+        filled: Vec::with_capacity(rows),
+    };
+    let mut keys: Vec<u32> = Vec::with_capacity(if spec.key.is_some() { rows } else { 0 });
+    for ((k, s), (lo, hi)) in series.iter_mut().zip(&spans) {
+        let n = filled.extend(s, *lo, *hi, width, spec.agg, spec.fill);
+        if spec.key.is_some() {
+            keys.extend(std::iter::repeat_n(*k, n));
+        }
+    }
+    // ticks to decimals: one division per value, after aggregation and interpolation (both
+    // commute with it); counts stay counts
+    if spec.scale > 0 && spec.agg != Agg::Count {
+        let div = 10f64.powi(spec.scale);
+        for v in &mut filled.value {
+            *v /= div;
+        }
+    }
+    let mut columns: Vec<ArrayRef> = Vec::with_capacity(4);
+    if spec.key.is_some() {
+        columns.push(Arc::new(UInt32Array::from(keys)));
+    }
+    columns.push(Arc::new(
+        TimestampNanosecondArray::from(filled.bucket).with_timezone("UTC"),
+    ));
+    columns.push(Arc::new(Float64Array::new(
+        filled.value.into(),
+        Some(arrow::buffer::NullBuffer::from(filled.valid)),
+    )));
+    columns.push(Arc::new(arrow::array::BooleanArray::from(filled.filled)));
+    Ok(RecordBatch::try_new(schema.clone(), columns)?)
 }
 
 fn percentiles_schema(key: Option<&str>, qs: &[f64]) -> SchemaRef {
