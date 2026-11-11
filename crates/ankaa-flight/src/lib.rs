@@ -535,7 +535,7 @@ impl AnkaaFlight {
 
     async fn plan_schema(&self, sql: &str) -> Result<SchemaRef, Status> {
         let df = self.plan(sql).await?;
-        Ok(Arc::new(df.schema().as_arrow().clone()))
+        Ok(wire_schema(df.schema().as_arrow()))
     }
 
     /// Execute `sql` and stream the result: a query slot for the whole life of the query, the
@@ -649,6 +649,40 @@ fn wal_status(e: &ankaa_wal::WalError) -> Status {
             Status::data_loss("the WAL could not be read (details are in the server log)")
         }
     }
+}
+
+/// The schema a client receives for `schema`: a dictionary-encoded column (a `dict` column shown
+/// as names, RFC-0002) travels as its value type.
+///
+/// The Flight encoder expands dictionaries while it writes a batch (`DictionaryHandling::Hydrate`,
+/// its default), so that every client reads the column, including the ones without support for
+/// dictionary batches or for a dictionary replaced in the middle of a stream. `GetFlightInfo`,
+/// `GetSchema`, `ListFlights` and the Flight SQL catalog calls must announce that same schema:
+/// drivers that allocate their result columns from the announced schema (JDBC, ADBC) would
+/// otherwise meet a stream that disagrees with it.
+pub(crate) fn wire_schema(schema: &arrow::datatypes::Schema) -> SchemaRef {
+    use arrow::datatypes::{DataType, Field};
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| matches!(f.data_type(), DataType::Dictionary(..)))
+    {
+        return Arc::new(schema.clone());
+    }
+    let fields: Vec<Arc<Field>> = schema
+        .fields()
+        .iter()
+        .map(|f| match f.data_type() {
+            DataType::Dictionary(_, value) => {
+                Arc::new(f.as_ref().clone().with_data_type(value.as_ref().clone()))
+            }
+            _ => f.clone(),
+        })
+        .collect();
+    Arc::new(arrow::datatypes::Schema::new_with_metadata(
+        fields,
+        schema.metadata().clone(),
+    ))
 }
 
 /// Run `stream` in its own task and return the Flight response stream that drains it.
@@ -828,7 +862,7 @@ impl FlightService for AnkaaFlight {
             if let Ok(Some(t)) = schema.table(&name).await {
                 let sql = format!("SELECT * FROM {name}");
                 let info = FlightInfo::new()
-                    .try_with_schema(t.schema().as_ref())
+                    .try_with_schema(wire_schema(t.schema().as_ref()).as_ref())
                     .map_err(|e| Status::internal(e.to_string()))?
                     .with_descriptor(FlightDescriptor::new_path(vec![name.clone()]))
                     .with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(sql)));

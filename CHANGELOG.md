@@ -67,8 +67,8 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   A segment finished for a chunk that retention dropped meanwhile is deleted, never attached.
 - **Breaking: `dict` columns (and `symbol`) are text in SQL** (RFC-0002,
   `docs/rfc/0002-dictionary-columns-as-names.md`). `WHERE machine = 'press03'`, `GROUP BY line` and results
-  with names, without joining `dictionaries` or `symbols`: the column's Arrow type is `Dictionary(UInt32, Utf8)`
-  (`text` for Postgres clients). The engine still works on the ids: `=`, `<>`, `IN`, `NOT IN` against string
+  with names, without joining `dictionaries` or `symbols`. Clients receive ordinary strings (`Utf8` over Flight
+  and Flight SQL, `text` over the Postgres protocol); inside the engine the column is `Dictionary(UInt32, Utf8)`. The engine still works on the ids: `=`, `<>`, `IN`, `NOT IN` against string
   literals are translated to ids and decided per chunk from its id range, grouping hashes ids, and every batch
   references one shared array of names per dictionary. Table functions and continuous-query tables return
   their key as names. A query that joined `dictionaries`/`symbols` on the id now stops with a cast

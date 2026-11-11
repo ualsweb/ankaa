@@ -321,16 +321,19 @@ GROUP BY rack;
 
 ### Dictionary columns in SQL
 
-A `dict` column is text in SQL: Arrow type `Dictionary(UInt32, Utf8)`, `text` for Postgres clients, a
-categorical in pandas and polars. You filter, group, sort and read it by name; rows keep storing the
-dense id, and the engine works on the ids:
+A `dict` column is text in SQL. You filter, group, sort and read it by name; rows keep storing the
+dense id, and the engine works on the ids (inside the engine the column is Arrow
+`Dictionary(UInt32, Utf8)`). Clients receive ordinary strings: `Utf8` over Arrow Flight and Flight
+SQL, `text` over the Postgres protocol, so every driver and tool reads it.
+
 
 - `=`, `<>`, `IN`, `NOT IN` and `OR` of those against string literals are translated to ids once per
   query and decided per chunk from its id range: a chunk without the value is skipped, a chunk that
   holds nothing else is taken whole, the others are filtered row by row on the ids. A name that was
   never seen matches nothing without reading a row.
-- `GROUP BY` and joins on the column hash the ids; the names of a result are one shared array per
-  dictionary, referenced by every batch (no string is copied per row).
+- `GROUP BY` and joins on the column hash the ids; inside the engine the names of a result are one
+  shared array per dictionary, referenced by every batch. A string is written per row only for the
+  rows that leave the server.
 - Everything else SQL does with strings (`LIKE`, `<`, `upper()`, `ORDER BY`, comparison with another
   column) works on the names, row by row.
 - Table functions keyed by a `dict` column (`gapfill`, `ohlcv`, `rolling`, `percentiles`, `asof_join`)

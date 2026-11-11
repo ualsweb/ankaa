@@ -285,7 +285,7 @@ impl AnkaaFlight {
         if !parameters.is_empty() {
             return Err(no_parameters());
         }
-        Ok(Arc::new(df.schema().as_arrow().clone()))
+        Ok(crate::wire_schema(df.schema().as_arrow()))
     }
 
     /// `DoGet` for a Flight SQL ticket.
@@ -394,7 +394,7 @@ impl AnkaaFlight {
                                 &schema_name,
                                 &table_name,
                                 table_type_name(table.table_type()),
-                                table.schema().as_ref(),
+                                crate::wire_schema(table.schema().as_ref()).as_ref(),
                             )
                             .map_err(|e| internal(&e))?;
                         }

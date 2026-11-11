@@ -50,8 +50,13 @@ keys of a dictionary column and group on them as before; their output key is a d
 between tables that do not share a dictionary stays refused. Continuous-query tables carry the names of their
 input's key column.
 
-**Clients.** Arrow Flight and Flight SQL deliver the dictionary type (pandas and polars read a categorical);
-the Postgres listener reports `text`.
+**Clients receive strings.** The Flight encoder expands a dictionary column into its value type while it writes
+a batch (arrow-flight's default, `DictionaryHandling::Hydrate`), and the Postgres listener reports `text`. Every
+schema the Flight service announces (`GetFlightInfo`, `GetSchema`, `ListFlights`, Flight SQL `GetTables`) is
+mapped the same way (`ankaa_flight::wire_schema`), so drivers that allocate result columns from the announced
+schema (JDBC, ADBC) meet the stream they were told about. Sending dictionaries was considered: it saves bytes
+on wide results, but the names array would travel again with every batch, and not every Flight SQL driver reads
+dictionary batches or a dictionary replaced mid-stream.
 
 **`server.dict_columns`** = `"names"` (default) or `"ids"` (also `ankaad serve --dict-ids`): `"ids"` keeps the
 previous surface exactly. It is a view setting, free to change at any restart. In `"names"` mode an old
@@ -64,8 +69,9 @@ numbers: there the old join runs and compares ids with those numbers, which the 
 - Building a dictionary array validates that every key is below the number of values (one pass over the ids
   of a batch, vectorised). The crate forbids `unsafe`, and the check is also what makes a
   corrupted segment an error instead of an out-of-bounds read.
-- A result that returns a name column sends the dictionary values once per stream over Flight. With a million
-  names and a three-row result that is wasteful; a later change can compact the values of small results.
+- A result that returns a name column pays one string copy per output row and column at the transport, as
+  every engine that returns strings does. A later option for clients that ask for it: dictionary batches with
+  the values compacted per batch (4 bytes per cell on the wire).
 - Statistics for a dictionary column are not given to the planner as min/max (they are ids, not strings).
 
 ## Not changed

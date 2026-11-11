@@ -246,3 +246,88 @@ async fn query_deadline_fires_without_a_reading_client() {
     }
     drop(stream);
 }
+
+/// A `dict` column shown as names (RFC-0002) reaches a client as plain strings, and every schema
+/// the server announces says so: what `GetFlightInfo`, `GetSchema` and `ListFlights` describe is
+/// what `DoGet` streams.
+#[tokio::test]
+async fn name_columns_travel_as_strings_and_the_announced_schema_says_so() {
+    use arrow::datatypes::DataType;
+
+    let ctx = Arc::new(SessionContext::new());
+    let mut c = Chunk::new(ChunkId(1), Schema::trades());
+    for i in 0..10i64 {
+        c.append_row(&[
+            Value::I64(1_000 + i),
+            Value::U32(u32::try_from(i % 2).unwrap()),
+            Value::I64(50 + i),
+            Value::I64(1),
+            Value::U8(0),
+            Value::I64(i),
+        ])
+        .unwrap();
+    }
+    let names = ankaa_sql::Names::of(&["BTCUSDT", "ETHUSDT"]);
+    let table =
+        ankaa_sql::ChunkTable::new(Schema::trades(), vec![c]).with_names(vec![None, Some(names)]);
+    ctx.register_table("trades", Arc::new(table)).unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let svc = AnkaaFlight::new(ctx, None).into_server();
+    tokio::spawn(async move {
+        tonic::transport::Server::builder()
+            .add_service(svc)
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    let channel = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    let mut client = FlightServiceClient::new(channel);
+
+    let sql = "SELECT symbol, count(*) AS n FROM trades WHERE symbol = 'ETHUSDT' GROUP BY symbol";
+    let info = client
+        .get_flight_info(FlightDescriptor::new_cmd(sql))
+        .await
+        .unwrap()
+        .into_inner();
+    let announced = info.clone().try_decode_schema().unwrap();
+    assert_eq!(announced.field(0).data_type(), &DataType::Utf8);
+
+    let got = client
+        .get_schema(FlightDescriptor::new_cmd(sql))
+        .await
+        .unwrap()
+        .into_inner();
+    let got = arrow::datatypes::Schema::try_from(&got).unwrap();
+    assert_eq!(got.field(0).data_type(), &DataType::Utf8);
+
+    let listed: Vec<_> = client
+        .list_flights(arrow_flight::Criteria::default())
+        .await
+        .unwrap()
+        .into_inner()
+        .try_collect()
+        .await
+        .unwrap();
+    let listed = listed[0].clone().try_decode_schema().unwrap();
+    assert_eq!(
+        listed.field_with_name("symbol").unwrap().data_type(),
+        &DataType::Utf8
+    );
+
+    let ticket: Ticket = info.endpoint[0].ticket.clone().unwrap();
+    let stream = client.do_get(ticket).await.unwrap().into_inner();
+    let decoder = arrow_flight::decode::FlightRecordBatchStream::new_from_flight_data(
+        stream.map_err(|e| arrow_flight::error::FlightError::Tonic(Box::new(e))),
+    );
+    let batches: Vec<_> = decoder.try_collect().await.unwrap();
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].schema().as_ref(), &announced);
+    assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "ETHUSDT");
+    assert_eq!(batches[0].column(1).as_primitive::<Int64Type>().value(0), 5);
+}
