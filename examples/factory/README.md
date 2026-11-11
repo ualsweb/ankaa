@@ -9,6 +9,8 @@ plant simulator ──MQTT──▶ Mosquitto ──▶ ankaad ──Postgres wi
  20 machines, 1 Hz        acme/plant1/<area>/<line>/<machine>/telemetry
 ```
 
+![The Plant 1 dashboard](../../docs/assets/factory-dashboard.png)
+
 ## Run it
 
 Requires Docker with Compose (Docker Desktop, colima or Linux).

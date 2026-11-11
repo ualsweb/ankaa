@@ -112,6 +112,15 @@ docker compose up -d          # then open http://localhost:3000
 What it shows and how to point it at your own broker: [`examples/factory`](examples/factory/) and the
 [Unified Namespace tutorial](docs/tutorials/uns-historian.md).
 
+![Grafana dashboard of the factory demo: readings stored, missing values, power per machine, live 1-minute bars and temperature quantiles, all read from ANKAA over the Postgres protocol](docs/assets/factory-dashboard.png)
+
+<details>
+<summary>The same data from a terminal (55-second recording)</summary>
+
+![Terminal recording: topic segments mapped to columns, rows growing live, NULL readings counted, live bars, late gateway readings accepted](docs/assets/factory-demo.gif)
+
+</details>
+
 ### Install
 
 - **Container image** (linux/arm64, linux/amd64): `docker run --rm -e ANKAA_TOKEN=change-me-to-16-chars -p 50051:50051 -p 5432:5432 -p 9100:9100 ghcr.io/ualsweb/ankaa:latest`, with your configuration mounted at `/etc/ankaa/ankaad.toml` ([`deploy/docker/ankaad.toml`](deploy/docker/ankaad.toml) is the default).

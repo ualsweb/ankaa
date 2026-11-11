@@ -38,6 +38,8 @@ psql -h 127.0.0.1 -p 55432 -U ankaa -c "SELECT count(*) FROM telemetry"
 
 Run it twice a few seconds apart: the count grows by about 20 per second.
 
+![The Plant 1 dashboard of the demo](../assets/factory-dashboard.png)
+
 ## 2. Topics become columns
 
 The whole namespace lands in **one table**. The source maps topic segments to columns with `$topic.N`
@@ -158,6 +160,7 @@ ORDER BY high_kw DESC LIMIT 5;
 SELECT dm.name AS machine, t.p50, t.p99
 FROM cq_temp_5m_live t
 JOIN dictionaries dm ON dm."table" = 'telemetry' AND dm."column" = 'machine' AND dm.id = t.machine
+WHERE t.ts = (SELECT max(ts) FROM cq_temp_5m_live)
 ORDER BY t.p99 DESC LIMIT 5;
 ```
 

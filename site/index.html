@@ -286,6 +286,10 @@ docker compose up -d        <span class="c-dim"># then open http://localhost:300
 <span class="c-dim"># or run the server image on its own (linux/arm64, linux/amd64)</span>
 docker run --rm -e ANKAA_TOKEN=change-me-to-16-chars -p 5432:5432 ghcr.io/ualsweb/ankaa:latest</pre>
     </div>
+    <div class="grid g2" style="margin-bottom:18px">
+      <figure style="margin:0"><img src="assets/factory-dashboard.png" alt="Grafana dashboard of the factory demo: readings, missing values, power per machine, live bars and temperature quantiles read from ANKAA over the Postgres protocol" loading="lazy" style="border-radius:var(--radius);border:1px solid var(--line);display:block"><figcaption class="note">The demo dashboard: every panel is SQL against ANKAA over the Postgres protocol.</figcaption></figure>
+      <figure style="margin:0"><video src="assets/factory-demo.mp4" controls muted loop playsinline preload="metadata" style="width:100%;border-radius:var(--radius);border:1px solid var(--line);display:block;background:#282a36" aria-label="Terminal recording of the factory demo"></video><figcaption class="note">55 seconds in a terminal: topics become columns, missing values are NULL, late gateway data is placed in time.</figcaption></figure>
+    </div>
     <p class="sub" style="margin-bottom:24px">Without Docker: install <a href="https://rustup.rs">Rust</a>; a 20-second capture of live Binance data ships with the repository.</p>
     <div class="grid g2">
       <div class="code-card">

@@ -394,7 +394,7 @@
           "rawQuery": true,
           "editorMode": "code",
           "format": "table",
-          "rawSql": "SELECT dm.name AS machine, t.p50 AS median_c, t.p99 AS p99_c, t.count AS readings, t.ts AS window_start\nFROM cq_temp_5m_live t\nJOIN dictionaries dm ON dm.\"table\" = 'telemetry' AND dm.\"column\" = 'machine' AND dm.id = t.machine\nORDER BY p99_c DESC"
+          "rawSql": "SELECT dm.name AS machine, t.p50 AS median_c, t.p99 AS p99_c, t.count AS readings, t.ts AS window_start\nFROM cq_temp_5m_live t\nJOIN dictionaries dm ON dm.\"table\" = 'telemetry' AND dm.\"column\" = 'machine' AND dm.id = t.machine\nWHERE t.ts = (SELECT max(ts) FROM cq_temp_5m_live)\nORDER BY p99_c DESC"
         }
       ],
       "fieldConfig": {
