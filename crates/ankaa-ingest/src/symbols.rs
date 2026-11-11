@@ -1,11 +1,14 @@
 //! Symbol dictionary: interns `(venue, symbol)` strings into dense `u32` ids.
 //!
 //! Hot path: feeds repeat the same few symbols, so [`SymbolDict::intern`] first compares against
-//! the last symbol seen (one short memcmp), then looks up a map keyed with a cheap FNV-1a hash.
-//! `SipHash` on every message showed up at ~19% of ingest time in profiles.
+//! the last symbol seen (one short memcmp), then looks up a map keyed with foldhash: 8 bytes per
+//! step, each mixed by a folded 64×64→128-bit multiply (`mul` + `umulh` on Arm), instead of one
+//! dependent multiply per byte (FNV-1a: 16 of them for a 16-byte metric name). `SipHash` on every
+//! message showed up at ~19% of ingest time in profiles. The seed is random per dictionary, so
+//! publishers cannot aim collisions at it (the entries are capped as well).
 
 use std::collections::HashMap;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::Hasher;
 
 /// Dense symbol identifier (dictionary code).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -40,7 +43,7 @@ impl Hasher for Fnv1a {
 /// persisted dictionaries (P1-06) replay the same order.
 #[derive(Debug, Default, Clone)]
 pub struct SymbolDict {
-    by_name: HashMap<String, SymbolId, BuildHasherDefault<Fnv1a>>,
+    by_name: HashMap<String, SymbolId, foldhash::fast::RandomState>,
     names: Vec<String>,
     /// Most recently interned symbol: `(id, name)`; feeds repeat symbols back to back.
     last: Option<(SymbolId, String)>,

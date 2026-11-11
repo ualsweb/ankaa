@@ -6,7 +6,8 @@
 //! speed), values are converted from byte spans of the message, decimals are parsed with
 //! [`parse_fixed`] (no floats for `fixed8`), strings go through a per-column [`SymbolDict`], and the
 //! output rows live in a buffer that is reused. With `rows`, one message yields one row per
-//! element of an array.
+//! element of an array. Sparkplug B payloads ([`RowMapper::with_sparkplug`]) yield one row per
+//! metric, decoded in place by [`crate::sparkplug`].
 #![allow(
     clippy::many_single_char_names,
     clippy::unnested_or_patterns,
@@ -22,6 +23,7 @@ use std::collections::HashMap;
 use ankaa_store::{ColumnType, Field, Schema, Value};
 
 use crate::json_scan;
+use crate::sparkplug::{self, Definitions};
 use crate::symbols::{SymbolDict, SymbolId};
 use crate::{DecodeError, parse_fixed};
 
@@ -51,8 +53,82 @@ pub enum Selector {
     /// The message topic (`$topic`) or one `/`-separated segment of it (`$topic.N`, from 0):
     /// MQTT puts the plant, line or device in the topic rather than in the payload.
     Topic(Option<usize>),
+    /// A field of a Sparkplug B metric or of its message (`$metric`, `$value`, …).
+    Sparkplug(SpField),
     /// Not mapped: timestamp from receive time, or a default/null.
     Absent,
+}
+
+/// What a Sparkplug selector reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpField {
+    /// `$metric`: the metric name (from the message, or its alias resolved through the BIRTH).
+    Metric,
+    /// `$value`: the value. Numbers and booleans go to numeric columns (a string value is `NULL`
+    /// there); a `dict` column takes any value as text.
+    Value,
+    /// `$string`: the value when it is a string, `NULL` otherwise.
+    String,
+    /// `$timestamp`: the metric's timestamp, else the payload's (ms since the epoch).
+    Timestamp,
+    /// `$datatype`: the Sparkplug datatype code.
+    Datatype,
+    /// `$historical`: 1 for a historical (late, buffered) value.
+    Historical,
+    /// `$seq`: the payload sequence number.
+    Seq,
+    /// `$group`: the group id of the topic.
+    Group,
+    /// `$node`: the edge node id.
+    Node,
+    /// `$device`: the device id (`NULL` for node-level metrics).
+    Device,
+    /// `$type`: the message type (`NBIRTH`, `NDATA`, `DBIRTH`, `DDATA`).
+    Type,
+}
+
+impl SpField {
+    /// The field a `map` value names, if it is a Sparkplug selector.
+    #[must_use]
+    pub fn parse(spec: &str) -> Option<Self> {
+        Some(match spec {
+            "$metric" => Self::Metric,
+            "$value" => Self::Value,
+            "$string" => Self::String,
+            "$timestamp" => Self::Timestamp,
+            "$datatype" => Self::Datatype,
+            "$historical" => Self::Historical,
+            "$seq" => Self::Seq,
+            "$group" => Self::Group,
+            "$node" => Self::Node,
+            "$device" => Self::Device,
+            "$type" => Self::Type,
+            _ => return None,
+        })
+    }
+}
+
+/// Sparkplug state of a mapper: what the BIRTH messages of its edge nodes defined.
+#[derive(Debug, Default)]
+struct SpState {
+    defs: Definitions,
+    /// Per column: the selector has one value per message (`$group`, `$node`, `$device`,
+    /// `$type`, `$seq`, `$topic`), so it is converted once and copied into the later rows.
+    per_message: Vec<bool>,
+    /// Per column, in the current message: the row that holds its converted value.
+    converted_in: Vec<Option<usize>>,
+}
+
+/// A Sparkplug value before conversion to a column type.
+#[derive(Debug, Clone, Copy)]
+enum SpRaw<'a> {
+    Text(&'a str),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    Bool(bool),
+    /// Milliseconds since the epoch (timestamps, `DateTime` values).
+    Ms(u64),
 }
 
 /// Most rows one message may carry with `rows`: bounds the work and memory one message can
@@ -104,6 +180,8 @@ pub struct RowMapper {
     /// Per column: the distinct new dictionary values of the last message, counted against
     /// `max_dict_entries` so that one message of many rows cannot overshoot the cap.
     new_names: Vec<std::collections::HashSet<Box<str>>>,
+    /// `format = "sparkplug"`: payloads are Sparkplug B, one row per metric.
+    sparkplug: Option<Box<SpState>>,
 }
 
 /// What [`RowMapper::parsed`] found for one row, before anything was added to a dictionary.
@@ -174,6 +252,10 @@ impl RowMapper {
     ) -> Result<Self, MapError> {
         let mut selectors = Vec::with_capacity(schema.fields().len());
         for f in schema.fields() {
+            if let Some(sp) = map.get(&f.name).and_then(|s| SpField::parse(s.trim())) {
+                selectors.push(Selector::Sparkplug(sp));
+                continue;
+            }
             let sel = match map.get(&f.name) {
                 None => Selector::Absent,
                 Some(spec) if spec.trim() == "$topic" => Selector::Topic(None),
@@ -238,7 +320,72 @@ impl RowMapper {
             pending: Vec::new(),
             pending_set: Vec::new(),
             new_names: Vec::new(),
+            sparkplug: None,
         })
+    }
+
+    /// Payloads are Sparkplug B (`format = "sparkplug"`, MQTT sources): one row per metric of
+    /// every BIRTH and DATA message; columns are mapped with `$metric`, `$value`, `$string`,
+    /// `$timestamp`, `$datatype`, `$historical`, `$seq`, `$group`, `$node`, `$device`, `$type`
+    /// and `$topic`. With `on == false` those selectors are refused.
+    pub fn with_sparkplug(mut self, on: bool) -> Result<Self, MapError> {
+        let names = self.schema.fields().iter().map(|f| f.name.as_str());
+        for (sel, name) in self.selectors.iter().zip(names) {
+            let bad = match sel {
+                Selector::Sparkplug(_) if !on => "Sparkplug selectors need format = \"sparkplug\"",
+                Selector::Path(_) | Selector::Index(_) if on => {
+                    "format = \"sparkplug\" maps columns with $metric, $value, $timestamp, … (not JSON paths)"
+                }
+                _ => continue,
+            };
+            return Err(MapError::Convert {
+                column: name.to_owned(),
+                reason: bad.to_owned(),
+            });
+        }
+        if on {
+            if self.rows_path.is_some() {
+                return Err(MapError::Convert {
+                    column: "rows".into(),
+                    reason: "rows needs format = \"json\"".into(),
+                });
+            }
+            let per_message = self
+                .selectors
+                .iter()
+                .map(|s| {
+                    matches!(
+                        s,
+                        Selector::Topic(_)
+                            | Selector::Sparkplug(
+                                SpField::Group
+                                    | SpField::Node
+                                    | SpField::Device
+                                    | SpField::Type
+                                    | SpField::Seq
+                            )
+                    )
+                })
+                .collect();
+            self.sparkplug = Some(Box::new(SpState {
+                per_message,
+                ..SpState::default()
+            }));
+        }
+        Ok(self)
+    }
+
+    /// The Sparkplug definitions known so far (`None` unless [`Self::with_sparkplug`]).
+    #[must_use]
+    pub fn sparkplug_definitions(&self) -> Option<&Definitions> {
+        self.sparkplug.as_ref().map(|s| &s.defs)
+    }
+
+    /// Replace the Sparkplug definitions (a snapshot read back from the log).
+    pub fn set_sparkplug_definitions(&mut self, defs: Definitions) {
+        if let Some(s) = &mut self.sparkplug {
+            s.defs = defs;
+        }
     }
 
     /// Compile the JSON selectors: message paths, and with `rows` the element paths (a path
@@ -371,6 +518,11 @@ impl RowMapper {
         } else {
             ("", msg)
         };
+        if let Some(mut sp) = self.sparkplug.take() {
+            let r = self.parse_sparkplug(topic, payload, recv_ns, dicts, &mut sp);
+            self.sparkplug = Some(sp);
+            return r;
+        }
         let ncols = self.schema.fields().len();
         if csv {
             let text = std::str::from_utf8(payload)
@@ -382,7 +534,7 @@ impl RowMapper {
                 let raw = match &self.selectors[c] {
                     Selector::Index(k) => self.csv_fields.get(*k).map(|&(a, b)| text[a..b].trim()),
                     Selector::Topic(n) => topic_segment(topic, *n),
-                    Selector::Path(_) | Selector::Absent => None,
+                    Selector::Path(_) | Selector::Sparkplug(_) | Selector::Absent => None,
                 };
                 if let Err(e) = self.convert(0, c, raw.map(Scalar::Text), payload, recv_ns, dicts) {
                     self.row_err[0] = Some(e);
@@ -419,6 +571,155 @@ impl RowMapper {
             }
         }
         Ok(n_rows)
+    }
+
+    /// One row per metric of a Sparkplug BIRTH or DATA message; other messages (DEATH,
+    /// commands, `STATE`, topics outside `spBv1.0`) give none. A BIRTH records each metric's
+    /// datatype, transient flag and alias ([`Definitions`]; an NBIRTH first forgets what the node
+    /// defined before, a DBIRTH what the device did); DATA metrics are read with them. Transient
+    /// metrics are not stored.
+    fn parse_sparkplug(
+        &mut self,
+        topic: &str,
+        payload: &[u8],
+        recv_ns: i64,
+        dicts: &[Option<SymbolDict>],
+        sp: &mut SpState,
+    ) -> Result<usize, MapError> {
+        let Some(t) = sparkplug::Topic::parse(topic) else {
+            return Ok(0);
+        };
+        match t.kind {
+            "NBIRTH" => sp.defs.reset_node(t.group, t.node),
+            "DBIRTH" => sp.defs.reset_device(t.group, t.node, t.device),
+            _ => {}
+        }
+        if !t.has_readings() {
+            return Ok(0);
+        }
+        let h = sparkplug::header(payload).map_err(|e| MapError::Malformed(e.0))?;
+        let ncols = self.schema.fields().len();
+        self.begin(h.metrics, ncols);
+        let mut defs = if t.is_birth() {
+            Defs::Birth(&mut sp.defs)
+        } else {
+            Defs::Data(sp.defs.node(t.group, t.node))
+        };
+        let per_message = &sp.per_message;
+        let converted_in = &mut sp.converted_in;
+        converted_in.clear();
+        converted_in.resize(ncols, None);
+        let mut r = 0usize;
+        let walked = sparkplug::for_each_metric(payload, |m| {
+            let found = sp_definition(&mut defs, &t, m);
+            let row = match found {
+                Ok(None) => return, // transient
+                Ok(Some((name, m))) => (|| {
+                    for c in 0..ncols {
+                        // the same for every row of the message: copy the converted cell
+                        if per_message[c]
+                            && let Some(from) = converted_in[c]
+                        {
+                            self.copy_cell(from, r, c);
+                            continue;
+                        }
+                        let raw = match self.selectors[c] {
+                            Selector::Sparkplug(f) => sp_raw(f, &m, name, &h, &t)?,
+                            Selector::Topic(n) => topic_segment(topic, n).map(SpRaw::Text),
+                            _ => None,
+                        };
+                        let from_value = self.selectors[c] == Selector::Sparkplug(SpField::Value);
+                        self.convert_sp(r, c, raw, from_value, recv_ns, dicts)?;
+                        if per_message[c] {
+                            converted_in[c] = Some(r);
+                        }
+                    }
+                    Ok(())
+                })(),
+                Err(e) => Err(e),
+            };
+            if let Err(e) = row {
+                self.row_err[r] = Some(e);
+            }
+            r += 1;
+        });
+        walked.map_err(|e| MapError::Malformed(e.0))?;
+        self.n_rows = r;
+        self.row_err.truncate(r);
+        Ok(r)
+    }
+
+    /// Copy cell (`from`, `c`) into (`to`, `c`), with its pending dictionary value.
+    fn copy_cell(&mut self, from: usize, to: usize, c: usize) {
+        let ncols = self.schema.fields().len();
+        let (a, b) = (from * ncols + c, to * ncols + c);
+        self.rows[b] = self.rows[a];
+        self.pending_set[b] = self.pending_set[a];
+        if self.pending_set[a] {
+            let (lo, hi) = self.pending.split_at_mut(b);
+            hi[0].clone_from(&lo[a]);
+        }
+    }
+
+    /// Convert a Sparkplug value into cell (`r`, `c`). `from_value`: the column maps `$value`,
+    /// where a string metric counts as no value for a numeric column.
+    fn convert_sp(
+        &mut self,
+        r: usize,
+        c: usize,
+        raw: Option<SpRaw<'_>>,
+        from_value: bool,
+        recv_ns: i64,
+        dicts: &[Option<SymbolDict>],
+    ) -> Result<(), MapError> {
+        use std::fmt::Write as _;
+        let ncols = self.schema.fields().len();
+        let idx = r * ncols + c;
+        let f: &Field = &self.schema.fields()[c];
+        let raw = match raw {
+            Some(SpRaw::Text(_)) if from_value && f.ty != ColumnType::DictU32 => None,
+            x => x,
+        };
+        let Some(raw) = raw else {
+            if f.nullable && c > 0 {
+                self.rows[idx] = Value::Null;
+                return Ok(());
+            }
+            if c == 0 && self.ts_from_receive {
+                self.rows[idx] = Value::I64(recv_ns);
+                return Ok(());
+            }
+            // a key column always holds a value: "" where the selector does not apply
+            // (`$device` of a node metric, `$string` of a number)
+            if f.ty == ColumnType::DictU32 {
+                return self.dict_value(idx, c, "", dicts);
+            }
+            return Err(MapError::Missing(f.name.clone()));
+        };
+        if f.ty == ColumnType::DictU32 {
+            let mut buf = StackStr::default();
+            let text = match raw {
+                SpRaw::Text(s) => Ok(s),
+                SpRaw::Bool(b) => Ok(if b { "true" } else { "false" }),
+                SpRaw::Int(v) => write!(buf, "{v}").map(|()| buf.as_str()),
+                SpRaw::UInt(v) | SpRaw::Ms(v) => write!(buf, "{v}").map(|()| buf.as_str()),
+                SpRaw::Float(x) if x.is_finite() => write!(buf, "{x}").map(|()| buf.as_str()),
+                SpRaw::Float(_) => Err(std::fmt::Error),
+            };
+            let Ok(text) = text else {
+                return Err(MapError::Convert {
+                    column: f.name.clone(),
+                    reason: "value has no text form".into(),
+                });
+            };
+            return self.dict_value(idx, c, text, dicts);
+        }
+        let value = sp_typed(f.ty, raw).map_err(|reason| MapError::Convert {
+            column: f.name.clone(),
+            reason: reason.to_owned(),
+        })?;
+        self.rows[idx] = value;
+        Ok(())
     }
 
     /// Size the reused output buffers for `n_rows` rows.
@@ -650,6 +951,186 @@ impl std::fmt::Write for StackStr {
         self.len = end;
         Ok(())
     }
+}
+
+/// The name of metric `m` and the metric with its datatype and value as its BIRTH defined them
+/// (`None`: transient, not stored). A BIRTH records the definition; a DATA metric is looked up
+/// by alias or by name, and keeps the datatype it carries when it carries one.
+fn sp_definition<'a>(
+    defs: &mut Defs<'a>,
+    t: &sparkplug::Topic<'a>,
+    m: sparkplug::Metric<'a>,
+) -> Result<Option<(&'a str, sparkplug::Metric<'a>)>, MapError> {
+    let name = match m.name {
+        Some(n) => Some(
+            std::str::from_utf8(n).map_err(|_| MapError::Malformed("metric name is not utf-8"))?,
+        ),
+        None => None,
+    };
+    let (name, ty, transient) = match (defs, name, m.alias) {
+        (Defs::Birth(d), Some(n), alias) => {
+            // a full table only loses the definition: this row is still stored
+            d.define(
+                t.group,
+                t.node,
+                t.device,
+                alias,
+                n,
+                m.datatype,
+                m.is_transient,
+            );
+            (n, m.datatype, m.is_transient)
+        }
+        (Defs::Birth(_), None, _) => {
+            return Err(MapError::Malformed("BIRTH metric without a name"));
+        }
+        (Defs::Data(node), Some(n), _) => {
+            let (ty, tr) = node
+                .and_then(|nd| nd.by_name(t.device, n))
+                .unwrap_or((0, false));
+            (n, ty, tr)
+        }
+        (Defs::Data(node), None, Some(a)) => {
+            let d = node
+                .and_then(|nd| nd.by_alias(a))
+                .ok_or(MapError::Malformed(
+                    "metric alias without a BIRTH that defines it",
+                ))?;
+            (d.name, d.datatype, d.transient)
+        }
+        (Defs::Data(_), None, None) => {
+            return Err(MapError::Malformed("metric without a name or an alias"));
+        }
+    };
+    if m.is_transient || transient {
+        return Ok(None);
+    }
+    let m = if m.datatype == 0 && ty != 0 {
+        sparkplug::Metric {
+            datatype: ty,
+            value: sparkplug::retype(m.value, ty),
+            ..m
+        }
+    } else {
+        m
+    };
+    Ok(Some((name, m)))
+}
+
+/// The definitions one message works with: a BIRTH records into the table, a DATA message reads
+/// its node's definitions, looked up once for all its metrics.
+enum Defs<'a> {
+    Birth(&'a mut Definitions),
+    Data(Option<sparkplug::NodeDefs<'a>>),
+}
+
+/// What a Sparkplug selector reads from metric `m` (named `name`) of a message.
+fn sp_raw<'a>(
+    f: SpField,
+    m: &sparkplug::Metric<'a>,
+    name: &'a str,
+    h: &sparkplug::Header,
+    t: &sparkplug::Topic<'a>,
+) -> Result<Option<SpRaw<'a>>, MapError> {
+    use sparkplug::Value as V;
+    Ok(match f {
+        SpField::Metric => Some(SpRaw::Text(name)),
+        SpField::Value | SpField::String => match m.value {
+            V::Str(s) => {
+                Some(SpRaw::Text(std::str::from_utf8(s).map_err(|_| {
+                    MapError::Malformed("string value is not utf-8")
+                })?))
+            }
+            _ if f == SpField::String => None,
+            V::Int(v) => Some(SpRaw::Int(v)),
+            V::UInt(v) if m.datatype == sparkplug::datatype::DATETIME => Some(SpRaw::Ms(v)),
+            V::UInt(v) => Some(SpRaw::UInt(v)),
+            V::Float(x) => Some(SpRaw::Float(x)),
+            V::Bool(b) => Some(SpRaw::Bool(b)),
+            V::Null => None,
+            V::Unsupported => {
+                return Err(MapError::Malformed(
+                    "metric datatype has no scalar value (DataSet, Template, Bytes, File or array)",
+                ));
+            }
+        },
+        SpField::Timestamp => m.timestamp.or(h.timestamp).map(SpRaw::Ms),
+        SpField::Datatype => Some(SpRaw::UInt(u64::from(m.datatype))),
+        SpField::Historical => Some(SpRaw::Bool(m.is_historical)),
+        SpField::Seq => h.seq.map(SpRaw::UInt),
+        SpField::Group => Some(SpRaw::Text(t.group)),
+        SpField::Node => Some(SpRaw::Text(t.node)),
+        SpField::Device => (!t.device.is_empty()).then_some(SpRaw::Text(t.device)),
+        SpField::Type => Some(SpRaw::Text(t.kind)),
+    })
+}
+
+/// A Sparkplug value as a value of a non-dictionary column type, or why it does not fit.
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+fn sp_typed(ty: ColumnType, raw: SpRaw<'_>) -> Result<Value, &'static str> {
+    // i64 range as f64: [-2^63, 2^63)
+    const LIMIT: f64 = 9_223_372_036_854_775_808.0;
+    let int = |raw: SpRaw<'_>| -> Option<i64> {
+        match raw {
+            SpRaw::Int(v) => Some(v),
+            SpRaw::UInt(v) | SpRaw::Ms(v) => i64::try_from(v).ok(),
+            SpRaw::Bool(b) => Some(i64::from(b)),
+            SpRaw::Float(x) if x.fract() == 0.0 && (-LIMIT..LIMIT).contains(&x) => Some(x as i64),
+            SpRaw::Float(_) => None,
+            SpRaw::Text(s) => s.trim().parse().ok(),
+        }
+    };
+    Ok(match ty {
+        ColumnType::TimestampNs => Value::I64(match raw {
+            SpRaw::Ms(v) | SpRaw::UInt(v) => i64::try_from(v)
+                .ok()
+                .and_then(|v| v.checked_mul(1_000_000))
+                .ok_or("timestamp out of range")?,
+            SpRaw::Int(v) => v.checked_mul(1_000_000).ok_or("timestamp out of range")?,
+            SpRaw::Text(s) => parse_rfc3339_ns(s.trim()).ok_or("bad timestamp")?,
+            SpRaw::Float(_) | SpRaw::Bool(_) => return Err("expected a timestamp"),
+        }),
+        ColumnType::FixedPoint { scale } => {
+            let pow = 10i64
+                .checked_pow(u32::from(scale))
+                .ok_or("scale too large")?;
+            Value::I64(match raw {
+                SpRaw::Float(x) => {
+                    let y = (x * pow as f64).round();
+                    if !y.is_finite() || !(-LIMIT..LIMIT).contains(&y) {
+                        return Err("number out of range");
+                    }
+                    y as i64
+                }
+                SpRaw::Text(s) => {
+                    parse_fixed(s.trim().as_bytes(), scale).map_err(|_| "expected a decimal")?
+                }
+                other => int(other)
+                    .and_then(|v| v.checked_mul(pow))
+                    .ok_or("number out of range")?,
+            })
+        }
+        ColumnType::Int64 => Value::I64(int(raw).ok_or("expected an integer")?),
+        ColumnType::U8 => Value::U8(
+            int(raw)
+                .and_then(|v| u8::try_from(v).ok())
+                .ok_or("expected 0..255")?,
+        ),
+        ColumnType::Float64 => {
+            let x = match raw {
+                SpRaw::Float(x) => x,
+                SpRaw::Int(v) => v as f64,
+                SpRaw::UInt(v) | SpRaw::Ms(v) => v as f64,
+                SpRaw::Bool(b) => f64::from(u8::from(b)),
+                SpRaw::Text(s) => s.trim().parse().map_err(|_| "expected a number")?,
+            };
+            if !x.is_finite() {
+                return Err("expected a finite number");
+            }
+            Value::F64(x)
+        }
+        ColumnType::DictU32 => return Err("not a scalar column"),
+    })
 }
 
 /// A raw value as a value of a non-dictionary column type, or why it does not fit.

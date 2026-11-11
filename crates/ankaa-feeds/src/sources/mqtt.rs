@@ -23,7 +23,7 @@
 //! mutual TLS). The files are read once, when the source starts; a bad file stops the source with
 //! the reason in the log.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use std::sync::Arc;
 
@@ -33,7 +33,7 @@ use rumqttc::{
 use tokio::sync::{mpsc, watch};
 
 use super::{
-    SourceOpts, SourceStats, TlsFiles, deliver_wait, oversized, redact_url, shutdown_wait,
+    SourceOpts, SourceStats, TlsFiles, deliver_wait, now_ns, oversized, redact_url, shutdown_wait,
 };
 use crate::capture::Frame;
 
@@ -206,6 +206,7 @@ pub async fn run(
     let (client, mut events): (AsyncClient, EventLoop) =
         AsyncClient::new(options(&broker, &client_id, opts, tls), 64);
     let mut backoff = Duration::from_millis(500);
+    let mut rebirth = opts.sparkplug_rebirth.then(Rebirth::default);
     loop {
         let event = tokio::select! {
             () = shutdown_wait(&mut shutdown) => break,
@@ -232,6 +233,20 @@ pub async fn run(
                 }
             }
             Ok(Event::Incoming(Packet::Publish(p))) => {
+                if let Some(r) = rebirth.as_mut()
+                    && let Some(cmd) = r.check(&p.topic, Instant::now())
+                {
+                    let now_ms = u64::try_from(now_ns() / 1_000_000).unwrap_or(0);
+                    let payload = ankaa_ingest::sparkplug::rebirth_request(now_ms);
+                    match client.try_publish(cmd.as_str(), QoS::AtMostOnce, false, payload) {
+                        Ok(()) => {
+                            tracing::info!(source_id, topic = %cmd, "sparkplug: rebirth requested");
+                        }
+                        Err(e) => {
+                            tracing::debug!(source_id, error = %e, "sparkplug rebirth request not queued");
+                        }
+                    }
+                }
                 if !oversized(p.payload.len(), opts, &mut stats) {
                     let msg = topic_message(&p.topic, &p.payload);
                     if !deliver_wait(&tx, source_id, &msg, &mut stats, &mut shutdown).await {
@@ -257,9 +272,79 @@ pub async fn run(
     stats
 }
 
+/// Which edge nodes have published a BIRTH since the source started, and when a rebirth was
+/// last asked of the others (at most once per [`Rebirth::EVERY`] per node).
+#[derive(Debug, Default)]
+struct Rebirth {
+    born: std::collections::HashSet<(String, String)>,
+    asked: std::collections::HashMap<(String, String), Instant>,
+}
+
+impl Rebirth {
+    const EVERY: Duration = Duration::from_secs(30);
+    /// Nodes remembered at most (beyond it, the oldest knowledge is dropped).
+    const MAX_NODES: usize = 100_000;
+
+    /// The `NCMD` topic to ask for a rebirth on, when a message on `topic` is DATA from a
+    /// node that has not published its BIRTH since the source started.
+    fn check(&mut self, topic: &str, now: Instant) -> Option<String> {
+        let t = ankaa_ingest::sparkplug::Topic::parse(topic)?;
+        let key = (t.group.to_owned(), t.node.to_owned());
+        if t.kind == "NBIRTH" {
+            if self.born.len() >= Self::MAX_NODES {
+                self.born.clear();
+            }
+            self.asked.remove(&key);
+            self.born.insert(key);
+            return None;
+        }
+        if !matches!(t.kind, "NDATA" | "DDATA" | "DBIRTH") || self.born.contains(&key) {
+            return None;
+        }
+        if self
+            .asked
+            .get(&key)
+            .is_some_and(|at| now.duration_since(*at) < Self::EVERY)
+        {
+            return None;
+        }
+        if self.asked.len() >= Self::MAX_NODES {
+            self.asked.clear();
+        }
+        let cmd = format!("spBv1.0/{}/NCMD/{}", t.group, t.node);
+        self.asked.insert(key, now);
+        Some(cmd)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rebirth_is_asked_once_per_node_until_its_birth() {
+        let mut r = Rebirth::default();
+        let t0 = Instant::now();
+        assert_eq!(
+            r.check("spBv1.0/plant/DDATA/gw1/press", t0).as_deref(),
+            Some("spBv1.0/plant/NCMD/gw1")
+        );
+        assert_eq!(
+            r.check("spBv1.0/plant/NDATA/gw1", t0 + Duration::from_secs(1)),
+            None
+        );
+        assert!(
+            r.check("spBv1.0/plant/NDATA/gw1", t0 + Rebirth::EVERY)
+                .is_some()
+        );
+        assert_eq!(r.check("spBv1.0/plant/NBIRTH/gw1", t0), None);
+        assert_eq!(
+            r.check("spBv1.0/plant/NDATA/gw1", t0 + Rebirth::EVERY * 3),
+            None
+        );
+        assert_eq!(r.check("factory/line1/temp", t0), None);
+        assert_eq!(r.check("spBv1.0/plant/NDEATH/gw2", t0), None);
+    }
 
     #[test]
     fn urls() {

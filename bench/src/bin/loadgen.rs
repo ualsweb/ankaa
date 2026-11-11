@@ -21,6 +21,10 @@ enum Format {
     Json,
     /// `--batch` readings per message, in a `samples` array.
     JsonArray,
+    /// Sparkplug B (MQTT only): one NBIRTH per device (edge node `dev-NNNNN`) defining `--batch`
+    /// metrics with aliases, then NDATA messages carrying all of them by alias and without a
+    /// datatype, as a compliant edge node sends them.
+    Sparkplug,
 }
 
 struct Args {
@@ -69,6 +73,7 @@ fn parse_args() -> Args {
                 a.format = match v().as_str() {
                     "json" => Format::Json,
                     "json-array" => Format::JsonArray,
+                    "sparkplug" => Format::Sparkplug,
                     _ => usage(),
                 }
             }
@@ -138,6 +143,16 @@ fn message(a: &Args, m: u64, rng: &mut Rng, payload: &mut Vec<u8>) -> String {
     let base_ms = 1_762_000_000_000 + round * a.batch.max(1);
     payload.clear();
     match a.format {
+        Format::Sparkplug => {
+            payload.push(0x08);
+            varint(base_ms, payload);
+            for k in 0..a.batch {
+                sp_metric(payload, None, k, base_ms, 20.0 + 15.0 * rng.unit());
+            }
+            payload.extend_from_slice(&[0x18]);
+            varint(round % 256, payload);
+            return format!("spBv1.0/{}/NDATA/dev-{d:05}", a.prefix);
+        }
         Format::Json => reading(payload, rng, base_ms, true, d),
         Format::JsonArray => {
             write!(payload, "{{\"dev\":\"dev-{d:05}\",\"samples\":[").unwrap();
@@ -153,10 +168,55 @@ fn message(a: &Args, m: u64, rng: &mut Rng, payload: &mut Vec<u8>) -> String {
     format!("{}/line{}/dev-{d:05}/telemetry", a.prefix, d % 8)
 }
 
+/// Protobuf varint.
+fn varint(mut v: u64, out: &mut Vec<u8>) {
+    while v >= 0x80 {
+        out.push((v as u8) | 0x80);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+/// One Sparkplug metric: name (BIRTH only), alias, timestamp, datatype (BIRTH only: Double),
+/// double value.
+fn sp_metric(out: &mut Vec<u8>, name: Option<&str>, alias: u64, ts_ms: u64, x: f64) {
+    let mut m = Vec::with_capacity(48);
+    if let Some(n) = name {
+        m.push(0x0a);
+        varint(n.len() as u64, &mut m);
+        m.extend_from_slice(n.as_bytes());
+    }
+    m.push(0x10);
+    varint(alias, &mut m);
+    m.push(0x18);
+    varint(ts_ms, &mut m);
+    if name.is_some() {
+        m.extend_from_slice(&[0x20, 10]);
+    }
+    m.push(0x69);
+    m.extend_from_slice(&x.to_le_bytes());
+    out.push(0x12);
+    varint(m.len() as u64, out);
+    out.extend_from_slice(&m);
+}
+
+/// The NBIRTH of device `d`: topic and payload.
+fn sp_birth(a: &Args, d: u64, payload: &mut Vec<u8>) -> String {
+    let ts = 1_762_000_000_000 - 1;
+    payload.clear();
+    payload.push(0x08);
+    varint(ts, payload);
+    for k in 0..a.batch {
+        sp_metric(payload, Some(&format!("Sensor/M{k:03}")), k, ts, 0.0);
+    }
+    payload.extend_from_slice(&[0x18, 0]);
+    format!("spBv1.0/{}/NBIRTH/dev-{d:05}", a.prefix)
+}
+
 fn readings_per_message(a: &Args) -> u64 {
     match a.format {
         Format::Json => 1,
-        Format::JsonArray => a.batch,
+        Format::JsonArray | Format::Sparkplug => a.batch,
     }
 }
 
@@ -189,7 +249,13 @@ async fn publish(a: std::sync::Arc<Args>, host: String, port: u16, c: u64) -> u6
     o.set_inflight(1000);
     o.set_max_packet_size(1 << 20, 1 << 20);
     let (client, mut events) = AsyncClient::new(o, 10_000);
-    let target = (a.messages + a.connections - 1 - c) / a.connections;
+    // a device stays on one connection: this one's devices are those ≡ c (mod connections)
+    let births = if matches!(a.format, Format::Sparkplug) {
+        (c..a.devices).step_by(a.connections as usize).count() as u64
+    } else {
+        0
+    };
+    let target = (a.messages + a.connections - 1 - c) / a.connections + births;
     let qos = a.qos;
     // the event loop counts acknowledgements (QoS 1) or sent publishes (QoS 0)
     let done = tokio::spawn(async move {
@@ -209,6 +275,15 @@ async fn publish(a: std::sync::Arc<Args>, host: String, port: u16, c: u64) -> u6
     });
     let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ c.wrapping_mul(0x2545_F491_4F6C_DD1D));
     let mut payload = Vec::with_capacity(4096);
+    if births > 0 {
+        for d in (c..a.devices).step_by(a.connections as usize) {
+            let topic = sp_birth(&a, d, &mut payload);
+            client
+                .publish(topic, qos, false, payload.clone())
+                .await
+                .unwrap();
+        }
+    }
     for m in (c..a.messages).step_by(a.connections as usize) {
         let topic = message(&a, m, &mut rng, &mut payload);
         client

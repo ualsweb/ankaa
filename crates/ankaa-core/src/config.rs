@@ -146,6 +146,10 @@ pub enum SourceFormat {
     Json,
     /// One CSV record per message (or per line for files); `map` gives a 0-based column index per column.
     Csv,
+    /// Sparkplug B (MQTT only): one row per metric of every BIRTH and DATA message; `map` uses
+    /// `$metric`, `$value`, `$string`, `$timestamp`, `$datatype`, `$historical`, `$seq`,
+    /// `$group`, `$node`, `$device`, `$type` and `$topic`.
+    Sparkplug,
 }
 
 /// Transport of a source.
@@ -228,6 +232,11 @@ pub struct SourceConfig {
     /// `mqtts://` only: PEM private key of `tls_cert`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_key: Option<PathBuf>,
+    /// Sparkplug: ask an edge node to publish its BIRTH again (`NCMD` `Node Control/Rebirth`)
+    /// when its DATA arrives before any BIRTH since the server started. Needs permission to
+    /// publish on `spBv1.0/<group>/NCMD/<node>`.
+    #[serde(default)]
+    pub sparkplug_rebirth: bool,
 }
 
 impl std::fmt::Debug for SourceConfig {
@@ -895,6 +904,18 @@ impl Config {
                 }
                 _ => {}
             }
+            if s.format == SourceFormat::Sparkplug && s.kind != SourceKind::Mqtt {
+                return inv(format!(
+                    "sources.{}: format = \"sparkplug\" needs kind = \"mqtt\"",
+                    s.name
+                ));
+            }
+            if s.sparkplug_rebirth && s.format != SourceFormat::Sparkplug {
+                return inv(format!(
+                    "sources.{}: sparkplug_rebirth needs format = \"sparkplug\"",
+                    s.name
+                ));
+            }
             if let Some(rows) = &s.rows {
                 if s.format != SourceFormat::Json {
                     return inv(format!("sources.{}: rows needs format = \"json\"", s.name));
@@ -1394,6 +1415,7 @@ standby_of = "10.0.0.1:50051"
             tls_ca: None,
             tls_cert: None,
             tls_key: None,
+            sparkplug_rebirth: false,
         };
         assert!(!format!("{s:?}").contains("s3cret"));
     }
@@ -1432,6 +1454,47 @@ map = {{ ts = "t", v = "v" }}
         assert!(err("mqtt://broker", "tls_ca = \"ca.pem\"").contains("need an mqtts://"));
         assert!(err("mqtts://broker", "tls_cert = \"c.pem\"").contains("together"));
         assert!(err("ssl://broker", "").contains("mqtts://"));
+    }
+
+    #[test]
+    fn sparkplug_sources() {
+        let cfg = |kind: &str, url: &str, format: &str, extra: &str| {
+            format!(
+                r#"
+[feed]
+enabled = false
+streams = []
+[[tables]]
+name = "t"
+columns = [{{ name = "ts", type = "timestamp_ns" }}, {{ name = "v", type = "float64" }}]
+[[sources]]
+name = "scada"
+kind = "{kind}"
+url = "{url}"
+subject = "spBv1.0/#"
+format = "{format}"
+table = "t"
+map = {{ ts = "$timestamp", v = "$value" }}
+{extra}
+"#
+            )
+        };
+        let c = Config::from_toml(&cfg(
+            "mqtt",
+            "mqtt://b",
+            "sparkplug",
+            "sparkplug_rebirth = true",
+        ))
+        .unwrap();
+        assert_eq!(c.sources[0].format, SourceFormat::Sparkplug);
+        assert!(c.sources[0].sparkplug_rebirth);
+        let err = |text: String| Config::from_toml(&text).unwrap_err().to_string();
+        assert!(err(cfg("nats", "nats://b", "sparkplug", "")).contains("needs kind = \"mqtt\""));
+        assert!(
+            err(cfg("mqtt", "mqtt://b", "json", "sparkplug_rebirth = true"))
+                .contains("needs format = \"sparkplug\"")
+        );
+        assert!(err(cfg("mqtt", "mqtt://b", "sparkplug", "rows = \"m\"")).contains("rows"));
     }
 
     #[test]

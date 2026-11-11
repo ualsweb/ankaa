@@ -13,6 +13,7 @@ pub mod fixed;
 pub mod framing;
 pub mod generic;
 pub mod json_scan;
+pub mod sparkplug;
 pub mod symbols;
 
 pub use batch::{BookDelta, BookSnapshot, EventBatch, Side, Trade};

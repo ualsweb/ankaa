@@ -81,3 +81,9 @@ doc = false
 bench = false
 
 [workspace]
+
+[[bin]]
+name = "sparkplug"
+path = "fuzz_targets/sparkplug.rs"
+test = false
+doc = false

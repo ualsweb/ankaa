@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end ingest profile on Linux (the Axion bench VM): broker → ankaad (WAL + segments) → rows.
 #
-#   scripts/e2e-profile.sh <scenario> [--transport mqtt|file] [--format json|json-array]
+#   scripts/e2e-profile.sh <scenario> [--transport mqtt|file] [--format json|json-array|sparkplug]
 #                          [--batch B] [--messages N] [--devices D] [--tls] [--publishers P]
 #
 # Needs: target/release/ankaad (or $ANKAAD), bench/target/release/loadgen, mosquitto (for mqtt), perf.
@@ -30,8 +30,10 @@ out="$root/target/e2e/$scenario"; work="$(mktemp -d)"
 mkdir -p "$out"
 ankaad="${ANKAAD:-$root/target/release/ankaad}"; loadgen="$root/bench/target/release/loadgen"
 token="e2e-profile-token-0123456789"
-per_msg=1; [ "$format" = json-array ] && per_msg="$batch"
+per_msg=1; [ "$format" != json ] && per_msg="$batch"
 expected=$((messages * per_msg))
+# Sparkplug: every device's NBIRTH carries its metrics too
+[ "$format" = sparkplug ] && expected=$((expected + devices * batch))
 # ports of their own per run: a previous ankaad may still be flushing on its way out
 base_port=$(( 20000 + ($$ % 20000) ))
 flight_port=$base_port; metrics_port=$((base_port + 1)); mqtt_port=$((base_port + 2)); tls_port=$((base_port + 3))
@@ -69,9 +71,11 @@ EOF
 fi
 
 # --- source mapping per format --------------------------------------------------------------
+subject="bench/#"; [ "$format" = sparkplug ] && subject='spBv1.0/bench/#'
 case "$format" in
   json) map='map = { ts = "t", dev = "dev", temp = "temp", kw = "kw", ok = "ok" }'; rows='';;
   json-array) map='map = { ts = "t", dev = "$msg.dev", temp = "temp", kw = "kw", ok = "ok" }'; rows='rows = "samples"';;
+  sparkplug) map='map = { ts = "$timestamp", dev = "$node", temp = "$value", kw = "$value", ok = "$historical" }'; rows='';;
   *) echo "unknown format $format" >&2; exit 2;;
 esac
 if [ "$transport" = file ]; then
@@ -82,11 +86,11 @@ elif [ "$tls" = 1 ]; then
   source="kind = \"mqtt\"
 url = \"mqtts://127.0.0.1:$tls_port\"
 tls_ca = \"$work/ca.pem\"
-subject = \"bench/#\""
+subject = \"$subject\""
 else
   source="kind = \"mqtt\"
 url = \"$broker_url\"
-subject = \"bench/#\""
+subject = \"$subject\""
 fi
 cat > "$work/ankaad.toml" <<EOF
 [feed]
@@ -113,7 +117,7 @@ columns = [
 [[sources]]
 name = "load"
 $source
-format = "json"
+format = "$( [ "$format" = sparkplug ] && echo sparkplug || echo json )"
 table = "telemetry"
 ts_unit = "millis"
 max_message_bytes = 1048576

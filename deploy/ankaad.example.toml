@@ -62,6 +62,10 @@ tier_budget_pct = 5
 
 # Query-view swap interval in milliseconds (>= 5). Queries see data up to the last swap.
 snapshot_ms = 50
+# Interrupt moderation of ingest, µs: under steady traffic the ingest loop waits this long
+# between batches so one wake-up takes many messages (invisible to queries, which see rows at
+# the next snapshot). 0 = off, at most 10000.
+ingest_coalesce_us = 200
 
 [server]
 # Arrow Flight (gRPC) bind address. Binding beyond loopback REQUIRES a bearer token.
@@ -129,6 +133,16 @@ token_env = "ANKAA_TOKEN"
 # map = { ts = "t", line = "$topic.1", machine = "$topic.2", temp = "temp" }
 # rows = "samples"                 # optional: one row per element of this array ($msg.<path>
 #                                  # in map reads the message around it)
+#
+# [[sources]]                      # Sparkplug B: one row per metric of every BIRTH and DATA
+# name = "scada"
+# kind = "mqtt"
+# url = "mqtts://broker.plant1:8883"
+# subject = "spBv1.0/plant1/#"
+# format = "sparkplug"
+# table = "scada"                  # columns ts, node, device, metric (dict), value (float64, nullable)
+# map = { ts = "$timestamp", node = "$node", device = "$device", metric = "$metric", value = "$value" }
+# sparkplug_rebirth = false        # true: ask nodes that send DATA before their BIRTH to rebirth
 #
 # [[continuous]]                   # incrementally maintained: cq_btc_1s and cq_btc_1s_live
 # name = "btc_1s"

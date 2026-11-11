@@ -557,6 +557,249 @@ map = {{ ts = "t", line = "$topic.1", machine = "$topic.2", kw = "kw" }}
     pump.abort();
 }
 
+/// Minimal Sparkplug B encoder for the test (protobuf by hand: the server must not depend on a
+/// code generator, and neither does its test).
+mod spb {
+    pub fn varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    fn len(tag: u8, body: &[u8], out: &mut Vec<u8>) {
+        out.push(tag);
+        varint(body.len() as u64, out);
+        out.extend_from_slice(body);
+    }
+    pub enum V<'a> {
+        Double(f64),
+        /// `int_value`: the two's complement of a 32-bit integer
+        Int(i32),
+        Str(&'a str),
+    }
+    /// One metric: name (BIRTH) or alias only (DATA, `datatype` 0 = left out as the
+    /// specification asks).
+    pub fn metric(name: Option<&str>, alias: u64, ts: u64, datatype: u32, v: &V) -> Vec<u8> {
+        let mut m = Vec::new();
+        if let Some(n) = name {
+            len(0x0a, n.as_bytes(), &mut m);
+        }
+        m.push(0x10);
+        varint(alias, &mut m);
+        m.push(0x18);
+        varint(ts, &mut m);
+        if datatype != 0 {
+            m.push(0x20);
+            varint(u64::from(datatype), &mut m);
+        }
+        match v {
+            V::Double(x) => {
+                m.push(0x69);
+                m.extend_from_slice(&x.to_le_bytes());
+            }
+            V::Int(i) => {
+                m.push(0x50);
+                varint(u64::from(*i as u32), &mut m);
+            }
+            V::Str(s) => len(0x7a, s.as_bytes(), &mut m),
+        }
+        m
+    }
+    pub fn payload(ts: u64, seq: u64, metrics: &[Vec<u8>]) -> Vec<u8> {
+        let mut p = vec![0x08];
+        varint(ts, &mut p);
+        for m in metrics {
+            len(0x12, m, &mut p);
+        }
+        p.push(0x18);
+        varint(seq, &mut p);
+        p
+    }
+}
+
+/// Sparkplug B through Mosquitto: DATA that arrives before any BIRTH makes the server ask the
+/// edge node for a rebirth (`NCMD`); BIRTHs define names, datatypes and aliases; DATA by alias
+/// without a datatype is read with the BIRTH's (an `Int32` keeps its sign); after a restart the
+/// aliases still resolve without a new BIRTH (replayed from the log).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::too_many_lines)]
+async fn sparkplug_source_resolves_aliases_and_asks_for_rebirth() {
+    use spb::{V, metric, payload};
+    if !enabled() {
+        eprintln!("skipped: set ANKAA_BROKER_TESTS=1 with an MQTT broker on :1883");
+        return;
+    }
+    let run = std::process::id();
+    let group = format!("g{run}");
+    let dir = tempfile::tempdir().unwrap();
+    let (flight, metrics) = (free_port(), free_port());
+    let config = format!(
+        r#"
+[feed]
+enabled = false
+streams = []
+[server]
+flight_addr = "127.0.0.1:{flight}"
+metrics_addr = "127.0.0.1:{metrics}"
+[storage]
+snapshot_ms = 100
+wal_dir = "{wal}"
+checkpoint_dir = "{ckpt}"
+
+[[tables]]
+name = "scada"
+partition_by = "metric"
+columns = [
+  {{ name = "ts", type = "timestamp_ns" }},
+  {{ name = "node", type = "dict" }},
+  {{ name = "device", type = "dict" }},
+  {{ name = "metric", type = "dict" }},
+  {{ name = "value", type = "float64", nullable = true }},
+  {{ name = "text", type = "dict" }},
+]
+
+[[sources]]
+name = "scada-{run}"
+kind = "mqtt"
+url = "mqtt://127.0.0.1:1883"
+subject = "spBv1.0/{group}/#"
+format = "sparkplug"
+table = "scada"
+sparkplug_rebirth = true
+map = {{ ts = "$timestamp", node = "$node", device = "$device", metric = "$metric", value = "$value", text = "$string" }}
+"#,
+        wal = dir.path().join("wal").display(),
+        ckpt = dir.path().join("ckpt").display(),
+    );
+    let cfg_path = dir.path().join("sparkplug.toml");
+    std::fs::write(&cfg_path, config).unwrap();
+    let start = |name: &str| {
+        let log = dir.path().join(format!("{name}.log"));
+        let server = Server(
+            Command::new(bin())
+                .args(["serve", "--config"])
+                .arg(&cfg_path)
+                .args(["--duration-secs", "120"])
+                .env("ANKAA_TOKEN", "t0k3n")
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(&log).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        (server, log)
+    };
+    // the edge node: publishes, and listens for commands addressed to it
+    let mut opts = rumqttc::MqttOptions::new(format!("edge-{run}"), "127.0.0.1", 1883);
+    opts.set_keep_alive(Duration::from_secs(10));
+    let (client, mut events) = rumqttc::AsyncClient::new(opts, 1_000);
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let pump = tokio::spawn(async move {
+        while let Ok(e) = events.poll().await {
+            if let rumqttc::Event::Incoming(rumqttc::Packet::Publish(p)) = e {
+                let _ = cmd_tx.send(p.topic);
+            }
+        }
+    });
+    client
+        .subscribe(format!("spBv1.0/{group}/NCMD/#"), rumqttc::QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    let send = |kind: &str, device: Option<&str>, p: Vec<u8>| {
+        let topic = match device {
+            Some(d) => format!("spBv1.0/{group}/{kind}/gw1/{d}"),
+            None => format!("spBv1.0/{group}/{kind}/gw1"),
+        };
+        let client = client.clone();
+        async move {
+            client
+                .publish(topic, rumqttc::QoS::AtLeastOnce, false, p)
+                .await
+                .unwrap();
+        }
+    };
+    let base: u64 = 1_762_700_000_000;
+    let data = |from: u64, to: u64| {
+        (from..to)
+            .map(|i| {
+                payload(
+                    base + 10 + i,
+                    i % 256,
+                    &[
+                        metric(None, 1, base + 10 + i, 0, &V::Double(20.0 + i as f64)),
+                        metric(None, 3, base + 10 + i, 0, &V::Int(-(i as i32))),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let (server, log) = start("run1");
+    wait_for(&log, "mqtt connected", Duration::from_secs(20));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // DATA before any BIRTH: refused rows, and a rebirth request to the node
+    send("DDATA", Some("press"), data(0, 1).remove(0)).await;
+    let cmd = tokio::time::timeout(Duration::from_secs(10), cmd_rx.recv())
+        .await
+        .expect("a rebirth request")
+        .unwrap();
+    assert_eq!(cmd, format!("spBv1.0/{group}/NCMD/gw1"));
+
+    // the edge node answers with its BIRTHs, then sends DATA by alias only
+    send(
+        "NBIRTH",
+        None,
+        payload(base, 0, &[metric(Some("Uptime"), 0, base, 4, &V::Int(7))]),
+    )
+    .await;
+    send(
+        "DBIRTH",
+        Some("press"),
+        payload(
+            base + 1,
+            1,
+            &[
+                metric(Some("Temp"), 1, base + 1, 10, &V::Double(19.5)),
+                metric(Some("State"), 2, base + 1, 12, &V::Str("IDLE")),
+                metric(Some("Offset"), 3, base + 1, 3, &V::Int(0)),
+            ],
+        ),
+    )
+    .await;
+    for p in data(0, 50) {
+        send("DDATA", Some("press"), p).await;
+    }
+    let addr = format!("127.0.0.1:{flight}");
+    let wait = Duration::from_secs(20);
+    // 1 + 3 birth rows, 2 per DATA message
+    count_until(&addr, "SELECT count(*) FROM scada", "104", wait);
+    // dict columns hold "" where the selector does not apply: only State has text
+    count_until(
+        &addr,
+        "SELECT count(*) FROM scada s JOIN dictionaries d ON d.\"table\" = 'scada' AND d.\"column\" = 'text' AND d.id = s.text WHERE d.name = 'IDLE'",
+        "1",
+        wait,
+    );
+    // an Int32 sent without its datatype keeps its sign
+    count_until(
+        &addr,
+        "SELECT min(s.value) FROM scada s JOIN dictionaries d ON d.\"table\" = 'scada' AND d.\"column\" = 'metric' AND d.id = s.metric WHERE d.name = 'Offset'",
+        "-49.0",
+        wait,
+    );
+    stop(server);
+
+    // after a restart the aliases resolve from the log, without a new BIRTH
+    let (_server, log) = start("run2");
+    wait_for(&log, "mqtt connected", Duration::from_secs(20));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for p in data(50, 60) {
+        send("DDATA", Some("press"), p).await;
+    }
+    count_until(&addr, "SELECT count(*) FROM scada", "124", wait);
+    pump.abort();
+}
+
 /// MQTT over TLS against a real broker (`scripts/mqtt-tls-broker.sh`): a source that trusts the
 /// broker's private CA connects, one that also presents a client certificate connects to the
 /// mutual-TLS listener, and one that trusts only the public roots is refused and stores nothing.

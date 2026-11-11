@@ -519,7 +519,12 @@ fn generic(c: &mut Criterion) {
                     )
                 })
                 .collect();
-            format!(r#"{{"meta":{{"id":"rack-{}"}},"samples":[{}]}}"#, i % 16, samples.join(",")).into_bytes()
+            format!(
+                r#"{{"meta":{{"id":"rack-{}"}},"samples":[{}]}}"#,
+                i % 16,
+                samples.join(",")
+            )
+            .into_bytes()
         })
         .collect();
     let rows_map: HashMap<String, String> = [
@@ -536,14 +541,140 @@ fn generic(c: &mut Criterion) {
     let mut g = c.benchmark_group("generic_ingest_rows");
     g.throughput(Throughput::Elements(10 * 1024));
     g.bench_function("map_json_rows_10x1024", |b| {
-        let mut m = RowMapper::new(schema.clone(), &rows_map, false, TsUnit::Millis, false, Some("rack"))
-            .unwrap()
-            .with_rows(Some("samples"))
-            .unwrap();
+        let mut m = RowMapper::new(
+            schema.clone(),
+            &rows_map,
+            false,
+            TsUnit::Millis,
+            false,
+            Some("rack"),
+        )
+        .unwrap()
+        .with_rows(Some("samples"))
+        .unwrap();
         let mut dicts = RowMapper::dictionaries_for(&schema);
         b.iter(|| {
             let mut acc = 0u32;
             for msg in &batch {
+                let n = m.parse(black_box(msg), 0, false, &dicts).unwrap();
+                for r in 0..n {
+                    let (key, _) = m.finish_row(r, &mut dicts);
+                    acc = acc.wrapping_add(key);
+                }
+            }
+            acc
+        });
+    });
+    g.finish();
+
+    // Sparkplug B: 1,024 DDATA messages of 20 metrics each, by alias and without a datatype
+    // (as a compliant edge node sends them), after one DBIRTH that defines the aliases
+    fn varint(mut v: u64, out: &mut Vec<u8>) {
+        while v >= 0x80 {
+            out.push((v as u8) | 0x80);
+            v >>= 7;
+        }
+        out.push(v as u8);
+    }
+    fn sp_payload(ts: u64, metrics: &[Vec<u8>]) -> Vec<u8> {
+        let mut p = vec![0x08];
+        varint(ts, &mut p);
+        for m in metrics {
+            p.push(0x12);
+            varint(m.len() as u64, &mut p);
+            p.extend_from_slice(m);
+        }
+        p.extend_from_slice(&[0x18, 7]);
+        p
+    }
+    fn sp_metric(name: Option<&str>, alias: u64, ts: u64, dt: u32, x: f64) -> Vec<u8> {
+        let mut m = Vec::new();
+        if let Some(n) = name {
+            m.push(0x0a);
+            varint(n.len() as u64, &mut m);
+            m.extend_from_slice(n.as_bytes());
+        }
+        m.push(0x10);
+        varint(alias, &mut m);
+        m.push(0x18);
+        varint(ts, &mut m);
+        if dt != 0 {
+            m.push(0x20);
+            varint(u64::from(dt), &mut m);
+        }
+        m.push(0x69);
+        m.extend_from_slice(&x.to_le_bytes());
+        m
+    }
+    let sp_msg = |kind: &str, p: Vec<u8>| {
+        let mut m = format!("spBv1.0/plant/{kind}/gw1/press").into_bytes();
+        m.push(0);
+        m.extend_from_slice(&p);
+        m
+    };
+    let base = 1_762_700_000_000u64;
+    let birth = sp_msg(
+        "DBIRTH",
+        sp_payload(
+            base,
+            &(0..20)
+                .map(|a| sp_metric(Some(&format!("Press/Sensor{a:02}")), a, base, 10, 0.0))
+                .collect::<Vec<_>>(),
+        ),
+    );
+    let sp_batch: Vec<Vec<u8>> = (0..1024u64)
+        .map(|i| {
+            let ts = base + 1 + i;
+            sp_msg(
+                "DDATA",
+                sp_payload(
+                    ts,
+                    &(0..20)
+                        .map(|a| sp_metric(None, a, ts, 0, 20.0 + (i * 20 + a) as f64 * 0.01))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        })
+        .collect();
+    let sp_schema = Schema::new(vec![
+        Field::new("ts", ColumnType::TimestampNs),
+        Field::new("device", ColumnType::DictU32),
+        Field::new("metric", ColumnType::DictU32),
+        Field::nullable("value", ColumnType::Float64),
+    ])
+    .unwrap();
+    let sp_map: HashMap<String, String> = [
+        ("ts", "$timestamp"),
+        ("device", "$device"),
+        ("metric", "$metric"),
+        ("value", "$value"),
+    ]
+    .into_iter()
+    .map(|(a, b)| (a.to_owned(), b.to_owned()))
+    .collect();
+    let mut g = c.benchmark_group("generic_ingest_sparkplug");
+    g.throughput(Throughput::Elements(20 * 1024));
+    g.bench_function("map_ddata_20x1024", |b| {
+        let mut m = RowMapper::new(
+            sp_schema.clone(),
+            &sp_map,
+            false,
+            TsUnit::Millis,
+            false,
+            Some("metric"),
+        )
+        .unwrap()
+        .with_topic_prefix(true)
+        .with_sparkplug(true)
+        .unwrap();
+        let mut dicts = RowMapper::dictionaries_for(&sp_schema);
+        let n = m.parse(&birth, 0, false, &dicts).unwrap();
+        for r in 0..n {
+            m.finish_row(r, &mut dicts);
+        }
+        b.iter(|| {
+            let mut acc = 0u32;
+            for msg in &sp_batch {
                 let n = m.parse(black_box(msg), 0, false, &dicts).unwrap();
                 for r in 0..n {
                     let (key, _) = m.finish_row(r, &mut dicts);

@@ -77,6 +77,12 @@ struct Ingest {
     /// not reach the log (the books would wait for it forever), or the log has outgrown its
     /// budget and can only be truncated behind a new starting point for the books.
     rebase_books: bool,
+    /// LSNs of the Sparkplug definitions frames still in the log, oldest first (see
+    /// [`Self::truncation_point`]).
+    sp_marks: Vec<u64>,
+    /// [`Tables::sparkplug_generation`] when the last definitions frame was handled: a new
+    /// frame is due once the definitions have changed.
+    sp_marked_gen: u64,
     /// Counters of the frames handled since the last [`Self::flush_tally`]: plain integers in
     /// the ingest thread, published to the shared atomics once per batch rather than with
     /// three atomic read-modify-writes per message.
@@ -169,13 +175,23 @@ impl Ingest {
     /// book they produce, depend on the snapshot and the diffs since the connection began. To
     /// regenerate the unpersisted ones after a crash the replay has to start at that
     /// connection, so the log is kept back to the last `connect` at or before `ckpt`.
+    ///
+    /// Sparkplug rows depend on the BIRTH that defined their metrics, which may be days older
+    /// than any checkpoint: with Sparkplug definitions in use, the log is kept back to the last
+    /// definitions frame at or before `ckpt` (a replay from there knows them all).
     fn truncation_point(&mut self, ckpt: u64) -> Option<u64> {
-        if !self.tables.book_sync_active() {
-            return Some(ckpt);
+        let mut at = ckpt;
+        if self.tables.book_sync_active() {
+            let base = self.connects.iter().rev().find(|c| **c <= ckpt).copied()?;
+            self.connects.retain(|c| *c >= base);
+            at = base;
         }
-        let base = self.connects.iter().rev().find(|c| **c <= ckpt).copied()?;
-        self.connects.retain(|c| *c >= base);
-        Some(base)
+        if self.tables.sparkplug_active() {
+            let mark = self.sp_marks.iter().rev().find(|m| **m <= ckpt).copied()?;
+            self.sp_marks.retain(|m| *m >= mark);
+            at = at.min(mark);
+        }
+        Some(at)
     }
 
     fn handle_frame(&mut self, frame: &Frame) {
@@ -191,6 +207,23 @@ impl Ingest {
                     self.tables.on_reconnect();
                     if self.lsn != 0 && self.connects.last().is_none_or(|l| *l < self.lsn) {
                         self.connects.push(self.lsn);
+                    }
+                } else if let Some(entries) =
+                    ankaa_feeds::capture::split_sparkplug_defs(&frame.payload)
+                {
+                    // the definitions as of this point of the log: what a replay that starts
+                    // here needs to read the Sparkplug DATA messages after it
+                    match self.tables.restore_sparkplug(&entries) {
+                        Ok(()) => {
+                            if self.lsn != 0 && self.sp_marks.last().is_none_or(|l| *l < self.lsn) {
+                                self.sp_marks.push(self.lsn);
+                            }
+                            self.sp_marked_gen = self.tables.sparkplug_generation();
+                        }
+                        Err(e) => {
+                            self.metrics.frames_bad.fetch_add(1, Ordering::Relaxed);
+                            warn!(error = %e, "sparkplug definitions frame rejected");
+                        }
                     }
                 } else if let Some((id, name)) =
                     ankaa_feeds::capture::split_source_id(&frame.payload)
@@ -351,6 +384,8 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         connects: Vec::new(),
         rebase_books: false,
         tally: Tally::default(),
+        sp_marks: Vec::new(),
+        sp_marked_gen: 0,
     };
 
     // User-defined tables, their sources and the continuous queries (before recovery so that
@@ -415,6 +450,7 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         .with_max_dict_entries(t.max_dict_entries)
         .with_topic_prefix(s.kind == SourceKind::Mqtt)
         .with_rows(s.rows.as_deref())
+        .and_then(|m| m.with_sparkplug(s.format == SourceFormat::Sparkplug))
         .map_err(|e| anyhow::anyhow!("source {}: {e}", s.name))?;
         // ids are stable across restarts and config edits: WAL frames name their source by id
         let id = ingest.states.id_for(&s.name)?;
@@ -446,6 +482,7 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 cert: s.tls_cert.clone(),
                 key: s.tls_key.clone(),
             },
+            sparkplug_rebirth: s.sparkplug_rebirth,
         };
         // a bad certificate file stops the start, with the reason, rather than the source later
         if s.kind == SourceKind::Mqtt && s.url.starts_with("mqtts://") {
@@ -845,6 +882,10 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let mut last_dict_register = Instant::now();
     let mut last_wal_check = Instant::now();
     let mut last_rebase: Option<Instant> = None;
+    // Sparkplug definitions frames: when the last was written, and the newest checkpoint
+    let mut last_sp_mark: Option<Instant> = None;
+    let mut last_ckpt = 0u64;
+    let sp_mark_every = Duration::from_secs(cfg.storage.checkpoint_interval_s.max(1));
     let wal_budget = cfg.storage.wal_budget_mib.saturating_mul(1024 * 1024);
     if opts.api_key.is_some() && cfg.feed.url.starts_with("ws://") && cfg.feed.enabled && !standby {
         anyhow::bail!("an exchange API key must not be sent over ws:// (clear text); use wss://");
@@ -1008,11 +1049,35 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                             info!("order books are being re-based on fresh snapshots");
                         }
                     }
-                    if let Some(ckpt) = tiering.tick(&ingest.tables, &metrics)
+                    // Sparkplug definitions into the log, so that truncation can pass the BIRTHs
+                    // they came from: when they changed, or when the last such frame holds
+                    // truncation back, at most once per checkpoint interval
+                    if !standby
                         && let Some(w) = &wal
-                        && let Some(at) = ingest.truncation_point(ckpt)
+                        && ingest.tables.sparkplug_active()
+                        && last_sp_mark.is_none_or(|t| t.elapsed() >= sp_mark_every)
+                        && (ingest.tables.sparkplug_generation() != ingest.sp_marked_gen
+                            || ingest.sp_marks.last().is_none_or(|m| *m < last_ckpt))
                     {
-                        w.truncate_before(at);
+                        let frame = Frame {
+                            recv_ns: now_ns(),
+                            kind: FrameKind::Control,
+                            payload: ingest.tables.sparkplug_defs_payload(),
+                        };
+                        if !wal_writer::WalHandle::too_large(&frame, &metrics)
+                            && let Some(lsn) = w.push(frame.clone(), &metrics)
+                        {
+                            ingest.handle_frame_lsn(&frame, lsn);
+                            last_sp_mark = Some(Instant::now());
+                        }
+                    }
+                    if let Some(ckpt) = tiering.tick(&ingest.tables, &metrics) {
+                        last_ckpt = last_ckpt.max(ckpt);
+                        if let Some(w) = &wal
+                            && let Some(at) = ingest.truncation_point(ckpt)
+                        {
+                            w.truncate_before(at);
+                        }
                     }
                 }
                 // source positions whose frames are durable by now
@@ -1507,6 +1572,8 @@ mod tests {
             connects: Vec::new(),
             rebase_books: false,
             tally: Tally::default(),
+            sp_marks: Vec::new(),
+            sp_marked_gen: 0,
         }
     }
 
@@ -1519,6 +1586,88 @@ mod tests {
     }
 
     const DEPTH: &[u8] = br#"{"stream":"btcusdt@depth@100ms","data":{"e":"depthUpdate","E":1794231662214,"s":"BTCUSDT","U":100,"u":105,"b":[["74663.56000000","0.00015000"]],"a":[["74670.00000000","0.00000000"]]}}"#;
+
+    /// Sparkplug rows depend on the BIRTH that defined their metrics: once a source holds
+    /// definitions, the log is only truncated up to a definitions frame at or before the
+    /// checkpoint, and older such frames are forgotten once passed.
+    #[test]
+    fn wal_truncation_keeps_the_sparkplug_definitions() {
+        use ankaa_store::{ColumnType, Field, Schema};
+        let mut i = ingest(false);
+        let schema = Schema::new(vec![
+            Field::new("ts", ColumnType::TimestampNs),
+            Field::new("metric", ColumnType::DictU32),
+            Field::nullable("value", ColumnType::Float64),
+        ])
+        .unwrap();
+        let t = i.tables.add_user_table("scada", schema.clone(), None, 0);
+        let map: std::collections::HashMap<String, String> = [
+            ("ts", "$timestamp"),
+            ("metric", "$metric"),
+            ("value", "$value"),
+        ]
+        .into_iter()
+        .map(|(a, b)| (a.to_owned(), b.to_owned()))
+        .collect();
+        let mapper = RowMapper::new(schema, &map, false, TsUnit::Millis, true, None)
+            .unwrap()
+            .with_topic_prefix(true)
+            .with_sparkplug(true)
+            .unwrap();
+        i.tables.add_source(0, "scada", t, mapper, false);
+        assert_eq!(i.truncation_point(500), Some(500), "no definitions yet");
+        // an NBIRTH: metric "T", alias 0, Double 1.5
+        let mut metric = vec![0x0a, 1, b'T', 0x10, 0, 0x20, 10, 0x69];
+        metric.extend_from_slice(&1.5f64.to_le_bytes());
+        let mut msg = b"spBv1.0/g/NBIRTH/n\0".to_vec();
+        msg.extend_from_slice(&[0x12, u8::try_from(metric.len()).unwrap()]);
+        msg.extend_from_slice(&metric);
+        let birth = Frame {
+            recv_ns: 1,
+            kind: FrameKind::User,
+            payload: ankaa_feeds::capture::user_payload(0, &msg),
+        };
+        i.handle_frame_lsn(&birth, 5);
+        assert!(i.tables.sparkplug_active());
+        assert_eq!(i.truncation_point(500), None, "the BIRTH at 5 must stay");
+        let mark = |i: &mut Ingest, lsn| {
+            let f = Frame {
+                recv_ns: 1,
+                kind: FrameKind::Control,
+                payload: i.tables.sparkplug_defs_payload(),
+            };
+            i.handle_frame_lsn(&f, lsn);
+        };
+        mark(&mut i, 100);
+        assert_eq!(i.sp_marked_gen, i.tables.sparkplug_generation());
+        assert_eq!(i.truncation_point(50), None);
+        assert_eq!(i.truncation_point(500), Some(100));
+        mark(&mut i, 400);
+        assert_eq!(i.truncation_point(300), Some(100));
+        assert_eq!(i.truncation_point(500), Some(400));
+        assert_eq!(i.sp_marks, vec![400]);
+        // the frame restores what it holds: a fresh server knows alias 0 without the BIRTH
+        let payload = i.tables.sparkplug_defs_payload();
+        let mut fresh = ingest(false);
+        let schema = i.tables.user[0].table.schema().clone();
+        let t = fresh
+            .tables
+            .add_user_table("scada", schema.clone(), None, 0);
+        let mapper = RowMapper::new(schema, &map, false, TsUnit::Millis, true, None)
+            .unwrap()
+            .with_topic_prefix(true)
+            .with_sparkplug(true)
+            .unwrap();
+        fresh.tables.add_source(0, "scada", t, mapper, false);
+        let f = Frame {
+            recv_ns: 1,
+            kind: FrameKind::Control,
+            payload,
+        };
+        fresh.handle_frame_lsn(&f, 7);
+        assert!(fresh.tables.sparkplug_active());
+        assert_eq!(fresh.sp_marks, vec![7]);
+    }
 
     /// Book rows can only be regenerated by replaying from the connection they belong to, so
     /// with synchronised books the log is kept back to the last `connect` at or before the

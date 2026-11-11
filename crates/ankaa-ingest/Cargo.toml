@@ -13,11 +13,16 @@ publish.workspace = true
 ankaa-store.workspace = true
 thiserror.workspace = true
 memchr = "2"
+# word-at-a-time hashing for the dictionaries (folded 64×64→128-bit multiply; zero dependencies)
+foldhash = "0.2"
 
 [dev-dependencies]
 proptest.workspace = true
 # reference parser for the scanner's differential test only
 serde_json.workspace = true
+# reference protobuf codec for the Sparkplug decoder's differential test only
+prost = "0.14"
+
 
 [lints]
 workspace = true

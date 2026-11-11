@@ -209,7 +209,10 @@ and their files deleted; nothing has to be scheduled.
    ask for one ([details](../generic-ingest.md)).
 3. Adjust the `$topic.N` positions to your hierarchy and the column list and JSON paths to your
    payload. A reading that does not match is counted in `ankaa_user_rejected_total` and logged at debug
-   level, never fatal.
+   level, never fatal. If your gateways publish **Sparkplug B** (`spBv1.0/...` topics) instead of
+   JSON, use `format = "sparkplug"` with `$metric`, `$value`, `$timestamp`, `$node` and `$device`
+   in `map`: one row per metric, aliases resolved from the BIRTH messages
+   ([details](../generic-ingest.md#sparkplug-b-format--sparkplug)).
 4. Run the container with your file mounted:
 
    ```sh

@@ -78,11 +78,12 @@ The schema is `crates/ankaa-core/src/config.rs`. All fields, with defaults:
 | `query_timeout_s` | `30` | — | Wall-clock budget per query (planning + execution + transfer). |
 | `resources.query_memory_mib` | `1024` | — | DataFusion memory pool for queries (≥ 64); a query beyond it fails instead of aborting the process. |
 | `[[tables]]` | — | — | User-defined tables (`name`, `columns`, `partition_by`, `max_dict_entries`); see `docs/generic-ingest.md`. |
-| `[[sources]]` | — | — | NATS / Kafka / file sources mapping messages onto a user table (`kind`, `url`, `subject`, `format`, `table`, `map`, `ts_unit`, `ts_from_receive`, `max_message_bytes`, `start`). File and Kafka positions are kept in `sources.json` in `wal_dir` (or `checkpoint_dir`). |
+| `[[sources]]` | — | — | MQTT / NATS / Kafka / file sources mapping messages onto a user table (`kind`, `url`, `subject`, `format` = json/csv/sparkplug, `table`, `map`, `ts_unit`, `ts_from_receive`, `max_message_bytes`, `start`, `rows`, `tls_ca`/`tls_cert`/`tls_key`, `sparkplug_rebirth`; see `docs/generic-ingest.md`). File and Kafka positions are kept in `sources.json` in `wal_dir` (or `checkpoint_dir`). |
 | `[[continuous]]` | — | — | Continuous queries (`name`, `kind` = ohlcv/percentiles/asof, `table`, `key`, `value`, `size`, `width_ns`, `quantiles`, `right_table`, `max_rows`); see `docs/continuous-queries.md`. |
 | `replication.standby_of` | unset | `--standby-of` | Run as a read-only standby of this primary's Flight address; needs `storage.wal_dir`. `primary_token_env`, `primary_tls_ca`, `primary_tls_domain` refine it; see `docs/replication.md`. |
 | `replication.serve_wal` | `false` | — | Serve this node's WAL to standbys (Flight ticket `__wal__:<lsn>`); needs `storage.wal_dir`. `replication.token_env` names the variable holding the token standbys must present (recommended), `replication.max_standbys` (default 4) caps concurrent streams. |
 | `snapshot_ms` | `50` | `--snapshot-ms` | Interval of the query-view swap: a row is queryable at the latest this long after it was ingested. Must be ≥ 5. A swap copies only the rows that arrived since the previous one, so a short interval is cheap. |
+| `ingest_coalesce_us` | `200` | — | Interrupt moderation of the ingest loop (as a network card's `rx-usecs`): while frames arrive more often than once per millisecond and the queue is drained, the loop waits this long before the next batch, so one wake-up takes many frames instead of one. Saves the per-message thread wake-ups (on a VM, an inter-processor interrupt each); a backlog (a full batch of 1,024) or a quiet source never waits. Not visible to queries, which see rows at the next snapshot. 0 = off; at most 10,000. |
 
 ### `[server]`
 

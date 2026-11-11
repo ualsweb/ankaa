@@ -100,6 +100,42 @@ pub fn split_source_id(payload: &[u8]) -> Option<(u16, &str)> {
     (!name.is_empty()).then_some((id, name))
 }
 
+/// Prefix of the control frame that records the Sparkplug definitions of every Sparkplug
+/// source (see [`sparkplug_defs_payload`]).
+pub const SPARKPLUG_DEFS_PREFIX: &[u8] = b"sp-defs:";
+
+/// Payload of a [`FrameKind::Control`] frame holding the Sparkplug BIRTH definitions of the
+/// sources as of its place in the log: `sp-defs:` + per source `[u16 LE id][u32 LE len]` + the
+/// encoded definitions. A replay that starts at it can read the DATA messages after it without
+/// the BIRTHs before it, so the log may be truncated up to it.
+#[must_use]
+pub fn sparkplug_defs_payload<'a>(sources: impl IntoIterator<Item = (u16, &'a [u8])>) -> Bytes {
+    let mut v = SPARKPLUG_DEFS_PREFIX.to_vec();
+    for (id, defs) in sources {
+        v.extend_from_slice(&id.to_le_bytes());
+        v.extend_from_slice(&(defs.len() as u32).to_le_bytes());
+        v.extend_from_slice(defs);
+    }
+    Bytes::from(v)
+}
+
+/// Split a Sparkplug-definitions payload into `(source id, encoded definitions)` entries;
+/// `None` when it is not one or is malformed.
+#[must_use]
+pub fn split_sparkplug_defs(payload: &[u8]) -> Option<Vec<(u16, &[u8])>> {
+    let mut rest = payload.strip_prefix(SPARKPLUG_DEFS_PREFIX)?;
+    let mut out = Vec::new();
+    while !rest.is_empty() {
+        let head = rest.get(..6)?;
+        let id = u16::from_le_bytes([head[0], head[1]]);
+        let len = u32::from_le_bytes([head[2], head[3], head[4], head[5]]) as usize;
+        let body = rest.get(6..6usize.checked_add(len)?)?;
+        out.push((id, body));
+        rest = &rest[6 + len..];
+    }
+    Some(out)
+}
+
 impl FrameKind {
     fn from_u8(b: u8) -> Option<Self> {
         match b {

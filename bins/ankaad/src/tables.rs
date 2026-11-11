@@ -184,6 +184,66 @@ impl Tables {
         });
     }
 
+    /// True when a Sparkplug source holds definitions: DATA messages in the log may then
+    /// depend on BIRTHs before them, and the log is only truncated up to a definitions frame.
+    pub fn sparkplug_active(&self) -> bool {
+        self.sources.iter().flatten().any(|s| {
+            s.mapper
+                .sparkplug_definitions()
+                .is_some_and(|d| !d.is_empty())
+        })
+    }
+
+    /// Sum of the change counters of every Sparkplug source's definitions.
+    pub fn sparkplug_generation(&self) -> u64 {
+        self.sources
+            .iter()
+            .flatten()
+            .filter_map(|s| s.mapper.sparkplug_definitions())
+            .map(ankaa_ingest::sparkplug::Definitions::generation)
+            .sum()
+    }
+
+    /// The payload of a definitions frame for every Sparkplug source (see
+    /// [`ankaa_feeds::capture::sparkplug_defs_payload`]).
+    pub fn sparkplug_defs_payload(&self) -> bytes::Bytes {
+        let encoded: Vec<(u16, Vec<u8>)> = self
+            .sources
+            .iter()
+            .enumerate()
+            .filter_map(|(id, s)| {
+                let d = s.as_ref()?.mapper.sparkplug_definitions()?;
+                let mut buf = Vec::new();
+                d.encode(&mut buf);
+                Some((u16::try_from(id).ok()?, buf))
+            })
+            .collect();
+        ankaa_feeds::capture::sparkplug_defs_payload(
+            encoded.iter().map(|(id, b)| (*id, b.as_slice())),
+        )
+    }
+
+    /// Replace the Sparkplug definitions of the sources named in a definitions frame. Sources
+    /// that are gone or no longer Sparkplug are skipped; a malformed entry is reported.
+    pub fn restore_sparkplug(&mut self, entries: &[(u16, &[u8])]) -> Result<(), String> {
+        for (id, bytes) in entries {
+            let Some(s) = self
+                .sources
+                .get_mut(usize::from(*id))
+                .and_then(Option::as_mut)
+            else {
+                continue;
+            };
+            if s.mapper.sparkplug_definitions().is_none() {
+                continue;
+            }
+            let defs = ankaa_ingest::sparkplug::Definitions::decode(bytes)
+                .map_err(|e| format!("source {}: {}", s.name, e.0))?;
+            s.mapper.set_sparkplug_definitions(defs);
+        }
+        Ok(())
+    }
+
     /// Distinct values across the dictionaries of user tables.
     pub fn dictionary_values(&self) -> usize {
         self.user

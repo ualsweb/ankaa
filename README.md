@@ -49,7 +49,7 @@ SELECT count(*) FROM power WHERE kw IS NULL;                        -- readings 
 ```mermaid
 flowchart LR
     A[Exchange feeds<br/>Binance JSON · SBE<br/>Databento DBN] --> B[Decode<br/>fixed-point, zero-copy]
-    K[MQTT · Kafka · NATS · files<br/>JSON · CSV] --> B
+    K[MQTT · Kafka · NATS · files<br/>JSON · CSV · Sparkplug B] --> B
     B --> C[Order-book sync<br/>for market data]
     B --> D[(Hot columnar store<br/>1,024-row vectors)]
     C --> D
@@ -66,7 +66,7 @@ flowchart LR
 | Capability | What you get |
 |---|---|
 | **Market-data ingest** | Binance WebSocket (JSON and SBE binary), REST depth snapshots aligned with diffs, sequence-gap detection and resync; replay of captures and Databento DBN files through the same code path |
-| **Bring your own feed** | Declare a table (`timestamp_ns`, `fixed8`, `int64`, `dict`, `u8`, `float64`, any of them `nullable`) and feed it from **MQTT** (TLS and client certificates, topic segments as columns, persistent sessions), **Kafka** (saved offsets), **NATS** or files, JSON or CSV, one row per message or one per element of a batch (`rows`), with exact decimal parsing ([guide](docs/generic-ingest.md)) |
+| **Bring your own feed** | Declare a table (`timestamp_ns`, `fixed8`, `int64`, `dict`, `u8`, `float64`, any of them `nullable`) and feed it from **MQTT** (TLS and client certificates, topic segments as columns, persistent sessions, **Sparkplug B** with BIRTH aliases and datatypes), **Kafka** (saved offsets), **NATS** or files, JSON, CSV or Sparkplug B, one row per message, per element of a batch (`rows`) or per Sparkplug metric, with exact decimal parsing ([guide](docs/generic-ingest.md)) |
 | **Time semantics** | Per-key watermarks; a bounded lateness window per table inserts late readings at their place in time (gateways that buffer, devices that reconnect); event-time continuous queries that rebuild to the same result after a crash ([time semantics](docs/temporal-architecture.md)) |
 | **Continuous queries** | OHLCV bars, quantiles and ASOF joins maintained incrementally as rows arrive, readable as ordinary tables (`cq_<name>`, `cq_<name>_live`) ([guide](docs/continuous-queries.md)) |
 | **Exact order books** | L2 books rebuilt from snapshot + diffs, top of book once per exchange message, crossed-book detection |
@@ -292,7 +292,7 @@ The project is maintained by an independent engineer with a background in teleco
 | `percentiles(table, column, 'q1,q2,…' [, key])` | Streaming quantiles (UDDSketch, 1 % relative error) |
 | `vwap(price, size)` | Aggregate: volume-weighted average price with exact integer sums |
 
-**Inputs:** MQTT topic filters, Kafka topics and NATS subjects (JSON or CSV); live Binance JSON and SBE streams; `.ankc` captures (`ankaa-capture` records them); Databento `.dbn`/`.dbn.zst`; `.csv` and `.parquet` trade files; NDJSON/CSV files; user-defined binary feeds through the framing helper.
+**Inputs:** MQTT topic filters (JSON, CSV or Sparkplug B), Kafka topics and NATS subjects (JSON or CSV); live Binance JSON and SBE streams; `.ankc` captures (`ankaa-capture` records them); Databento `.dbn`/`.dbn.zst`; `.csv` and `.parquet` trade files; NDJSON/CSV files; user-defined binary feeds through the framing helper.
 
 **Configuration:** `ankaad serve --config file.toml`; `ankaad config print` shows defaults, `ankaad config check` validates without side effects. Annotated example: [`deploy/ankaad.example.toml`](deploy/ankaad.example.toml).
 

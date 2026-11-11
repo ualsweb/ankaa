@@ -56,6 +56,9 @@ pub struct SourceOpts {
     pub client_id: Option<String>,
     /// TLS files of an `mqtts://` source.
     pub tls: TlsFiles,
+    /// MQTT Sparkplug: ask edge nodes whose DATA arrives before their BIRTH to publish the
+    /// BIRTH again (`NCMD`, `Node Control/Rebirth`).
+    pub sparkplug_rebirth: bool,
 }
 
 /// TLS material of a source, as paths to PEM files (read when the source starts).
@@ -77,11 +80,12 @@ impl Default for SourceOpts {
             resume: None,
             client_id: None,
             tls: TlsFiles::default(),
+            sparkplug_rebirth: false,
         }
     }
 }
 
-fn now_ns() -> i64 {
+pub(crate) fn now_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_nanos()).unwrap_or(i64::MAX))

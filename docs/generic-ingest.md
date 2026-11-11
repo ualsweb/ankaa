@@ -68,7 +68,7 @@ name = "racks"
 kind = "nats"                        # mqtt | nats | kafka | file
 url = "nats://127.0.0.1:4222"        # MQTT: mqtt://host:1883; Kafka: bootstrap servers; file: a path
 subject = "racks.>"                  # MQTT topic filter, NATS subject or Kafka topic
-format = "json"                      # json | csv
+format = "json"                      # json | csv | sparkplug (MQTT)
 table = "telemetry"
 ts_unit = "millis"                   # seconds | millis | micros | nanos | rfc3339
 map = { ts = "meta.time", rack = "meta.id", temp = "temp", ok = "ok", load = "load" }
@@ -129,6 +129,79 @@ nothing is allocated per message. Values on a mapped path are checked against th
 unmapped parts are checked for structure (balanced brackets, terminated strings), the way
 on-demand JSON parsers work. Nesting deeper than 128 levels is refused. Numbers are converted
 with correctly rounded parsing (`fixed8` columns with exact decimal parsing).
+
+### Sparkplug B (`format = "sparkplug"`)
+
+Sparkplug B is the MQTT payload of most industrial gateways and SCADA systems (Ignition, Kepware,
+Cirrus Link, the Eclipse Tahu libraries): a protobuf message with a list of metrics, each with a
+name or an alias, a datatype, a timestamp and a value. An MQTT source with
+`format = "sparkplug"` stores one row per metric of every BIRTH and DATA message:
+
+```toml
+[[tables]]
+name = "scada"
+partition_by = "metric"
+columns = [
+  { name = "ts",     type = "timestamp_ns" },
+  { name = "node",   type = "dict" },
+  { name = "device", type = "dict" },
+  { name = "metric", type = "dict" },
+  { name = "value",  type = "float64", nullable = true },
+  { name = "text",   type = "dict" },
+]
+
+[[sources]]
+name = "plant1"
+kind = "mqtt"
+url = "mqtts://broker.plant1:8883"
+subject = "spBv1.0/plant1/#"
+format = "sparkplug"
+table = "scada"
+# sparkplug_rebirth = true           # ask nodes whose DATA comes before their BIRTH to rebirth
+map = { ts = "$timestamp", node = "$node", device = "$device", metric = "$metric", value = "$value", text = "$string" }
+```
+
+| Selector | Value |
+|---|---|
+| `$metric` | metric name; for a DATA message that sends only the alias, the name its BIRTH gave |
+| `$value` | the value. Numeric columns take integers, floats and booleans (0/1); a string value is `NULL` there. A `dict` column takes any value as text |
+| `$string` | the value when it is a string (`String`, `Text`, `UUID`), otherwise none |
+| `$timestamp` | the metric's timestamp, else the payload's (milliseconds since the epoch; `ts_unit` does not apply) |
+| `$datatype` | the Sparkplug datatype code |
+| `$historical` | 1 for a historical value (sent late from the node's buffer), else 0 |
+| `$seq` | the payload's sequence number (0–255) |
+| `$group`, `$node`, `$device`, `$type` | from the topic `spBv1.0/<group>/<type>/<node>[/<device>]`; `$device` is none for node-level metrics |
+| `$topic`, `$topic.N` | as for any MQTT source |
+
+- **Definitions.** A BIRTH (`NBIRTH`, `DBIRTH`) defines each metric: its datatype, whether it is
+  transient, and the alias that later DATA messages may use instead of the name. A compliant edge
+  node leaves the datatype out of DATA messages, so the server remembers the definitions per edge
+  node and reads every DATA metric with them (an `Int32` sent as its 32-bit two's complement keeps
+  its sign). An `NBIRTH` replaces what the node and its devices defined before; a `DBIRTH`
+  replaces the device's metrics.
+- **Not stored:** transient metrics (the specification says hosts do not historise them),
+  `NDEATH`/`DDEATH`, commands (`NCMD`, `DCMD`), `STATE`, and topics outside `spBv1.0`. Metrics
+  whose datatype has no scalar value (`DataSet`, `Template`, `Bytes`, `File`, arrays) are refused
+  and counted; the other metrics of the message are stored. A DATA metric whose alias no BIRTH has
+  defined is refused and counted.
+- **Where a selector does not apply** (`$device` of a node metric, `$string` of a number), a
+  nullable numeric column holds `NULL` and a `dict` column the empty string `''` (a dictionary
+  key always holds a value).
+- **Restarts and truncation.** BIRTH messages may be days older than any checkpoint. The server
+  writes the definitions of its Sparkplug sources into the write-ahead log (at most once per
+  `checkpoint_interval_s`, when they changed or when they hold truncation back) and truncates the
+  log only up to the newest such record: a restart, a crash or a standby reads DATA messages by
+  alias without waiting for a new BIRTH.
+- **`sparkplug_rebirth = true`** makes the server publish a rebirth request (`NCMD` with
+  `Node Control/Rebirth` = true, QoS 0) to an edge node whose DATA arrives before any BIRTH from
+  it since the server started, at most once per 30 s per node. The broker account needs permission
+  to publish on `spBv1.0/<group>/NCMD/<node>`. Off by default: the server is otherwise a read-only
+  subscriber.
+- Compressed payloads (the optional `algorithm` metric of Sparkplug 3.0) are not supported: they
+  do not decode as metrics and the message is refused.
+- Decoding reads the protobuf bytes once, in place: names and strings are slices of the message,
+  numbers come from their varint or fixed-width fields, and nothing is allocated per metric.
+  Limits: 65,536 metrics per message, 1,000,000 definitions per source, names up to 1 KiB.
 
 ### How values are converted
 
