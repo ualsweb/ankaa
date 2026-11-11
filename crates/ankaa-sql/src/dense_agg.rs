@@ -306,6 +306,30 @@ struct Shared {
 /// No group has this key yet.
 const UNSEEN: u32 = u32::MAX;
 
+/// The time-bucket key, its width and the timestamps of `batch` when that key is the only one
+/// that varies in the batch (every other key is fixed): the common shape over a table
+/// partitioned by its key column.
+fn only_bucket<'a>(
+    shared: &'a Shared,
+    batch: &'a RecordBatch,
+    fixed: &[Option<usize>],
+) -> Option<(&'a Key, i64, &'a [i64])> {
+    let mut open = shared
+        .keys
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| !fixed.get(*k).is_some_and(Option::is_some));
+    let (Some((_, key)), None) = (open.next(), open.next()) else {
+        return None;
+    };
+    let ts = batch
+        .column(key.col)
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .filter(|ts| ts.null_count() == 0)?;
+    Some((key, key.bucket?, ts.values()))
+}
+
 /// The aggregation state of one task (or of the whole query, after merging).
 ///
 /// Groups are numbered in the order their keys first appear, as a hash aggregate numbers
@@ -390,6 +414,10 @@ impl Partial {
             return Ok(());
         }
         let base: usize = fixed.iter().flatten().sum();
+        if let Some((key, width, ts)) = only_bucket(shared, batch, fixed) {
+            self.groups_by_bucket_runs(ts, key, width, base)?;
+            return self.accumulate(shared, batch);
+        }
         self.idx.clear();
         self.idx.resize(n, base);
         for (k, key) in shared.keys.iter().enumerate() {
@@ -467,9 +495,60 @@ impl Partial {
                 }
             }
         }
+        self.accumulate(shared, batch)
+    }
+
+    /// Feed the batch to the accumulators, with the group of every row in `self.groups`.
+    fn accumulate(&mut self, shared: &Shared, batch: &RecordBatch) -> Result<()> {
         let total = self.key_of.len();
         for (acc, args) in self.accs.iter_mut().zip(&shared.args) {
             acc.update_batch(&eval(args, batch)?, &self.groups, None, total)?;
+        }
+        Ok(())
+    }
+
+    /// The group of every row when the only key that varies in the batch is the time bucket
+    /// `key`: rows of one bucket follow each other (a chunk is in time order), so the work is
+    /// per run of rows, not per row. A run is found by comparing timestamps with the bucket's
+    /// end (a loop with nothing carried from one row to the next), its group is looked up
+    /// once, and the rows are filled with it. Rows out of time order only make shorter runs.
+    fn groups_by_bucket_runs(
+        &mut self,
+        ts: &[i64],
+        key: &Key,
+        width: i64,
+        base: usize,
+    ) -> Result<()> {
+        self.groups.clear();
+        self.groups.resize(ts.len(), 0);
+        let mut i = 0;
+        while let Some(&t) = ts.get(i) {
+            let nth = t.wrapping_sub(key.lo).div_euclid(width);
+            // a value outside the range the statistics promised is an error, never an
+            // out-of-bounds slot
+            let Some(d) = usize::try_from(nth).ok().filter(|d| *d < key.size) else {
+                return internal_err!(
+                    "dense aggregation: a key value lies outside the range of its statistics"
+                );
+            };
+            let from = key.lo.wrapping_add(nth.wrapping_mul(width));
+            let to = from.saturating_add(width);
+            let len = ts[i..]
+                .iter()
+                .take_while(|&&x| x >= from && x < to)
+                .count()
+                .max(1);
+            let dense = base.wrapping_add(d.wrapping_mul(key.stride));
+            let Some(&slot) = self.slot_of.get(dense) else {
+                return internal_err!("dense aggregation: key outside the table of groups");
+            };
+            let group = if slot == UNSEEN {
+                self.group(dense)
+            } else {
+                slot as usize
+            };
+            self.groups[i..i + len].fill(group);
+            i += len;
         }
         Ok(())
     }
