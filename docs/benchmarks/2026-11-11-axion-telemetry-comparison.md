@@ -79,8 +79,8 @@ ANKAA is fastest on 12 of the 15 and level with TimescaleDB on one more. It lose
   five newest minutes directly; ANKAA aggregates every minute before the end time and then takes five.
   Against TimescaleDB's columnstore (44 ms) and QuestDB (9.4 ms) ANKAA is ahead.
 
-The same queries after a restart of ANKAA (everything read from segment files, then held in the segment
-cache) are measured by `scripts/profile-telemetry.sh`; see the table at the end.
+After a restart ANKAA answers the same (everything is read from its segment file once, then held in the
+segment cache): the table at the end has both.
 
 ## What the morning looked like, and why
 
@@ -144,20 +144,37 @@ Measured and left as it is, with the reason:
 
 ### After a restart
 
-`scripts/profile-telemetry.sh` on the build before the last two changes (cached segments read like warm
-chunks, full compaction; 5,289 chunks at the time), client-observed medians in ms. The run with the final
-build is still to be done and will replace this table.
+The same statements with `scripts/profile-telemetry.sh` on the final build, on the server that loaded the
+data and on the same server after a restart (1.26 s until it serves the 25.9 M rows again; every chunk
+is then read from its segment file once and held in the segment cache). Client-observed medians, ms.
+Before the segment cache and compaction a restarted server answered the large scans 3 to 8 times slower
+than a loaded one.
 
 | Statement | Loaded | Restarted |
 |---|---:|---:|
-| single-groupby-1-1-1 | 0.74 | 0.83 |
-| double-groupby-1 | 36.3 | 89.7 |
-| high-cpu-all | 168 | 858 |
-| lastpoint / `latest('cpu', 'hostname')` | 1.90 | 0.79 |
-| `count(*)` | 0.95 | 0.58 |
-| `hostname LIKE 'host_1%'` | 0.74 | 0.57 |
-| `gapfill` (1,000 hosts, one hour by minute) | 14.7 | 71.9 |
-| `SELECT 1` | 0.33 | 0.32 |
+| single-groupby-1-1-1 | 0.72 | 0.70 |
+| cpu-max-all-8 | 1.02 | 1.00 |
+| double-groupby-1 | 14.8 | 14.6 |
+| double-groupby-all | 60.1 | 58.9 |
+| high-cpu-all (384,179 rows) | 61.6 | 62.3 |
+| lastpoint / `latest('cpu', 'hostname')` | 0.77 | 0.75 |
+| `count(*)` over 25.9 M rows | 0.40 | 0.40 |
+| `GROUP BY region, datacenter` over all rows | 58.5 | 58.2 |
+| `region = … AND usage_user > 50`, all rows | 3.22 | 3.16 |
+| `hostname LIKE 'host_1%'` | 0.52 | 0.52 |
+| `gapfill` (1,000 hosts, one hour by minute, 60,000 rows) | 12.1 | 12.2 |
+| `ORDER BY ts DESC LIMIT 100`, one host | 0.48 | 0.48 |
+| `SELECT 1` (the round trip itself) | 0.31 | 0.31 |
+
+### Where a load spends its time
+
+The same script profiles the load alone (25.9 M CSV rows in 25.4 s with the profiler attached). By
+thread: the ingest loop 30 %, the encode thread 26 %, the two mapping workers 13 % each, the file source
+13 %, the log thread 5 %. The ingest loop is the thread that cannot be spread yet, and its time is the
+row-by-row append: `Column::push` (4.5 %), `Mapped::resolve` and `apply_rows` (4.9 %), `Chunk::check_types`
+and `append_row` (2.4 %), one value at a time through an enum for 21 columns. Appending a mapped message
+column by column, and one writer per group of partitions (RFC-0001 stage 2), is the next step for ingest;
+`RowMapper::parse` (8.7 %) already runs on the workers.
 
 ## Reproduce
 
