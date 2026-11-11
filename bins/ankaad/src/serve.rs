@@ -565,7 +565,10 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         ),
         Duration::from_secs(cfg.storage.checkpoint_interval_s),
     )
-    .with_retention(retention_windows(cfg));
+    .with_retention(retention_windows(cfg))
+    .with_encoders(cfg.storage.tier_workers.unwrap_or_else(|| {
+        (std::thread::available_parallelism().map_or(1, std::num::NonZero::get) / 4).clamp(1, 16)
+    }))?;
     let mut symbols_saved = 0usize;
     let mut dict_values_saved = 0usize;
     let mut restored_max_lsn = 0u64;

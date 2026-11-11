@@ -16,6 +16,14 @@
 //! query snapshot holds the chunk any more (a query that started before the drop finishes
 //! on the data it saw).
 //!
+//! **Encoding off the ingest loop.** With encode threads ([`Tiering::with_encoders`]) a tick only
+//! picks the chunks due (all of them, not a time budget's worth) and hands them over; Vortex
+//! encoding and the segment write with its `fsync` run on those threads, and the next tick swaps
+//! the finished chunks in under the partition lock. Ingest never waits for compression, and
+//! compression keeps up with ingest on as many cores as it is given. A finished segment whose
+//! chunk retention dropped meanwhile goes to the graveyard (deleted once free), never into the
+//! table: expired data cannot come back at the next start.
+//!
 //! On start, [`Tiering::restore`] lists the segments and re-attaches them as cold chunks, then
 //! the WAL replay skips records whose LSN is already covered by a segment.
 
@@ -26,7 +34,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use ankaa_store::{ChunkId, ChunkRef, EncodedChunk as _, Table, Tier, TierStats};
-use ankaa_tier::{ColdChunk, Encoder};
+use ankaa_tier::{ColdChunk, Encoder, WarmChunk};
 use tracing::{info, warn};
 
 use crate::metrics::Metrics;
@@ -67,6 +75,93 @@ pub struct Tiering {
     pub checkpoints: u64,
     /// Encode errors (chunk stays hot; retried next tick).
     pub errors: u64,
+    /// Encode threads (`None`: encode in the tick, within its time budget).
+    pool: Option<EncodePool>,
+    /// Chunks handed to the encode threads and not swapped in yet.
+    in_flight: std::collections::HashSet<Key>,
+}
+
+/// A sealed chunk to encode (and persist).
+struct EncodeJob {
+    table: String,
+    partition: usize,
+    key: u32,
+    chunk: Arc<ankaa_store::Chunk>,
+}
+
+/// A finished [`EncodeJob`]: the warm chunk and, with a checkpoint directory, its segment.
+struct EncodeDone {
+    job: EncodeJob,
+    result: Result<(Arc<WarmChunk>, Option<Arc<ColdChunk>>), String>,
+}
+
+/// Threads that encode sealed chunks and write their segments.
+struct EncodePool {
+    jobs: std::sync::mpsc::Sender<EncodeJob>,
+    done: std::sync::mpsc::Receiver<EncodeDone>,
+    threads: Vec<std::thread::JoinHandle<()>>,
+    /// Jobs handed out at most: enough to keep every thread busy, bounded memory.
+    max_in_flight: usize,
+}
+
+impl EncodePool {
+    fn start(n: usize, enc: &Arc<Encoder>, dir: Option<&Path>) -> std::io::Result<Self> {
+        let (job_tx, job_rx) = std::sync::mpsc::channel::<EncodeJob>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<EncodeDone>();
+        // jobs take milliseconds each: one shared queue costs nothing measurable
+        let job_rx = Arc::new(parking_lot::Mutex::new(job_rx));
+        let mut threads = Vec::with_capacity(n);
+        for i in 0..n {
+            let (job_rx, done_tx, enc, dir) = (
+                job_rx.clone(),
+                done_tx.clone(),
+                enc.clone(),
+                dir.map(Path::to_path_buf),
+            );
+            threads.push(
+                std::thread::Builder::new()
+                    .name(format!("ankaa-tier-{i}"))
+                    .spawn(move || {
+                        loop {
+                            let next = job_rx.lock().recv();
+                            let Ok(job) = next else { return };
+                            let result = enc
+                                .encode_warm(&job.table, job.key, &job.chunk)
+                                .map_err(|e| e.to_string())
+                                .and_then(|warm| {
+                                    let cold = match &dir {
+                                        Some(d) => Some(
+                                            enc.write_cold(d, &warm).map_err(|e| e.to_string())?,
+                                        ),
+                                        None => None,
+                                    };
+                                    Ok((warm, cold))
+                                });
+                            if done_tx.send(EncodeDone { job, result }).is_err() {
+                                return;
+                            }
+                        }
+                    })?,
+            );
+        }
+        Ok(Self {
+            jobs: job_tx,
+            done: done_rx,
+            threads,
+            max_in_flight: 2 * n,
+        })
+    }
+}
+
+impl Drop for EncodePool {
+    fn drop(&mut self) {
+        // close the queue; threads finish the job in hand and stop
+        let (tx, _) = std::sync::mpsc::channel();
+        drop(std::mem::replace(&mut self.jobs, tx));
+        for t in self.threads.drain(..) {
+            let _ = t.join();
+        }
+    }
 }
 
 /// What a restore found.
@@ -111,6 +206,93 @@ impl Tiering {
             moves_to_cold: 0,
             checkpoints: 0,
             errors: 0,
+            pool: None,
+            in_flight: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Encode and persist on `n` threads instead of in the tick (0 keeps it in the tick).
+    pub fn with_encoders(mut self, n: usize) -> std::io::Result<Self> {
+        if n > 0 {
+            self.pool = Some(EncodePool::start(
+                n,
+                &self.enc,
+                self.checkpoint_dir.as_deref(),
+            )?);
+        }
+        Ok(self)
+    }
+
+    /// Swap in the chunks the encode threads finished; with `wait`, until none is out.
+    fn collect_encodes(&mut self, tables: &Tables, wait: bool) -> bool {
+        let mut persisted = false;
+        loop {
+            let next = match &self.pool {
+                None => return persisted,
+                Some(_) if self.in_flight.is_empty() => return persisted,
+                Some(p) if wait => p.done.recv().ok(),
+                Some(p) => p.done.try_recv().ok(),
+            };
+            let Some(done) = next else { return persisted };
+            let EncodeDone { job, result } = done;
+            self.in_flight
+                .remove(&(job.table.clone(), job.key, job.chunk.id()));
+            match result {
+                Ok((warm, cold)) => {
+                    persisted |= self.install(tables, &job, &warm, cold);
+                }
+                Err(e) => {
+                    self.errors += 1;
+                    warn!(table = %job.table, partition = job.key, chunk = job.chunk.id().0, error = %e, "encode or segment write failed; chunk stays hot");
+                }
+            }
+        }
+    }
+
+    /// Put an encoded chunk in place of its hot copy (and record its segment). A chunk that is no
+    /// longer there (retention dropped it meanwhile) is not put back: its segment file goes to the
+    /// graveyard, so expired rows cannot return at the next start. Returns whether a segment now
+    /// backs the partition.
+    fn install(
+        &mut self,
+        tables: &Tables,
+        job: &EncodeJob,
+        warm: &Arc<WarmChunk>,
+        cold: Option<Arc<ColdChunk>>,
+    ) -> bool {
+        let Some((_, table)) = tables
+            .persistent()
+            .into_iter()
+            .find(|(n, _)| *n == job.table.as_str())
+        else {
+            if let Some(c) = cold {
+                self.graveyard.push(c);
+            }
+            return false;
+        };
+        let (_, last_lsn) = job.chunk.lsn_range();
+        let last_rows = job.chunk.last_lsn_rows();
+        let id = job.chunk.id();
+        let replaced = table.with_partition(job.partition, |p| {
+            let ok = p.replace_sealed(id, ChunkRef::Encoded(warm.clone()));
+            if ok && cold.is_some() {
+                p.set_persisted_through_lsn(last_lsn, last_rows);
+            }
+            ok
+        });
+        if !replaced {
+            if let Some(c) = cold {
+                self.graveyard.push(c);
+            }
+            return false;
+        }
+        self.moves_to_warm += 1;
+        match cold {
+            Some(c) => {
+                self.cold.insert((job.table.clone(), job.key, id), c);
+                true
+            }
+            None => false,
         }
     }
 
@@ -439,15 +621,24 @@ impl Tiering {
         if !self.retention.is_empty() || !self.graveyard.is_empty() {
             self.apply_retention(tables, metrics);
         }
-        // 1. hot → warm (+ segment)
+        // 1. hot → warm (+ segment): swap in what the encode threads finished, then hand out
+        // what is due (or, without threads, encode here within the time budget)
+        persisted_any |= self.collect_encodes(tables, false);
         'outer: for (name, table) in tables.persistent() {
             let mut n_parts = table.num_partitions();
             let mut idx = 0;
             while idx < n_parts {
-                if t0.elapsed() > self.budget {
+                let threaded = self.pool.is_some();
+                if threaded {
+                    if self.in_flight.len() >= self.pool.as_ref().map_or(0, |p| p.max_in_flight) {
+                        break 'outer;
+                    }
+                } else if t0.elapsed() > self.budget {
                     break 'outer;
                 }
-                // pick the oldest hot sealed chunk beyond the hot window, under the lock
+                // pick the oldest hot sealed chunk beyond the hot window that is not being
+                // encoded already, under the lock
+                let in_flight = &self.in_flight;
                 let candidate = table.with_partition(idx, |p| {
                     let sealed = p.sealed();
                     let hot_total = sealed.iter().filter(|c| c.tier() == Tier::Hot).count();
@@ -460,10 +651,13 @@ impl Tiering {
                     if hot_total <= keep_hot {
                         return None;
                     }
+                    let due = hot_total - keep_hot;
                     sealed
                         .iter()
-                        .find(|c| c.tier() == Tier::Hot)
-                        .and_then(|c| c.as_hot().cloned())
+                        .filter(|c| c.tier() == Tier::Hot)
+                        .take(due)
+                        .filter(|c| !in_flight.contains(&(name.to_owned(), p.key(), c.id())))
+                        .find_map(|c| c.as_hot().cloned())
                         .map(|c| (p.key(), c))
                 });
                 let Some((key, chunk)) = candidate else {
@@ -471,41 +665,33 @@ impl Tiering {
                     n_parts = table.num_partitions();
                     continue;
                 };
-                match self.enc.encode_warm(name, key, &chunk) {
-                    Ok(warm) => {
-                        let mut cold_ref = None;
-                        if let Some(dir) = &self.checkpoint_dir {
-                            match self.enc.write_cold(dir, &warm) {
-                                Ok(c) => cold_ref = Some(c),
-                                Err(e) => {
-                                    self.errors += 1;
-                                    warn!(table = name, partition = key, chunk = chunk.id().0, error = %e, "segment write failed; chunk stays hot");
-                                    idx += 1;
-                                    continue;
-                                }
-                            }
-                        }
-                        let (_, last_lsn) = chunk.lsn_range();
-                        let last_rows = chunk.last_lsn_rows();
-                        let id = chunk.id();
-                        let replaced = table.with_partition(idx, |p| {
-                            let ok = p.replace_sealed(id, ChunkRef::Encoded(warm.clone()));
-                            if ok && cold_ref.is_some() {
-                                p.set_persisted_through_lsn(last_lsn, last_rows);
-                            }
-                            ok
-                        });
-                        if replaced {
-                            self.moves_to_warm += 1;
-                            if let Some(c) = cold_ref {
-                                self.cold.insert((name.to_owned(), key, id), c);
-                                persisted_any = true;
-                            }
-                        }
-                    }
+                let job = EncodeJob {
+                    table: name.to_owned(),
+                    partition: idx,
+                    key,
+                    chunk,
+                };
+                if let Some(pool) = &self.pool {
+                    self.in_flight
+                        .insert((job.table.clone(), key, job.chunk.id()));
+                    let _ = pool.jobs.send(job);
+                    continue;
+                }
+                let encoded = self
+                    .enc
+                    .encode_warm(name, key, &job.chunk)
+                    .and_then(|warm| {
+                        let cold = match &self.checkpoint_dir {
+                            Some(dir) => Some(self.enc.write_cold(dir, &warm)?),
+                            None => None,
+                        };
+                        Ok((warm, cold))
+                    });
+                match encoded {
+                    Ok((warm, cold)) => persisted_any |= self.install(tables, &job, &warm, cold),
                     Err(e) => {
                         self.errors += 1;
-                        warn!(table = name, partition = key, chunk = chunk.id().0, error = %e, "encode failed; chunk stays hot");
+                        warn!(table = name, partition = key, chunk = job.chunk.id().0, error = %e, "encode or segment write failed; chunk stays hot");
                         idx += 1;
                     }
                 }
@@ -630,8 +816,11 @@ impl Tiering {
         Some(lsn)
     }
 
-    /// Persist everything sealed (shutdown): hot window ignored, no time budget.
+    /// Persist everything sealed (shutdown): hot window ignored, no time budget; chunks being
+    /// encoded on the threads are waited for first, the rest is encoded here.
     pub fn flush_all(&mut self, tables: &Tables, metrics: &Metrics) -> Option<u64> {
+        self.checkpoint_pending |= self.collect_encodes(tables, true);
+        self.pool = None;
         let (hot, budget, interval) = (self.hot_sealed, self.budget, self.checkpoint_interval);
         self.hot_sealed = 0;
         self.budget = Duration::from_secs(3600);
@@ -686,6 +875,104 @@ mod tests {
 
     fn total_rows(t: &Tables) -> u64 {
         t.trades.stats().rows
+    }
+
+    fn segment_count(dir: &Path) -> usize {
+        std::fs::read_dir(dir.join("trades")).map_or(0, |r| r.filter_map(Result::ok).count())
+    }
+
+    /// Tick until the encode threads have nothing left out and nothing new is due.
+    fn settle(t: &mut Tiering, tables: &Tables, metrics: &Metrics) {
+        let t0 = Instant::now();
+        loop {
+            let before = t.moves_to_warm;
+            t.tick(tables, metrics);
+            if t.in_flight.is_empty() && t.moves_to_warm == before {
+                return;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_secs(30),
+                "encode threads did not settle"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Encoding on threads leaves exactly what encoding in the tick leaves: the same chunks in
+    /// each tier, the same rows, the same segment files.
+    #[test]
+    fn encode_threads_persist_what_the_tick_persists() {
+        let metrics = Metrics::default();
+        let run = |threads: usize| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut tables = Tables::new(false);
+            for i in (0..7 * CHUNK_ROWS).step_by(4096) {
+                tables.ingest(&trades(i, 4096));
+            }
+            let mut t = Tiering::new(
+                Some(dir.path().to_path_buf()),
+                1,
+                usize::MAX,
+                Duration::from_secs(5),
+                Duration::ZERO,
+            )
+            .with_encoders(threads)
+            .unwrap();
+            settle(&mut t, &tables, &metrics);
+            let st = tables.trades.tier_stats();
+            (
+                (st.hot_chunks, st.warm_chunks, st.cold_chunks),
+                total_rows(&tables),
+                segment_count(dir.path()),
+                t.moves_to_warm,
+            )
+        };
+        let inline = run(0);
+        assert!(inline.3 > 0, "something was encoded");
+        assert_eq!(run(1), inline);
+        assert_eq!(run(3), inline);
+    }
+
+    /// A chunk that retention drops while its segment is being written never comes back: the
+    /// finished segment is deleted (graveyard), not attached, and not found at the next start.
+    #[test]
+    fn a_chunk_expired_while_encoding_does_not_come_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let metrics = Metrics::default();
+        let mut tables = Tables::new(false);
+        for i in (0..6 * CHUNK_ROWS).step_by(4096) {
+            tables.ingest(&trades(i, 4096));
+        }
+        let mut t = Tiering::new(
+            Some(dir.path().to_path_buf()),
+            1,
+            usize::MAX,
+            Duration::from_secs(5),
+            Duration::ZERO,
+        )
+        .with_encoders(2)
+        .unwrap();
+        // hand the chunks out, then drop every sealed chunk before they are swapped in
+        t.tick(&tables, &metrics);
+        assert!(!t.in_flight.is_empty());
+        let dropped = tables.trades.expire(1);
+        assert!(!dropped.is_empty());
+        drop(dropped);
+        settle(&mut t, &tables, &metrics);
+        // no encoded copy came back, and the files are gone once nothing holds them
+        let st = tables.trades.tier_stats();
+        assert_eq!((st.warm_chunks, st.cold_chunks), (0, 0));
+        t.tick(&tables, &metrics);
+        assert_eq!(segment_count(dir.path()), 0);
+        let restarted = Tables::new(false);
+        let mut t2 = Tiering::new(
+            Some(dir.path().to_path_buf()),
+            1,
+            usize::MAX,
+            Duration::from_secs(5),
+            Duration::ZERO,
+        );
+        assert_eq!(t2.restore(&restarted).unwrap().segments, 0);
     }
 
     /// Uncompressed rows stay bounded: open chunks older than the age limit are sealed whatever

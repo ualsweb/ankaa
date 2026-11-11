@@ -64,6 +64,9 @@ checkpoint_interval_s = 60
 
 # Share of one core (percent, 1-50) the tiering step may use per snapshot interval.
 tier_budget_pct = 5
+# Threads encoding sealed chunks and writing segments off the ingest loop (unset = cores / 4,
+# 1 to 16; 0 = in the tick, within tier_budget_pct).
+# tier_workers = 4
 
 # Query-view swap interval in milliseconds (>= 5). Queries see data up to the last swap.
 snapshot_ms = 50

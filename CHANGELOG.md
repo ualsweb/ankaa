@@ -59,6 +59,12 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   long. Before, a table with one partition per device kept every reading uncompressed (twice: the open chunk
   and its query view) until 65,536 had arrived for that device. Metrics `ankaa_tier_sealed_for_age_total`,
   `ankaa_tier_sealed_for_memory_total`.
+- Mapping workers learn the dictionary ids the ingest loop gives to the values they leave pending and
+  resolve those values themselves afterwards: the serial loop hashes only values it has never seen.
+- Compression off the ingest loop: `storage.tier_workers` threads (default cores ÷ 4) encode sealed chunks
+  and write their segments; the tick hands over every chunk that is due and swaps in the finished ones.
+  Before, tiering had 5 % of one core (about 60 MB/s of rows), far below what ingest produces under load.
+  A segment finished for a chunk that retention dropped meanwhile is deleted, never attached.
 - Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
   could hand the last messages to the next start again.
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on

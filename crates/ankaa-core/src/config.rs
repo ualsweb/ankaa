@@ -413,7 +413,12 @@ pub struct StorageConfig {
     pub warm_budget_mib: u64,
     /// Minimum seconds between WAL truncations after a checkpoint.
     pub checkpoint_interval_s: u64,
-    /// Share of one core (percent) the tiering step may use per snapshot interval.
+    /// Threads that encode sealed chunks (Vortex) and write their segments, off the ingest loop.
+    /// Unset: a quarter of the cores, 1 to 16; 0: encode in the snapshot tick within
+    /// `tier_budget_pct`. At most 256.
+    pub tier_workers: Option<usize>,
+    /// Share of one core (percent) the tiering step may use per snapshot interval (only when
+    /// `tier_workers` is 0).
     pub tier_budget_pct: u8,
     /// WAL size, MiB, above which the partitions holding the oldest unpersisted rows are
     /// sealed and written to segments early so the log can be truncated (needs
@@ -525,6 +530,7 @@ impl Default for StorageConfig {
             snapshot_ms: 50,
             ingest_coalesce_us: 200,
             ingest_workers: None,
+            tier_workers: None,
             warm_budget_mib: 512,
             checkpoint_interval_s: 60,
             tier_budget_pct: 5,
@@ -661,6 +667,9 @@ impl Config {
         }
         if self.storage.ingest_workers.is_some_and(|n| n > 256) {
             return inv("storage.ingest_workers must be <= 256");
+        }
+        if self.storage.tier_workers.is_some_and(|n| n > 256) {
+            return inv("storage.tier_workers must be <= 256");
         }
         if self.storage.ingest_coalesce_us > 10_000 {
             return inv("storage.ingest_coalesce_us must be <= 10000 (10 ms)");
