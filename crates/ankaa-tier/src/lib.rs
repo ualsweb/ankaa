@@ -91,6 +91,125 @@ pub struct Encoder {
     session: VortexSession,
     compressor: BtrBlocksCompressor,
     runtime: CurrentThreadRuntime,
+    cache: SegmentCache,
+}
+
+/// Segment files kept in memory after a read, compressed as they are on disk, with their footer
+/// parsed: the most recently used ones, up to a budget in bytes.
+///
+/// Reading a cold chunk costs a file read, a footer parse and the decode of the columns asked
+/// for; for a chunk of some hundred kilobytes the first two are most of it (measured: 17 µs and
+/// 21 µs of 55 to 75 µs). A query that returns to a segment (a dashboard refreshing, a scan of
+/// the same day by another user) finds it here and pays the decode only. The operating
+/// system's page cache already holds the bytes; this saves the copy out of it and the parse.
+///
+/// Entries are keyed by an id given to each [`ColdChunk`] when it is created and removed when
+/// it is dropped, so a file replaced or deleted is never served from here.
+#[derive(Default)]
+struct SegmentCache {
+    budget: usize,
+    state: std::sync::Mutex<CacheState>,
+    next_id: std::sync::atomic::AtomicU64,
+    hits: std::sync::atomic::AtomicU64,
+    misses: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default)]
+struct CacheState {
+    files: std::collections::HashMap<u64, Cached>,
+    bytes: usize,
+    tick: u64,
+}
+
+struct Cached {
+    file: vortex::file::VortexFile,
+    bytes: usize,
+    used: u64,
+}
+
+/// Counters of the segment cache ([`Encoder::segment_cache`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentCacheStats {
+    /// Bytes of segment files held.
+    pub bytes: usize,
+    /// Segment files held.
+    pub files: usize,
+    /// Reads answered from the cache.
+    pub hits: u64,
+    /// Reads that had to open the file.
+    pub misses: u64,
+}
+
+impl SegmentCache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
+        // the state is consistent after every statement below: a panic elsewhere while the lock
+        // was held leaves nothing half done
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn get(&self, id: u64) -> Option<vortex::file::VortexFile> {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.budget == 0 {
+            return None;
+        }
+        let mut s = self.lock();
+        s.tick += 1;
+        let tick = s.tick;
+        let found = s.files.get_mut(&id).map(|c| {
+            c.used = tick;
+            c.file.clone()
+        });
+        drop(s);
+        if found.is_some() {
+            self.hits.fetch_add(1, Relaxed);
+        } else {
+            self.misses.fetch_add(1, Relaxed);
+        }
+        found
+    }
+
+    /// Keep `file` (`bytes` long). When the budget is exceeded the least recently used eighth
+    /// of it goes at once, so a workload larger than the cache pays for an eviction pass once
+    /// in many inserts, not on each.
+    fn put(&self, id: u64, file: vortex::file::VortexFile, bytes: usize) {
+        if bytes > self.budget {
+            return;
+        }
+        let mut s = self.lock();
+        s.tick += 1;
+        let used = s.tick;
+        if let Some(old) = s.files.insert(id, Cached { file, bytes, used }) {
+            s.bytes -= old.bytes;
+        }
+        s.bytes += bytes;
+        if s.bytes > self.budget {
+            let keep = self.budget - self.budget / 8;
+            let mut by_age: Vec<(u64, u64)> = s.files.iter().map(|(&i, c)| (c.used, i)).collect();
+            by_age.sort_unstable();
+            for (_, old) in by_age {
+                if s.bytes <= keep {
+                    break;
+                }
+                if old != id
+                    && let Some(c) = s.files.remove(&old)
+                {
+                    s.bytes -= c.bytes;
+                }
+            }
+        }
+    }
+
+    fn remove(&self, id: u64) {
+        if self.budget == 0 {
+            return;
+        }
+        let mut s = self.lock();
+        if let Some(c) = s.files.remove(&id) {
+            s.bytes -= c.bytes;
+        }
+    }
 }
 
 impl Debug for Encoder {
@@ -116,7 +235,35 @@ impl Encoder {
             session,
             compressor,
             runtime,
+            cache: SegmentCache::default(),
         }
+    }
+
+    /// Keep up to `bytes` of recently read segment files in memory (0: none, the default):
+    /// a cold chunk read again is decoded without reading its file or parsing its footer.
+    #[must_use]
+    pub fn with_segment_cache(mut self, bytes: usize) -> Self {
+        self.cache.budget = bytes;
+        self
+    }
+
+    /// What the segment cache holds and how often it answered.
+    #[must_use]
+    pub fn segment_cache(&self) -> SegmentCacheStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        let s = self.cache.lock();
+        SegmentCacheStats {
+            bytes: s.bytes,
+            files: s.files.len(),
+            hits: self.cache.hits.load(Relaxed),
+            misses: self.cache.misses.load(Relaxed),
+        }
+    }
+
+    fn next_cache_id(&self) -> u64 {
+        self.cache
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     fn column_to_arrow(col: &Column, valid: Option<&[bool]>) -> ArrowArrayRef {
@@ -269,6 +416,7 @@ impl Encoder {
             path,
             file_size,
             enc: Arc::clone(self),
+            cache_id: self.next_cache_id(),
         }))
     }
 
@@ -307,6 +455,7 @@ impl Encoder {
             path: path.to_path_buf(),
             file_size,
             enc: Arc::clone(self),
+            cache_id: self.next_cache_id(),
         }))
     }
 
@@ -357,13 +506,22 @@ impl Encoder {
         self.scan_segment(&file, cold, projection, rows)
     }
 
-    /// Read a segment file and parse its footer.
+    /// The segment file of `cold`, opened: from the cache, or read and its footer parsed (and
+    /// then kept, within the cache's budget).
     fn open_segment(&self, cold: &ColdChunk) -> Result<vortex::file::VortexFile, TierError> {
+        if let Some(file) = self.cache.get(cold.cache_id) {
+            return Ok(file);
+        }
         let bytes = std::fs::read(&cold.path).map_err(io_err(&cold.path))?;
-        Ok(self
+        let len = bytes.len();
+        let file = self
             .session
             .open_options()
-            .open_buffer(ByteBuffer::from(bytes))?)
+            .open_buffer(ByteBuffer::from(bytes))?;
+        if self.cache.budget > 0 {
+            self.cache.put(cold.cache_id, file.clone(), len);
+        }
+        Ok(file)
     }
 
     /// Decode `projection` (all rows, or the rows `rows`) of an opened segment.
@@ -487,6 +645,15 @@ pub struct ColdChunk {
     path: PathBuf,
     file_size: u64,
     enc: Arc<Encoder>,
+    /// Key of this chunk in the encoder's segment cache.
+    cache_id: u64,
+}
+
+impl Drop for ColdChunk {
+    /// The chunk is gone (retention, a rewritten segment): so is its cached file.
+    fn drop(&mut self) {
+        self.enc.cache.remove(self.cache_id);
+    }
 }
 
 impl Debug for ColdChunk {
@@ -767,6 +934,62 @@ mod tests {
         }
         // a column with no NULL in this chunk reports no validity
         assert!(warm.decode_nullable(&[4]).unwrap()[0].1.is_none());
+    }
+
+    /// Cold chunks read again come from the segment cache, the same values as from the file;
+    /// the cache stays inside its budget, forgets a dropped chunk and is off by default.
+    #[test]
+    fn the_segment_cache_serves_repeated_reads_within_its_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let chunks: Vec<Chunk> = (0..6).map(|_| chunk(4_000)).collect();
+        let plain = Arc::new(Encoder::new());
+        let one = plain
+            .write_cold(
+                dir.path(),
+                &plain.encode_warm("size", 0, &chunks[0]).unwrap(),
+            )
+            .unwrap();
+        let size = usize::try_from(one.file_size).unwrap();
+        one.decode(&[0]).unwrap();
+        one.decode(&[0]).unwrap();
+        assert_eq!(plain.segment_cache(), SegmentCacheStats::default());
+
+        // room for three segments and a half
+        let enc = Arc::new(Encoder::new().with_segment_cache(size * 7 / 2));
+        let mut cold: Vec<Arc<ColdChunk>> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let warm = enc.encode_warm("t", u32::try_from(i).unwrap(), c).unwrap();
+                enc.write_cold(dir.path(), &warm).unwrap()
+            })
+            .collect();
+        let want = chunks[0].column(2).unwrap();
+        for _ in 0..3 {
+            assert!(same(&cold[0].decode(&[2]).unwrap()[0], want));
+            let part = cold[0].decode_rows(&[2], 10..20).unwrap();
+            assert!(same(&part[0].0, &want.copy_range(10..20)));
+        }
+        let s = enc.segment_cache();
+        assert_eq!((s.files, s.misses, s.hits), (1, 1, 5), "{s:?}");
+        // more segments than fit: the budget holds, the most recently used stay
+        for c in &cold {
+            c.decode(&[0]).unwrap();
+        }
+        let s = enc.segment_cache();
+        assert!(
+            s.bytes <= size * 7 / 2 && s.files >= 2 && s.files <= 3,
+            "{s:?}"
+        );
+        let hits = s.hits;
+        cold[5].decode(&[1]).unwrap();
+        assert_eq!(enc.segment_cache().hits, hits + 1);
+        // a dropped chunk leaves the cache
+        let before = enc.segment_cache();
+        cold.pop();
+        let after = enc.segment_cache();
+        assert_eq!(after.files, before.files - 1);
+        assert!(after.bytes < before.bytes);
     }
 
     /// A sensors chunk with `NULL`s in three columns.

@@ -105,6 +105,10 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   longer decodes the days its chunk holds, in the warm tier (constant-time slice of the compressed arrays)
   and in the cold tier (row range through the segment layout). `LIMIT` without a time range decodes the
   first rows only.
+- Segment cache: `storage.segment_cache_mib` (default 256) keeps recently read cold segment files in
+  memory, compressed as on disk and with their footer parsed. A cold chunk read again skips the file read
+  and the parse, which are most of the cost of a small cold read. Metrics `ankaa_segment_cache_bytes`,
+  `ankaa_segment_cache_reads_total{from}`.
 - Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
   could hand the last messages to the next start again.
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on

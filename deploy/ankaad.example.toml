@@ -59,6 +59,10 @@ max_open_age_s = 600
 # (read from their segment file on demand). Needs checkpoint_dir to be > 0 effective.
 warm_budget_mib = 512
 
+# Recently read cold segment files kept in memory (compressed, as on disk), MiB; least recently
+# used out first. A cold chunk read again skips the file read and the footer parse. 0 = none.
+segment_cache_mib = 256
+
 # Minimum seconds between WAL truncations after a checkpoint.
 checkpoint_interval_s = 60
 

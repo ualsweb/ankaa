@@ -580,6 +580,10 @@ pub struct StorageConfig {
     /// Memory budget for warm (encoded, in-memory) chunks in MiB; beyond it the oldest warm
     /// chunks are demoted to cold (segment on disk, decoded on demand). Needs `checkpoint_dir`.
     pub warm_budget_mib: u64,
+    /// Recently read cold segment files kept in memory, compressed as on disk, in MiB (least
+    /// recently used out first; 0: none). A cold chunk read again is decoded without reading
+    /// its file or parsing its footer.
+    pub segment_cache_mib: u64,
     /// Minimum seconds between WAL truncations after a checkpoint.
     pub checkpoint_interval_s: u64,
     /// Threads that encode sealed chunks (Vortex) and write their segments, off the ingest loop.
@@ -716,6 +720,7 @@ impl Default for StorageConfig {
             ingest_workers: None,
             tier_workers: None,
             warm_budget_mib: 512,
+            segment_cache_mib: 256,
             checkpoint_interval_s: 60,
             tier_budget_pct: 5,
             wal_budget_mib: 1024,
@@ -900,6 +905,7 @@ impl Config {
                 self.resources.query_memory_mib,
             ),
             ("storage.warm_budget_mib", self.storage.warm_budget_mib),
+            ("storage.segment_cache_mib", self.storage.segment_cache_mib),
         ] {
             if mib.checked_mul(1024 * 1024).is_none() {
                 return Err(ConfigError::Invalid(format!("{name} is too large")));

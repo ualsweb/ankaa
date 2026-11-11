@@ -602,6 +602,10 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         ),
         Duration::from_secs(cfg.storage.checkpoint_interval_s),
     )
+    .with_segment_cache(
+        usize::try_from(cfg.storage.segment_cache_mib.saturating_mul(1024 * 1024))
+            .unwrap_or(usize::MAX),
+    )
     .with_retention(retention_windows(cfg))
     .with_encoders(cfg.storage.tier_workers.unwrap_or_else(|| {
         (std::thread::available_parallelism().map_or(1, std::num::NonZero::get) / 4).clamp(1, 16)

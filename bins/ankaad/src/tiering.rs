@@ -212,6 +212,13 @@ impl Tiering {
     }
 
     /// Encode and persist on `n` threads instead of in the tick (0 keeps it in the tick).
+    /// Keep up to `bytes` of recently read segment files in memory (`storage.segment_cache_mib`).
+    /// Call before any segment is restored or written.
+    pub fn with_segment_cache(mut self, bytes: usize) -> Self {
+        self.enc = Arc::new(Encoder::new().with_segment_cache(bytes));
+        self
+    }
+
     pub fn with_encoders(mut self, n: usize) -> std::io::Result<Self> {
         if n > 0 {
             self.pool = Some(EncodePool::start(
@@ -775,6 +782,12 @@ impl Tiering {
             .store(self.moves_to_warm, Ordering::Relaxed);
         tm.moves_to_cold
             .store(self.moves_to_cold, Ordering::Relaxed);
+        let cache = self.enc.segment_cache();
+        tm.segment_cache_bytes
+            .store(cache.bytes as u64, Ordering::Relaxed);
+        tm.segment_cache_hits.store(cache.hits, Ordering::Relaxed);
+        tm.segment_cache_misses
+            .store(cache.misses, Ordering::Relaxed);
         // 4. checkpoint LSN
         self.checkpoint_pending |= persisted_any;
         if self.checkpoint_dir.is_none() || !self.checkpoint_pending {

@@ -72,6 +72,12 @@ pub struct TierMetrics {
     pub moves_to_warm: AtomicU64,
     /// Chunks written warm → cold.
     pub moves_to_cold: AtomicU64,
+    /// Bytes of cold segment files held in memory by the segment cache.
+    pub segment_cache_bytes: AtomicU64,
+    /// Cold chunk reads answered from the segment cache.
+    pub segment_cache_hits: AtomicU64,
+    /// Cold chunk reads that opened the segment file.
+    pub segment_cache_misses: AtomicU64,
     /// Checkpoints written.
     pub checkpoints: AtomicU64,
     /// WAL segments truncated after checkpoints.
@@ -215,6 +221,17 @@ impl Metrics {
             s,
             "ankaa_tier_moves_total{{to=\"cold\"}} {}",
             g(&t.moves_to_cold)
+        );
+        let _ = writeln!(
+            s,
+            "# HELP ankaa_segment_cache_bytes Bytes of cold segment files kept in memory (storage.segment_cache_mib)\n# TYPE ankaa_segment_cache_bytes gauge\nankaa_segment_cache_bytes {}",
+            g(&t.segment_cache_bytes)
+        );
+        let _ = writeln!(
+            s,
+            "# HELP ankaa_segment_cache_reads_total Cold chunk reads by where the segment came from\n# TYPE ankaa_segment_cache_reads_total counter\nankaa_segment_cache_reads_total{{from=\"cache\"}} {}\nankaa_segment_cache_reads_total{{from=\"file\"}} {}",
+            g(&t.segment_cache_hits),
+            g(&t.segment_cache_misses)
         );
         let _ = writeln!(
             s,
