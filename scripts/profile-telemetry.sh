@@ -41,6 +41,8 @@ TIER_SECONDS="${TIER_SECONDS:-45}"
 mkdir -p "$OUT" "$WORK"
 [ -x "$ANKAAD" ] || { echo "no $ANKAAD: cargo build --release -p ankaad" >&2; exit 1; }
 [ -f "$DATA/manifest.json" ] || { echo "no dataset in $DATA: bench/telemetry/generate.py" >&2; exit 1; }
+perf record -q -e cpu-clock -o /dev/null -- true 2>/dev/null || {
+  echo "perf cannot record here: sudo sysctl -w kernel.perf_event_paranoid=1 (and install perf)" >&2; exit 1; }
 ROWS=$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1]))['rows'])" "$DATA/manifest.json")
 
 metric() { curl -s -H "Authorization: Bearer $ANKAA_TOKEN" "http://127.0.0.1:$METRICS_PORT/metrics" | awk -v m="$1" '$1==m {print int($2)}'; }
