@@ -595,6 +595,10 @@ pub struct StorageConfig {
     /// recently used out first; 0: none). A cold chunk read again is decoded without reading
     /// its file or parsing its footer.
     pub segment_cache_mib: u64,
+    /// Merge runs of small sealed chunks of a partition into full ones in the background
+    /// (bounded memory seals chunks early when there are many partitions; every chunk has a
+    /// fixed cost at query time and a file).
+    pub compact_small_chunks: bool,
     /// Minimum seconds between WAL truncations after a checkpoint.
     pub checkpoint_interval_s: u64,
     /// Threads that encode sealed chunks (Vortex) and write their segments, off the ingest loop.
@@ -732,6 +736,7 @@ impl Default for StorageConfig {
             tier_workers: None,
             warm_budget_mib: 512,
             segment_cache_mib: 256,
+            compact_small_chunks: true,
             checkpoint_interval_s: 60,
             tier_budget_pct: 5,
             wal_budget_mib: 1024,

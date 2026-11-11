@@ -18,7 +18,7 @@ pub mod table;
 pub mod tier;
 
 pub use ankaa_simd::VECTOR_LEN;
-pub use chunk::{BlockStats, Chunk, ChunkId, ChunkState, ZoneMap};
+pub use chunk::{BlockStats, Chunk, ChunkId, ChunkPart, ChunkState, ZoneMap};
 pub use column::{Column, ColumnStats, Value};
 pub use schema::{ColumnType, Field, Schema, SchemaError};
 pub use table::{Partition, PartitionStats, Table, TableSnapshot, TableWriter};

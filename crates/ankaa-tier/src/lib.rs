@@ -107,7 +107,7 @@ pub struct Encoder {
 /// it is dropped, so a file replaced or deleted is never served from here.
 #[derive(Default)]
 struct SegmentCache {
-    budget: usize,
+    budget: std::sync::atomic::AtomicUsize,
     state: std::sync::Mutex<CacheState>,
     next_id: std::sync::atomic::AtomicU64,
     hits: std::sync::atomic::AtomicU64,
@@ -141,6 +141,10 @@ pub struct SegmentCacheStats {
 }
 
 impl SegmentCache {
+    fn budget(&self) -> usize {
+        self.budget.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
         // the state is consistent after every statement below: a panic elsewhere while the lock
         // was held leaves nothing half done
@@ -151,7 +155,7 @@ impl SegmentCache {
 
     fn get(&self, id: u64) -> Option<vortex::file::VortexFile> {
         use std::sync::atomic::Ordering::Relaxed;
-        if self.budget == 0 {
+        if self.budget() == 0 {
             return None;
         }
         let mut s = self.lock();
@@ -174,7 +178,8 @@ impl SegmentCache {
     /// of it goes at once, so a workload larger than the cache pays for an eviction pass once
     /// in many inserts, not on each.
     fn put(&self, id: u64, file: vortex::file::VortexFile, bytes: usize) {
-        if bytes > self.budget {
+        let budget = self.budget();
+        if bytes > budget {
             return;
         }
         let mut s = self.lock();
@@ -184,8 +189,8 @@ impl SegmentCache {
             s.bytes -= old.bytes;
         }
         s.bytes += bytes;
-        if s.bytes > self.budget {
-            let keep = self.budget - self.budget / 8;
+        if s.bytes > budget {
+            let keep = budget - budget / 8;
             let mut by_age: Vec<(u64, u64)> = s.files.iter().map(|(&i, c)| (c.used, i)).collect();
             by_age.sort_unstable();
             for (_, old) in by_age {
@@ -202,9 +207,6 @@ impl SegmentCache {
     }
 
     fn remove(&self, id: u64) {
-        if self.budget == 0 {
-            return;
-        }
         let mut s = self.lock();
         if let Some(c) = s.files.remove(&id) {
             s.bytes -= c.bytes;
@@ -242,9 +244,17 @@ impl Encoder {
     /// Keep up to `bytes` of recently read segment files in memory (0: none, the default):
     /// a cold chunk read again is decoded without reading its file or parsing its footer.
     #[must_use]
-    pub fn with_segment_cache(mut self, bytes: usize) -> Self {
-        self.cache.budget = bytes;
+    pub fn with_segment_cache(self, bytes: usize) -> Self {
+        self.set_segment_cache(bytes);
         self
+    }
+
+    /// Change the budget of the segment cache. A smaller one takes effect as files are added:
+    /// nothing is dropped at once.
+    pub fn set_segment_cache(&self, bytes: usize) {
+        self.cache
+            .budget
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// What the segment cache holds and how often it answered.
@@ -340,7 +350,21 @@ impl Encoder {
         partition: u32,
         chunk: &Chunk,
     ) -> Result<Arc<WarmChunk>, TierError> {
-        let meta = ChunkMeta::of(table, partition, chunk);
+        self.encode_warm_replacing(table, partition, chunk, Vec::new())
+    }
+
+    /// [`Self::encode_warm`] for a chunk made by compaction: its metadata (and its segment,
+    /// once written) names the chunks `replaces` whose rows it holds instead
+    /// ([`ChunkMeta::replaces`]).
+    pub fn encode_warm_replacing(
+        self: &Arc<Self>,
+        table: &str,
+        partition: u32,
+        chunk: &Chunk,
+        replaces: Vec<u64>,
+    ) -> Result<Arc<WarmChunk>, TierError> {
+        let mut meta = ChunkMeta::of(table, partition, chunk);
+        meta.replaces = replaces;
         let mut columns = Vec::with_capacity(meta.schema.fields().len());
         for (i, f) in meta.schema.fields().iter().enumerate() {
             let col = chunk
@@ -518,7 +542,7 @@ impl Encoder {
             .session
             .open_options()
             .open_buffer(ByteBuffer::from(bytes))?;
-        if self.cache.budget > 0 {
+        if self.cache.budget() > 0 {
             self.cache.put(cold.cache_id, file.clone(), len);
         }
         Ok(file)

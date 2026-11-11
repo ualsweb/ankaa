@@ -72,6 +72,10 @@ pub struct TierMetrics {
     pub moves_to_warm: AtomicU64,
     /// Chunks written warm → cold.
     pub moves_to_cold: AtomicU64,
+    /// Merges of small chunks done, and chunks they replaced.
+    pub compactions: AtomicU64,
+    /// See [`Self::compactions`].
+    pub compacted_chunks: AtomicU64,
     /// Bytes of cold segment files held in memory by the segment cache.
     pub segment_cache_bytes: AtomicU64,
     /// Cold chunk reads answered from the segment cache.
@@ -221,6 +225,16 @@ impl Metrics {
             s,
             "ankaa_tier_moves_total{{to=\"cold\"}} {}",
             g(&t.moves_to_cold)
+        );
+        let _ = writeln!(
+            s,
+            "# HELP ankaa_tier_compactions_total Merges of small chunks of a partition into one\n# TYPE ankaa_tier_compactions_total counter\nankaa_tier_compactions_total {}",
+            g(&t.compactions)
+        );
+        let _ = writeln!(
+            s,
+            "# HELP ankaa_tier_compacted_chunks_total Small chunks replaced by merged ones\n# TYPE ankaa_tier_compacted_chunks_total counter\nankaa_tier_compacted_chunks_total {}",
+            g(&t.compacted_chunks)
         );
         let _ = writeln!(
             s,

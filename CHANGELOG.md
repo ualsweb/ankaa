@@ -125,6 +125,15 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   like `=` and `IN`. Before, they ran row by row and a pattern was compiled for every batch.
 - Scans prune on flat arrays of chunk statistics (a quarter of a small query went into asking 17,000
   chunks one by one); the tiering tick sums tier sizes once instead of three times.
+- Compaction: runs of small sealed chunks of a partition are merged into full ones in the background
+  (`storage.compact_small_chunks`, on by default). With many devices the memory bound seals chunks long
+  before they are full: a TSBS load of 1,000 hosts left 16,937 chunks of about 1,500 rows where 1,000 would
+  do, and every per-chunk cost showed in the profiles (planning, a decode call per column, a file each). A
+  merged segment lists the segments it replaces; a start-up that finds both keeps the merged one, so a crash
+  in between neither loses nor repeats a row.
+- A table's view for queries is rebuilt only when the table changed (it was rebuilt every snapshot tick,
+  a walk over every chunk), and `latest()` finds the newest rows on the pruning index.
+- The part of `warm_budget_mib` the warm tier does not use is lent to the segment cache.
 - Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
   could hand the last messages to the next start again.
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on

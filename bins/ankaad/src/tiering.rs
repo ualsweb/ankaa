@@ -61,6 +61,15 @@ pub struct Tiering {
     /// Tier totals of all tables and the moves they were taken after: summing them walks every
     /// chunk, so a tick reuses them until a chunk moves or [`STATS_MAX_AGE`] passes.
     totals: Option<(Instant, u64, TierStats)>,
+    /// `storage.segment_cache_mib` in bytes (0: no segment cache).
+    segment_cache_bytes: usize,
+    /// Compaction: on or off, when partitions were last searched, partitions with a merge out.
+    compact: bool,
+    last_compact: Option<Instant>,
+    merging: std::collections::HashSet<(String, u32)>,
+    /// Merges done and chunks they replaced.
+    pub compactions: u64,
+    pub compacted_chunks: u64,
     /// Segment written for a chunk (table, partition, id) → cold reference.
     cold: HashMap<Key, Arc<ColdChunk>>,
     /// Partitions `(table, key)` whose sealed chunks are persisted at once, whatever the hot
@@ -92,7 +101,66 @@ struct EncodeJob {
     table: String,
     partition: usize,
     key: u32,
+    /// The hot chunk to encode; for a compaction an empty chunk that only carries the id the
+    /// merged chunk will have.
     chunk: Arc<ankaa_store::Chunk>,
+    /// Compaction: the chunks to merge into one.
+    merge: Option<Merge>,
+}
+
+/// A run of small encoded chunks of one partition to be made one chunk.
+struct Merge {
+    /// The chunks, adjacent and in the partition's order.
+    parts: Vec<ChunkRef>,
+    /// What the merged chunk's metadata will list as replaced: the parts and what they replaced.
+    replaces: Vec<u64>,
+    /// WAL bookkeeping of the merged chunk: first LSN, last LSN, rows of the last record.
+    lsn: (u64, u64, u32),
+}
+
+/// A sealed chunk below this many rows is small: compaction merges runs of them.
+pub const SMALL_CHUNK_ROWS: usize = ankaa_store::CHUNK_ROWS / 4;
+/// Fewest small chunks merged when the result is still small (a merge that makes a chunk of at
+/// least [`SMALL_CHUNK_ROWS`] takes two).
+const MIN_MERGE_PARTS: usize = 4;
+/// Most chunks one merge takes, and most ids a merged chunk may list as replaced.
+const MAX_MERGE_PARTS: usize = 64;
+const MAX_REPLACED_IDS: usize = 4096;
+/// How often partitions are searched for runs to merge.
+const COMPACT_EVERY: Duration = Duration::from_secs(1);
+
+/// Encode a chunk (and write its segment when `dir` is given); for a compaction, first build
+/// the merged chunk from its parts. Runs on an encode thread, or in the tick without them.
+fn run_job(
+    enc: &Arc<Encoder>,
+    dir: Option<&Path>,
+    job: &EncodeJob,
+) -> Result<(Arc<WarmChunk>, Option<Arc<ColdChunk>>), String> {
+    let warm = match &job.merge {
+        None => enc
+            .encode_warm(&job.table, job.key, &job.chunk)
+            .map_err(|e| e.to_string())?,
+        Some(m) => {
+            let schema = job.chunk.schema().clone();
+            let all: Vec<usize> = (0..schema.len()).collect();
+            let mut parts = Vec::with_capacity(m.parts.len());
+            for part in &m.parts {
+                let ChunkRef::Encoded(e) = part else {
+                    return Err("compaction of a chunk that is not encoded".into());
+                };
+                let cols = e.decode_nullable(&all).map_err(|e| e.to_string())?;
+                parts.push(cols.into_iter().unzip());
+            }
+            let merged = ankaa_store::Chunk::merged(job.chunk.id(), schema, &parts, m.lsn)?;
+            enc.encode_warm_replacing(&job.table, job.key, &merged, m.replaces.clone())
+                .map_err(|e| e.to_string())?
+        }
+    };
+    let cold = match dir {
+        Some(d) => Some(enc.write_cold(d, &warm).map_err(|e| e.to_string())?),
+        None => None,
+    };
+    Ok((warm, cold))
 }
 
 /// A finished [`EncodeJob`]: the warm chunk and, with a checkpoint directory, its segment.
@@ -131,18 +199,7 @@ impl EncodePool {
                         loop {
                             let next = job_rx.lock().recv();
                             let Ok(job) = next else { return };
-                            let result = enc
-                                .encode_warm(&job.table, job.key, &job.chunk)
-                                .map_err(|e| e.to_string())
-                                .and_then(|warm| {
-                                    let cold = match &dir {
-                                        Some(d) => Some(
-                                            enc.write_cold(d, &warm).map_err(|e| e.to_string())?,
-                                        ),
-                                        None => None,
-                                    };
-                                    Ok((warm, cold))
-                                });
+                            let result = run_job(&enc, dir.as_deref(), &job);
                             if done_tx.send(EncodeDone { job, result }).is_err() {
                                 return;
                             }
@@ -183,6 +240,9 @@ pub struct RestoreStats {
     pub bad_files: usize,
     /// Segments written before their table gained columns (read with the added ones `NULL`).
     pub evolved: usize,
+    /// Segments deleted because a merged segment holds their rows (a crash came between
+    /// writing the merged one and deleting them).
+    pub replaced: usize,
 }
 
 impl Tiering {
@@ -204,6 +264,12 @@ impl Tiering {
             checkpoint_interval,
             last_truncate: None,
             totals: None,
+            segment_cache_bytes: 0,
+            compact: true,
+            last_compact: None,
+            merging: std::collections::HashSet::new(),
+            compactions: 0,
+            compacted_chunks: 0,
             cold: HashMap::new(),
             forced: std::collections::HashSet::new(),
             retention: HashMap::new(),
@@ -223,6 +289,7 @@ impl Tiering {
     /// Call before any segment is restored or written.
     pub fn with_segment_cache(mut self, bytes: usize) -> Self {
         self.enc = Arc::new(Encoder::new().with_segment_cache(bytes));
+        self.segment_cache_bytes = bytes;
         self
     }
 
@@ -277,7 +344,10 @@ impl Tiering {
                 }
                 Err(e) => {
                     self.errors += 1;
-                    warn!(table = %job.table, partition = job.key, chunk = job.chunk.id().0, error = %e, "encode or segment write failed; chunk stays hot");
+                    if job.merge.is_some() {
+                        self.merging.remove(&(job.table.clone(), job.key));
+                    }
+                    warn!(table = %job.table, partition = job.key, chunk = job.chunk.id().0, error = %e, "encode or segment write failed; the chunk stays as it is");
                 }
             }
         }
@@ -294,6 +364,9 @@ impl Tiering {
         warm: &Arc<WarmChunk>,
         cold: Option<Arc<ColdChunk>>,
     ) -> bool {
+        if let Some(merge) = &job.merge {
+            return self.install_merged(tables, job, merge, warm, cold);
+        }
         let Some((_, table)) = tables
             .persistent()
             .into_iter()
@@ -328,6 +401,175 @@ impl Tiering {
             }
             None => false,
         }
+    }
+
+    /// Put a merged chunk in place of the run it was made from. The segments of the run are
+    /// dead from here on: their files go once no query reads them (and a restart before that
+    /// skips them, because the merged segment lists them). When the run is no longer there
+    /// (retention dropped part of it meanwhile) the merged chunk is given up instead.
+    fn install_merged(
+        &mut self,
+        tables: &Tables,
+        job: &EncodeJob,
+        merge: &Merge,
+        warm: &Arc<WarmChunk>,
+        cold: Option<Arc<ColdChunk>>,
+    ) -> bool {
+        self.merging.remove(&(job.table.clone(), job.key));
+        let ids: Vec<ankaa_store::ChunkId> = merge.parts.iter().map(ChunkRef::id).collect();
+        let replaced = tables
+            .persistent()
+            .into_iter()
+            .find(|(n, _)| *n == job.table.as_str())
+            .is_some_and(|(_, table)| {
+                table.with_partition(job.partition, |p| {
+                    p.key() == job.key
+                        && p.replace_sealed_run(&ids, ChunkRef::Encoded(warm.clone()))
+                })
+            });
+        if !replaced {
+            if let Some(c) = cold {
+                self.graveyard.push(c);
+            }
+            return false;
+        }
+        for id in &ids {
+            if let Some(old) = self.cold.remove(&(job.table.clone(), job.key, *id)) {
+                self.graveyard.push(old);
+            }
+        }
+        self.compactions += 1;
+        self.compacted_chunks += ids.len() as u64;
+        // a move for the tier totals: the chunk counts changed
+        self.moves_to_warm += 1;
+        if let Some(c) = cold {
+            self.cold
+                .insert((job.table.clone(), job.key, warm.meta().id), c);
+        }
+        // nothing new became durable: the rows were in segments before
+        false
+    }
+
+    /// Find runs of small encoded chunks and hand them out to be merged (one run per partition
+    /// at a time; in the tick itself, within its time budget, when there are no encode
+    /// threads). A run is adjacent chunks of fewer than [`SMALL_CHUNK_ROWS`] rows each, in time
+    /// order, every one of them in a segment when segments are kept, that fit one chunk
+    /// together; it is merged when it has [`MIN_MERGE_PARTS`] chunks or makes a chunk that is
+    /// no longer small.
+    ///
+    /// Small chunks come from bounding memory: with many partitions and a budget for
+    /// uncompressed rows, open chunks are sealed long before they are full. Every chunk has a
+    /// fixed cost (its statistics at planning, a decode call per column, a file), so a
+    /// partition in a hundred pieces is read a hundred times slower than its rows need.
+    fn compact_small_chunks(&mut self, tables: &Tables, t0: Instant) -> bool {
+        let mut persisted = false;
+        for (name, table) in tables.persistent() {
+            for idx in 0..table.num_partitions() {
+                match &self.pool {
+                    Some(p) if self.in_flight.len() >= p.max_in_flight => return persisted,
+                    None if t0.elapsed() > self.budget => return persisted,
+                    _ => {}
+                }
+                let job = table.with_partition(idx, |p| {
+                    if self.merging.contains(&(name.to_owned(), p.key())) {
+                        return None;
+                    }
+                    let run = self.small_run(name, p)?;
+                    let parts: Vec<ChunkRef> = run.clone().map(|i| p.sealed()[i].clone()).collect();
+                    let mut replaces: Vec<u64> = Vec::new();
+                    for part in &parts {
+                        replaces.push(part.id().0);
+                        if let ChunkRef::Encoded(e) = part {
+                            replaces.extend_from_slice(&e.meta().replaces);
+                        }
+                    }
+                    replaces.sort_unstable();
+                    replaces.dedup();
+                    if replaces.len() > MAX_REPLACED_IDS {
+                        return None;
+                    }
+                    let (first, last) = (parts.first()?, parts.last()?);
+                    let lsn = (
+                        first.lsn_range().0,
+                        last.lsn_range().1,
+                        last.last_lsn_rows(),
+                    );
+                    let key = p.key();
+                    let schema = table.schema().clone();
+                    let id = p.fresh_chunk_id();
+                    Some(EncodeJob {
+                        table: name.to_owned(),
+                        partition: idx,
+                        key,
+                        chunk: Arc::new(ankaa_store::Chunk::new(id, schema)),
+                        merge: Some(Merge {
+                            parts,
+                            replaces,
+                            lsn,
+                        }),
+                    })
+                });
+                let Some(job) = job else { continue };
+                self.merging.insert((job.table.clone(), job.key));
+                if let Some(pool) = &self.pool {
+                    self.in_flight
+                        .insert((job.table.clone(), job.key, job.chunk.id()));
+                    let _ = pool.jobs.send(job);
+                    continue;
+                }
+                match run_job(&self.enc, self.checkpoint_dir.as_deref(), &job) {
+                    Ok((warm, cold)) => persisted |= self.install(tables, &job, &warm, cold),
+                    Err(e) => {
+                        self.errors += 1;
+                        self.merging.remove(&(job.table.clone(), job.key));
+                        warn!(table = %job.table, partition = job.key, error = %e, "compaction failed; the chunks stay as they are");
+                    }
+                }
+            }
+        }
+        persisted
+    }
+
+    /// The first run of sealed chunks of `p` worth merging, as positions in `p.sealed()`.
+    fn small_run(&self, table: &str, p: &ankaa_store::Partition) -> Option<std::ops::Range<usize>> {
+        let sealed = p.sealed();
+        let small = |c: &ChunkRef| {
+            matches!(c, ChunkRef::Encoded(_))
+                && c.num_rows() < SMALL_CHUNK_ROWS
+                && (self.checkpoint_dir.is_none()
+                    || self.cold.contains_key(&(table.to_owned(), p.key(), c.id())))
+        };
+        let mut start = 0;
+        while start < sealed.len() {
+            if !small(&sealed[start]) {
+                start += 1;
+                continue;
+            }
+            let (mut end, mut rows) = (start + 1, sealed[start].num_rows());
+            while end < sealed.len()
+                && end - start < MAX_MERGE_PARTS
+                && small(&sealed[end])
+                && rows + sealed[end].num_rows() <= ankaa_store::CHUNK_ROWS
+                // the merged rows must be in time order
+                && sealed[end].time_range().map(|r| r.0) >= sealed[end - 1].time_range().map(|r| r.1)
+            {
+                rows += sealed[end].num_rows();
+                end += 1;
+            }
+            let parts = end - start;
+            if parts >= MIN_MERGE_PARTS || (parts >= 2 && rows >= SMALL_CHUNK_ROWS) {
+                return Some(start..end);
+            }
+            start = end;
+        }
+        None
+    }
+
+    /// Whether small chunks are merged (`storage.compact_small_chunks`; on by default).
+    #[must_use]
+    pub fn with_compaction(mut self, on: bool) -> Self {
+        self.compact = on;
+        self
     }
 
     /// Retention windows (table name → nanoseconds); tables not named keep everything.
@@ -505,6 +747,32 @@ impl Tiering {
             st.bad_files += 1;
             problems.push(format!("{}: unreadable ({e})", p.display()));
         })?;
+        // segments whose rows live on in a merged segment: a crash came between writing that
+        // one and deleting these
+        let dead: std::collections::HashSet<(String, u32, u64)> = segments
+            .iter()
+            .flat_map(|s| {
+                let m = s.meta();
+                m.replaces
+                    .iter()
+                    .map(|id| (m.table.clone(), m.partition, *id))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let (dead_segments, segments): (Vec<_>, Vec<_>) = segments.into_iter().partition(|s| {
+            let m = s.meta();
+            dead.contains(&(m.table.clone(), m.partition, m.id.0))
+        });
+        for seg in dead_segments {
+            let path = seg.path().to_path_buf();
+            drop(seg);
+            match std::fs::remove_file(&path) {
+                Ok(()) => st.replaced += 1,
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "segment replaced by a merged one could not be deleted; it is ignored");
+                }
+            }
+        }
         let all = tables.persistent();
         let names: HashMap<&str, &Table> = all.iter().copied().collect();
         for seg in &segments {
@@ -703,6 +971,7 @@ impl Tiering {
                     partition: idx,
                     key,
                     chunk,
+                    merge: None,
                 };
                 if let Some(pool) = &self.pool {
                     self.in_flight
@@ -710,16 +979,7 @@ impl Tiering {
                     let _ = pool.jobs.send(job);
                     continue;
                 }
-                let encoded = self
-                    .enc
-                    .encode_warm(name, key, &job.chunk)
-                    .and_then(|warm| {
-                        let cold = match &self.checkpoint_dir {
-                            Some(dir) => Some(self.enc.write_cold(dir, &warm)?),
-                            None => None,
-                        };
-                        Ok((warm, cold))
-                    });
+                let encoded = run_job(&self.enc, self.checkpoint_dir.as_deref(), &job);
                 match encoded {
                     Ok((warm, cold)) => persisted_any |= self.install(tables, &job, &warm, cold),
                     Err(e) => {
@@ -729,6 +989,15 @@ impl Tiering {
                     }
                 }
             }
+        }
+        // 1b. compaction: runs of small encoded chunks of a partition become one chunk
+        if self.compact
+            && self
+                .last_compact
+                .is_none_or(|t| t.elapsed() >= COMPACT_EVERY)
+        {
+            self.last_compact = Some(Instant::now());
+            persisted_any |= self.compact_small_chunks(tables, t0);
         }
         // 2. warm → cold when over budget (only chunks that have a segment)
         if self.checkpoint_dir.is_some() {
@@ -801,6 +1070,17 @@ impl Tiering {
             .store(self.moves_to_warm, Ordering::Relaxed);
         tm.moves_to_cold
             .store(self.moves_to_cold, Ordering::Relaxed);
+        tm.compactions.store(self.compactions, Ordering::Relaxed);
+        tm.compacted_chunks
+            .store(self.compacted_chunks, Ordering::Relaxed);
+        // what the warm tier leaves of its budget is lent to the segment cache: after a restart
+        // nothing is warm, and the segments queries return to take that place
+        if self.segment_cache_bytes > 0 {
+            self.enc.set_segment_cache(
+                self.segment_cache_bytes
+                    .saturating_add(self.warm_budget_bytes.saturating_sub(total.warm_bytes)),
+            );
+        }
         let cache = self.enc.segment_cache();
         tm.segment_cache_bytes
             .store(cache.bytes as u64, Ordering::Relaxed);
@@ -928,6 +1208,196 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// Every row of `trades` as text, in partition and stored order, whatever tier it is in.
+    fn dump(t: &Tables) -> Vec<String> {
+        let mut out = Vec::new();
+        for c in &t.trades.snapshot().chunks {
+            let n = c.schema().len();
+            let all: Vec<usize> = (0..n).collect();
+            match c {
+                ChunkRef::Hot(h) => {
+                    for row in 0..h.num_rows() {
+                        let cells: Vec<_> = (0..n).map(|i| h.value(i, row)).collect();
+                        out.push(format!("{cells:?}"));
+                    }
+                }
+                ChunkRef::Encoded(e) => {
+                    let cols = e.decode_nullable(&all).unwrap();
+                    for row in 0..e.meta().num_rows {
+                        let cells: Vec<_> = cols.iter().map(|(col, _)| col.get(row)).collect();
+                        out.push(format!("{cells:?}"));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 40 small sealed chunks per symbol, as bounded memory leaves them.
+    fn fragmented() -> Tables {
+        let mut tables = Tables::new(false);
+        for i in 0..40 {
+            tables.ingest(&trades(i * 500, 500));
+            for idx in 0..tables.trades.num_partitions() {
+                tables
+                    .trades
+                    .with_partition(idx, ankaa_store::Partition::seal_open);
+            }
+        }
+        tables
+    }
+
+    /// Tick (searching for runs every time) until nothing is out and nothing more is merged.
+    fn compacted(t: &mut Tiering, tables: &Tables, metrics: &Metrics) {
+        let t0 = Instant::now();
+        loop {
+            let before = (t.moves_to_warm, t.compactions);
+            t.last_compact = None;
+            t.tick(tables, metrics);
+            if t.in_flight.is_empty() && (t.moves_to_warm, t.compactions) == before {
+                return;
+            }
+            assert!(t0.elapsed() < Duration::from_secs(30), "did not settle");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Small chunks of a partition become full ones and no row changes: the same rows in the
+    /// same order before and after, in the tick and on encode threads, and after a restart
+    /// from the segments, of which only the merged ones are left.
+    #[test]
+    fn small_chunks_are_merged_and_no_row_changes() {
+        let metrics = Metrics::default();
+        for threads in [0, 2] {
+            let dir = tempfile::tempdir().unwrap();
+            let tables = fragmented();
+            let before = dump(&tables);
+            assert_eq!(before.len(), 20_000);
+            let sealed_before = tables.trades.tier_stats();
+            let mut t = Tiering::new(
+                Some(dir.path().to_path_buf()),
+                1,
+                usize::MAX,
+                Duration::from_secs(5),
+                Duration::ZERO,
+            )
+            .with_encoders(threads)
+            .unwrap();
+            compacted(&mut t, &tables, &metrics);
+            let st = tables.trades.tier_stats();
+            assert!(
+                t.compactions >= 2,
+                "threads {threads}: {} merges",
+                t.compactions
+            );
+            assert!(
+                st.warm_chunks + st.cold_chunks <= 4,
+                "threads {threads}: {st:?} (before: {sealed_before:?})"
+            );
+            assert_eq!(dump(&tables), before, "threads {threads}");
+            assert_eq!(total_rows(&tables), 20_000);
+            // the segments of the merged-away chunks are gone
+            t.tick(&tables, &metrics);
+            assert_eq!(segment_count(dir.path()), t.cold.len(), "threads {threads}");
+            assert_eq!(t.cold.len(), st.warm_chunks + st.cold_chunks);
+            // a compaction switched off leaves the chunks as they are
+            let untouched = fragmented();
+            let mut off = Tiering::new(None, 1, usize::MAX, Duration::from_secs(5), Duration::ZERO)
+                .with_compaction(false);
+            compacted(&mut off, &untouched, &metrics);
+            assert_eq!(off.compactions, 0);
+            assert!(untouched.trades.tier_stats().warm_chunks > 40);
+
+            // restart from the segments
+            drop(t);
+            let restarted = Tables::new(false);
+            let mut t2 = Tiering::new(
+                Some(dir.path().to_path_buf()),
+                1,
+                usize::MAX,
+                Duration::from_secs(5),
+                Duration::ZERO,
+            );
+            let rs = t2.restore(&restarted).unwrap();
+            assert_eq!((rs.replaced, rs.bad_files), (0, 0));
+            let persisted: Vec<String> = dump(&restarted);
+            // (the newest chunk of each symbol stayed hot and was never persisted)
+            assert_eq!(persisted.len() as u64, rs.rows);
+            assert!(persisted.iter().all(|r| before.contains(r)));
+        }
+    }
+
+    /// A crash between writing a merged segment and deleting the segments it replaces leaves
+    /// both on disk. The next start keeps the merged one and deletes the others: no row twice.
+    #[test]
+    fn a_crash_during_compaction_neither_loses_nor_repeats_rows() {
+        let metrics = Metrics::default();
+        let dir = tempfile::tempdir().unwrap();
+        let backup = tempfile::tempdir().unwrap();
+        let tables = fragmented();
+        let mut t = Tiering::new(
+            Some(dir.path().to_path_buf()),
+            1,
+            usize::MAX,
+            Duration::from_secs(5),
+            Duration::ZERO,
+        )
+        .with_compaction(false);
+        compacted(&mut t, &tables, &metrics);
+        // every small chunk is in a segment; keep copies of those files
+        let small = segment_count(dir.path());
+        assert!(small > 70);
+        for f in std::fs::read_dir(dir.path().join("trades")).unwrap() {
+            let f = f.unwrap();
+            std::fs::copy(f.path(), backup.path().join(f.file_name())).unwrap();
+        }
+        let persisted_before: std::collections::BTreeSet<String> = {
+            let check = Tables::new(false);
+            let mut tr = Tiering::new(
+                Some(dir.path().to_path_buf()),
+                1,
+                usize::MAX,
+                Duration::from_secs(5),
+                Duration::ZERO,
+            );
+            tr.restore(&check).unwrap();
+            dump(&check).into_iter().collect()
+        };
+        // merge, let the old files be deleted, then put them back: the state after a crash
+        // that came before the deletion
+        let mut t = t.with_compaction(true);
+        compacted(&mut t, &tables, &metrics);
+        t.tick(&tables, &metrics);
+        let merged = segment_count(dir.path());
+        assert!(merged <= 4, "{merged} segments left");
+        drop(t);
+        for f in std::fs::read_dir(backup.path()).unwrap() {
+            let f = f.unwrap();
+            let back = dir.path().join("trades").join(f.file_name());
+            if !back.exists() {
+                std::fs::copy(f.path(), back).unwrap();
+            }
+        }
+        assert_eq!(segment_count(dir.path()), small + merged);
+
+        let restarted = Tables::new(false);
+        let mut t2 = Tiering::new(
+            Some(dir.path().to_path_buf()),
+            1,
+            usize::MAX,
+            Duration::from_secs(5),
+            Duration::ZERO,
+        );
+        let rs = t2.restore(&restarted).unwrap();
+        assert_eq!(rs.replaced, small);
+        assert_eq!(rs.segments, merged);
+        assert_eq!(segment_count(dir.path()), merged);
+        let rows = dump(&restarted);
+        let distinct: std::collections::BTreeSet<String> = rows.iter().cloned().collect();
+        assert_eq!(rows.len(), distinct.len(), "a row came back twice");
+        assert_eq!(distinct, persisted_before);
     }
 
     /// Encoding on threads leaves exactly what encoding in the tick leaves: the same chunks in

@@ -162,6 +162,8 @@ Good looks like: `rate(ankaa_wal_durable_lsn[1m]) > 0` whenever `rate(ankaa_fram
 | `ankaa_tier_chunks{tier="hot|warm|cold"}` | gauge | chunks | Sealed chunks per storage tier, set on every snapshot tick by the tiering step. |
 | `ankaa_tier_bytes{tier="hot|warm|cold"}` | gauge | bytes | Bytes per tier (plain for hot, encoded size for warm, file size for cold). |
 | `ankaa_tier_moves_total{to="warm|cold"}` | counter | chunks | Chunk moves hot→warm and warm→cold since start. |
+| `ankaa_tier_compactions_total` | counter | merges | Runs of small chunks of a partition merged into one chunk (`storage.compact_small_chunks`). |
+| `ankaa_tier_compacted_chunks_total` | counter | chunks | Small chunks replaced by those merges. Divided by the merges: the average run length. |
 | `ankaa_segment_cache_bytes` | gauge | bytes | Cold segment files held in memory by the segment cache (`storage.segment_cache_mib`), compressed as on disk. Updated every snapshot tick. |
 | `ankaa_segment_cache_reads_total{from="cache|file"}` | counter | reads | Reads of a cold chunk answered from the segment cache, and reads that opened the segment file. A low share of `cache` under steady queries means the queried data is larger than the cache. |
 | `ankaa_checkpoints_total` | counter | checkpoints | Checkpoints that produced a WAL truncation request. |

@@ -77,6 +77,18 @@ impl Column {
         }
     }
 
+    /// Append the values of `other`; `false` (nothing appended) when it holds another type.
+    pub fn extend_from(&mut self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::I64(a), Self::I64(b)) => a.extend_from_slice(b),
+            (Self::U32(a), Self::U32(b)) => a.extend_from_slice(b),
+            (Self::U8(a), Self::U8(b)) => a.extend_from_slice(b),
+            (Self::F64(a), Self::F64(b)) => a.extend_from_slice(b),
+            _ => return false,
+        }
+        true
+    }
+
     /// A copy of rows `rows` (clamped to the column's length).
     #[must_use]
     pub fn copy_range(&self, rows: core::ops::Range<usize>) -> Self {

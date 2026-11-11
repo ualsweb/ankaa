@@ -66,6 +66,13 @@ pub struct ChunkMeta {
     /// Empty in segments written before this field existed (the row is decoded instead).
     #[serde(default)]
     pub last_row: Vec<Option<u64>>,
+    /// Ids of the chunks of this partition whose rows this chunk holds instead: it was made by
+    /// compaction from them (and from the chunks they had replaced in turn). A segment whose
+    /// id is listed by another segment of its partition is dead: it is skipped and deleted at
+    /// start-up, so a crash between writing the merged segment and deleting the old ones
+    /// neither loses nor repeats a row. Empty for a chunk that was never merged.
+    #[serde(default)]
+    pub replaces: Vec<u64>,
 }
 
 /// A value as 64 bits (`None` for `NULL`): two's complement for integers, IEEE 754 for floats.
@@ -138,6 +145,7 @@ impl ChunkMeta {
                 })
                 .unwrap_or_default(),
             tie_order: chunk.zone_map().and_then(|z| z.tie_order),
+            replaces: Vec::new(),
             last_row: chunk
                 .num_rows()
                 .checked_sub(1)
@@ -815,6 +823,7 @@ mod tests {
             i64_stats: vec![(0, 0, 4, 10)],
             tie_order: Some((0, 4)),
             last_row: vec![Some(4), Some(0)],
+            replaces: Vec::new(),
         };
         let cols = vec![
             Column::I64((0..5).collect()),

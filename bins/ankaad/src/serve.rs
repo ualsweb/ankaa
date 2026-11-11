@@ -612,6 +612,7 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         usize::try_from(cfg.storage.segment_cache_mib.saturating_mul(1024 * 1024))
             .unwrap_or(usize::MAX),
     )
+    .with_compaction(cfg.storage.compact_small_chunks)
     .with_retention(retention_windows(cfg))
     .with_encoders(cfg.storage.tier_workers.unwrap_or_else(|| {
         (std::thread::available_parallelism().map_or(1, std::num::NonZero::get) / 4).clamp(1, 16)
@@ -632,6 +633,7 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             max_lsn = st.max_lsn,
             bad_files = st.bad_files,
             evolved = st.evolved,
+            replaced = st.replaced,
             symbols = symbols_saved,
             dictionary_values = dict_values_saved,
             ms = t0.elapsed().as_millis(),
@@ -773,6 +775,9 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     register_functions(&ctx);
     let mut symbols_registered = ingest.dec.symbols().len();
     let mut live_extra: Vec<(String, Arc<ChunkTable>)> = Vec::new();
+    // version of each table's content as last shown to queries (see the snapshot tick)
+    let mut published_versions: std::collections::HashMap<String, u64> =
+        std::collections::HashMap::new();
     for (i, u) in ingest.tables.user.iter().enumerate() {
         let t = Arc::new(with(
             ChunkTable::from_snapshot(u.table.snapshot()),
@@ -1266,12 +1271,24 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 metrics.source_positions_saved.fetch_add(saved, Ordering::Relaxed);
                 // names first: every id in the views swapped in below has its name
                 dict_names.publish(ingest.dec.symbols(), &ingest.tables);
-                live_trades.swap_snapshot(ingest.tables.trades.snapshot());
-                live_deltas.swap_snapshot(ingest.tables.deltas.snapshot());
-                live_quotes.swap_snapshot(ingest.tables.quotes.snapshot());
-                for (name, t) in &live_extra {
-                    if let Some((_, src)) = ingest.tables.all().into_iter().find(|(n, _)| *n == name.as_str()) {
-                        t.swap_snapshot(src.snapshot());
+                // a table nobody wrote to keeps the view it has: building one walks every chunk
+                {
+                    let all = ingest.tables.all();
+                    let market = [
+                        ("trades", &ingest.tables.trades, &live_trades),
+                        ("book_deltas", &ingest.tables.deltas, &live_deltas),
+                        ("quotes", &ingest.tables.quotes, &live_quotes),
+                    ];
+                    let extra = live_extra.iter().filter_map(|(name, live)| {
+                        let (_, src) = all.iter().find(|(n, _)| *n == name.as_str())?;
+                        Some((name.as_str(), *src, live))
+                    });
+                    for (name, src, live) in market.into_iter().chain(extra) {
+                        let version = src.version();
+                        if published_versions.get(name) != Some(&version) {
+                            live.swap_snapshot(src.snapshot());
+                            published_versions.insert(name.to_owned(), version);
+                        }
                     }
                 }
                 let mut registered = Ok(());

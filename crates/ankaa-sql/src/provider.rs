@@ -250,6 +250,9 @@ impl MetaRows {
     }
 }
 
+/// Stands for "the last row of the chunk" while the newest rows are searched.
+const LAST_ROW: usize = usize::MAX;
+
 /// Rows per batch of a [`ChunkTable::latest`] result.
 const LATEST_BATCH_ROWS: usize = 8192;
 
@@ -577,8 +580,8 @@ impl ChunkTable {
             .iter()
             .map(|&c| self.names_of(c).map(|n| n.values()))
             .collect();
-        let chunks = self.chunks.read().clone();
-        let wanted = self.newest_rows(&chunks, key)?;
+        let (chunks, index) = self.indexed();
+        let wanted = self.newest_rows(&chunks, &index, key)?;
         if projection.is_empty() {
             // `count(*)`: the rows are counted, none of their columns is read
             let rows =
@@ -650,7 +653,16 @@ impl ChunkTable {
     }
 
     /// `(chunk, row)` of the newest row of every value of the `dict` column `key`, sorted.
-    fn newest_rows(&self, chunks: &[ChunkRef], key: usize) -> Result<Vec<(usize, usize)>> {
+    ///
+    /// A chunk that holds one key value is judged from the pruning index (its newest
+    /// timestamp and its id): no chunk is touched for it, and only a winner is asked for its
+    /// number of rows.
+    fn newest_rows(
+        &self,
+        chunks: &[ChunkRef],
+        index: &PruneIndex,
+        key: usize,
+    ) -> Result<Vec<(usize, usize)>> {
         use arrow::array::AsArray;
         use datafusion::error::DataFusionError;
         // per key id, the newest row seen so far: (timestamp, chunk, row)
@@ -666,12 +678,15 @@ impl ChunkTable {
             }
         };
         let ids_schema = Arc::new(arrow_schema(&self.ankaa_schema).project(&[0, key])?);
+        let ranges = index.ids(chunks, key);
         for (ci, chunk) in chunks.iter().enumerate() {
-            let Some((_, ts_max)) = chunk.time_range() else {
+            let ts_max = index.ts_max[ci];
+            if index.ts_min[ci] > ts_max {
                 continue; // empty
-            };
-            match chunk.u32_range(key) {
-                Some((lo, hi)) if lo == hi => consider(lo, ts_max, ci, chunk.num_rows() - 1),
+            }
+            match ranges.and_then(|r| r.range(ci)) {
+                // the last row of the chunk; its position is looked up for winners only
+                Some((lo, hi)) if lo == hi => consider(lo, ts_max, ci, LAST_ROW),
                 _ => {
                     let Some(cols) = chunk_columns(
                         chunk,
@@ -704,7 +719,14 @@ impl ChunkTable {
         let mut wanted: Vec<(usize, usize)> = newest
             .iter()
             .flatten()
-            .map(|&(_, chunk, row)| (chunk, row))
+            .map(|&(_, chunk, row)| {
+                let row = if row == LAST_ROW {
+                    chunks[chunk].num_rows().saturating_sub(1)
+                } else {
+                    row
+                };
+                (chunk, row)
+            })
             .collect();
         wanted.sort_unstable();
         Ok(wanted)

@@ -215,6 +215,9 @@ pub enum AppendError {
     NoTimestamp,
 }
 
+/// The columns of some rows and, per column, which rows hold a value (`None`: all of them).
+pub type ChunkPart = (Vec<Column>, Vec<Option<Vec<bool>>>);
+
 /// An append-only columnar chunk.
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -259,6 +262,91 @@ impl Chunk {
             last_lsn: 0,
             last_lsn_rows: 0,
         }
+    }
+
+    /// One sealed chunk holding the rows of `parts`, in that order: what compaction makes of
+    /// several small chunks of a partition. Every part gives its columns (the schema's, all of
+    /// one length) and its validity per column (`None`: no `NULL`). `lsn` is the WAL
+    /// bookkeeping of the result: `(first, last, rows of the last record)`.
+    ///
+    /// Refused (`Err` says why) when the parts do not fit the schema, hold more than
+    /// [`crate::CHUNK_ROWS`] rows together, or their timestamps are not in order across the
+    /// whole: a chunk's rows are in time order, and every reader relies on it.
+    pub fn merged(
+        id: ChunkId,
+        schema: Schema,
+        parts: &[ChunkPart],
+        lsn: (u64, u64, u32),
+    ) -> Result<Self, String> {
+        let total: usize = parts
+            .iter()
+            .map(|(c, _)| c.first().map_or(0, Column::len))
+            .sum();
+        if total > crate::CHUNK_ROWS {
+            return Err(format!("{total} rows do not fit one chunk"));
+        }
+        let mut columns: Vec<Column> = schema
+            .fields()
+            .iter()
+            .map(|f| Column::with_capacity(f.ty, total))
+            .collect();
+        let mut validity: Vec<Option<Vec<bool>>> = vec![None; schema.len()];
+        let mut rows = 0usize;
+        for (cols, valid) in parts {
+            if cols.len() != columns.len() || valid.len() != columns.len() {
+                return Err("a part has another number of columns".into());
+            }
+            let n = cols.first().map_or(0, Column::len);
+            for (i, (col, v)) in cols.iter().zip(valid).enumerate() {
+                if col.len() != n || !columns[i].extend_from(col) {
+                    return Err(format!("column {i} of a part does not fit the schema"));
+                }
+                match (v, &mut validity[i]) {
+                    (Some(v), _) if v.len() != n => {
+                        return Err(format!("validity of column {i} has another length"));
+                    }
+                    (Some(v), Some(all)) => all.extend_from_slice(v),
+                    (Some(v), slot @ None) => {
+                        // the rows before this part all hold a value
+                        let mut all = vec![true; rows];
+                        all.extend_from_slice(v);
+                        *slot = Some(all);
+                    }
+                    (None, Some(all)) => all.resize(rows + n, true),
+                    (None, None) => {}
+                }
+            }
+            rows += n;
+        }
+        for (i, v) in validity.iter_mut().enumerate() {
+            if v.as_ref().is_some_and(|v| !v.contains(&false)) {
+                *v = None;
+            } else if v.is_some() && !schema.fields()[i].nullable {
+                return Err(format!("column {i} holds NULL and is not nullable"));
+            }
+        }
+        let ts = columns
+            .first()
+            .and_then(Column::as_i64)
+            .ok_or("the first column is not the timestamp")?;
+        if ts.windows(2).any(|w| w[0] > w[1]) {
+            return Err("the rows are not in time order".into());
+        }
+        let watermark = ts.last().copied().unwrap_or(i64::MIN);
+        let zone_map = Some(ZoneMap::of_valid(&columns, &validity));
+        Ok(Self {
+            id,
+            schema,
+            columns,
+            validity,
+            rows,
+            watermark,
+            state: ChunkState::Sealed,
+            zone_map,
+            first_lsn: lsn.0,
+            last_lsn: lsn.1,
+            last_lsn_rows: lsn.2,
+        })
     }
 
     /// Record that rows appended from now on came from WAL record `lsn` (ignored when 0).

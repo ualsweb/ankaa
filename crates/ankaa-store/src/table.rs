@@ -60,6 +60,9 @@ pub struct Partition {
     /// When the open chunk received its first row (`None` while it is empty): how long its rows
     /// have been waiting, uncompressed, for the chunk to fill.
     open_since: Option<std::time::Instant>,
+    /// Changes to the sealed chunks (sealed, moved between tiers, merged, restored, expired).
+    /// With the rows accepted it tells whether queries need a new view ([`Self::version`]).
+    moves: u64,
 }
 
 /// What queries see of a chunk that is still being written: sealed copies of consecutive row
@@ -97,7 +100,15 @@ impl Partition {
             open_view: parking_lot::Mutex::new(OpenView::default()),
             max_lateness,
             open_since: None,
+            moves: 0,
         }
+    }
+
+    /// A number that grows with every change queries can see: a row accepted, a chunk sealed,
+    /// moved to another tier, merged, restored or expired. Equal numbers: the same content.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.stats.rows.wrapping_add(self.moves)
     }
 
     /// Rows in the open chunk.
@@ -177,10 +188,41 @@ impl Partition {
         match self.sealed.iter_mut().find(|c| c.id() == id) {
             Some(slot) => {
                 *slot = replacement;
+                self.moves += 1;
                 true
             }
             None => false,
         }
+    }
+
+    /// Replace the sealed chunks `ids` (adjacent, in this order) by `merged`, which holds
+    /// their rows: compaction. Returns `false`, changing nothing, when the partition no longer
+    /// holds exactly that run (retention dropped part of it meanwhile).
+    pub fn replace_sealed_run(&mut self, ids: &[ChunkId], merged: ChunkRef) -> bool {
+        let Some(first) = ids.first() else {
+            return false;
+        };
+        let Some(at) = self.sealed.iter().position(|c| c.id() == *first) else {
+            return false;
+        };
+        let run = self.sealed.get(at..at + ids.len());
+        if !run.is_some_and(|run| run.iter().zip(ids).all(|(c, id)| c.id() == *id)) {
+            return false;
+        }
+        self.sealed.splice(at..at + ids.len(), [merged]);
+        self.moves += 1;
+        self.stats.sealed_chunks = self
+            .stats
+            .sealed_chunks
+            .saturating_sub(ids.len() as u64 - 1);
+        true
+    }
+
+    /// An id for a chunk made outside the partition (a merged chunk): never given before.
+    pub fn fresh_chunk_id(&mut self) -> ChunkId {
+        let id = ChunkId(self.next_id);
+        self.next_id += 1;
+        id
     }
 
     /// Re-attach a sealed chunk from a persisted segment at start-up (before any append).
@@ -192,6 +234,7 @@ impl Partition {
         self.next_id = self.next_id.max(chunk.id().0 + 1);
         self.stats.sealed_chunks += 1;
         self.stats.rows += chunk.num_rows() as u64;
+        self.moves += 1;
         let wm = chunk.watermark();
         let pos = self.sealed.partition_point(|c| c.watermark() <= wm);
         self.sealed.insert(pos, chunk);
@@ -343,6 +386,7 @@ impl Partition {
         self.open.set_watermark(done.watermark());
         self.sealed.push(ChunkRef::Hot(Arc::new(done)));
         self.stats.sealed_chunks += 1;
+        self.moves += 1;
     }
 
     /// Watermark: max accepted timestamp across the partition (`i64::MIN` when empty).
@@ -424,6 +468,7 @@ impl Partition {
             self.open.set_watermark(wm);
         }
         self.stats.expired_rows += expired.iter().map(|c| c.num_rows() as u64).sum::<u64>();
+        self.moves += 1;
         expired
     }
 
@@ -803,6 +848,17 @@ impl Table {
         for p in self.partitions.write().iter_mut() {
             p.seal_open();
         }
+    }
+
+    /// A number that changes whenever the content queries see changes (rows, chunks, tiers):
+    /// while it stays the same, the last [`Self::snapshot`] is still exact. Costs a pass over
+    /// the partitions, not over their chunks.
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        let parts = self.partitions.read();
+        parts
+            .iter()
+            .fold(parts.len() as u64, |v, p| v.wrapping_add(p.version()))
     }
 
     /// Consistent snapshot for queries.

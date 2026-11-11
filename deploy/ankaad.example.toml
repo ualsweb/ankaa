@@ -63,6 +63,10 @@ warm_budget_mib = 512
 # used out first. A cold chunk read again skips the file read and the footer parse. 0 = none.
 segment_cache_mib = 256
 
+# Merge runs of small sealed chunks of a partition into full ones in the background (many devices
+# under a memory bound seal chunks early; every chunk costs a little at query time and is a file).
+compact_small_chunks = true
+
 # Minimum seconds between WAL truncations after a checkpoint.
 checkpoint_interval_s = 60
 
