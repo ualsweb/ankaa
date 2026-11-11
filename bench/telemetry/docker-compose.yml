@@ -1,0 +1,103 @@
+# Engines of bench/telemetry (TSBS cpu-only): pinned, multi-arch images (arm64 pulled on Axion/Graviton).
+# DuckDB runs in-process (Python) and ANKAA from the repo's own binary, so only these three are containers.
+#
+# run.py starts ONE service at a time (`docker compose up -d <service>`), loads it, times it and stops it
+# before the next one, so no engine competes with another for the 4 vCPUs. By hand:
+#
+#   docker compose -f bench/telemetry/docker-compose.yml up -d influxdb3
+#   docker compose -f bench/telemetry/docker-compose.yml down -v          # also drops the data volumes
+#
+# Policy (docs/benchmarks/comparison-method.md): stock images, vendor defaults, nothing tuned DOWN; the
+# few settings below are either required to run the benchmark at all or recommended by the vendor's own
+# documentation, each with its link. No CPU or memory limits: every engine sees the whole machine.
+# Host ports differ from bench/compare's so both stacks can exist on one box (never run them together).
+name: ankaa-tsbs
+
+services:
+  influxdb3:
+    # InfluxDB 3 Core (open-source edition), 2026-10-30 release. https://hub.docker.com/_/influxdb
+    image: influxdb:3.12.2-core
+    container_name: ankaa-tsbs-influxdb3
+    command:
+      - influxdb3
+      - serve
+      - --node-id=tsbs
+      - --object-store=file
+      - --data-dir=/var/lib/influxdb3/data
+      # Benchmark only: no tokens (the port is bound to loopback). Auth does not change the data path.
+      # https://docs.influxdata.com/influxdb3/core/reference/config-options/#without-auth
+      - --without-auth
+      # "We recommend 100ms for local disks" (default 1s, sized for object stores):
+      # https://docs.influxdata.com/influxdb3/core/reference/config-options/#wal-flush-interval
+      - --wal-flush-interval=100ms
+    environment:
+      # Core refuses queries that would read more Parquet files than this (default 432 = 72 h of 10-minute
+      # gen1 files). The 3-day dataset is 432 files on the smoke run (measured) and more when a 10-minute
+      # chunk straddles two snapshots, so whole-range queries (lastpoint) would fail at the default; the
+      # documented option is to raise it.
+      # https://docs.influxdata.com/influxdb3/core/reference/config-options/#query-file-limit
+      INFLUXDB3_QUERY_FILE_LIMIT: "4320"
+      # The in-memory Parquet file cache (default 20% of RAM) only takes files whose data is newer than
+      # now - recency (default 5h). TSBS data is stamped 2016, so with the default the cache would never
+      # apply, unlike in any live deployment; the window is widened to cover the dataset.
+      # https://docs.influxdata.com/influxdb3/core/reference/config-options/#file-cache-recency
+      INFLUXDB3_FILE_CACHE_RECENCY: "100000h"
+      # A snapshot moves buffered WAL data to Parquet after 600 WAL files or after this age (default 1h).
+      # run.py waits until every row is in Parquet before timing queries (the "at rest" state every
+      # other engine is measured in); 1m bounds that wait without changing the snapshot cadence during
+      # the load (600 x 100 ms = one snapshot per minute anyway).
+      # https://docs.influxdata.com/influxdb3/core/reference/config-options/#force-snapshot-max-age
+      INFLUXDB3_FORCE_SNAPSHOT_MAX_AGE: "1m"
+    ports:
+      - "127.0.0.1:8181:8181"
+    volumes:
+      - influxdb3-data:/var/lib/influxdb3
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+
+  timescaledb:
+    # TimescaleDB 2.31.0 on PostgreSQL 17, the full (Timescale License) image: the columnstore is not in
+    # the -oss image. https://hub.docker.com/r/timescale/timescaledb
+    image: timescale/timescaledb:2.31.0-pg17
+    container_name: ankaa-tsbs-timescaledb
+    environment:
+      POSTGRES_PASSWORD: tsbs
+      # The image runs timescaledb-tune on first start and sizes shared_buffers, effective_cache_size,
+      # work_mem, max_worker_processes / parallel workers to the machine (left at its defaults).
+      # https://docs.timescale.com/self-hosted/latest/configuration/timescaledb-tune/
+    ports:
+      - "127.0.0.1:5433:5432"
+    # Parallel query workers use dynamic shared memory in /dev/shm; Docker's 64 MB default makes
+    # parallel plans fail ("could not resize shared memory segment"). Required, not a tuning.
+    shm_size: 2g
+    volumes:
+      - timescaledb-data:/var/lib/postgresql/data
+
+  questdb:
+    # Same pin as bench/compare (10.1.0, 2026-10-22). https://hub.docker.com/r/questdb/questdb
+    image: questdb/questdb:10.1.0
+    container_name: ankaa-tsbs-questdb
+    ports:
+      - "127.0.0.1:9300:9000"   # REST + ILP over HTTP
+      - "127.0.0.1:8813:8812"   # PostgreSQL wire
+    environment:
+      QDB_PG_USER: admin
+      QDB_PG_PASSWORD: quest
+      # https://questdb.com/docs/configuration/ - worker pools default to the CPU count. Only timeouts
+      # are raised so that a slow query is measured instead of cancelled.
+      QDB_HTTP_QUERY_TIMEOUT: 600000
+      QDB_PG_NET_CONNECTION_TIMEOUT: 600000
+    volumes:
+      - questdb-data:/var/lib/questdb
+    ulimits:
+      # https://questdb.com/docs/operations/capacity-planning/#maximum-open-files
+      nofile:
+        soft: 1048576
+        hard: 1048576
+
+volumes:
+  influxdb3-data:
+  timescaledb-data:
+  questdb-data:

@@ -17,7 +17,7 @@ writes to `results/smoke/` (git-ignored) and labels the output as a smoke test.
 | `queries/manifest.json` | The 20-query tick set: ids, descriptions, comparison rules (exact / approx / quantile), which ones are timed. |
 | `queries/{ankaa,duckdb,clickhouse,questdb}.sql` | The same queries in each dialect (`-- @query <id>` blocks, `{T0}`/`{T1}` placeholders). |
 | `run.py` | Verifies each engine's result against the DuckDB reference, then times each query (warm-up + N runs, median and p95) with each engine's native client. Writes `results/<date>-<host>.json` and `.md`. |
-| `harness/` | Shared Python: query loading, export, result diffing, engine adapters, system facts. Also used by `bench/oracle`. |
+| `harness/` | Shared Python: query loading, export, result diffing, engine adapters, system facts. Also used by `bench/oracle` and `bench/telemetry` (TSBS cpu-only: InfluxDB 3 Core, TimescaleDB adapters live here too). |
 | `report-template.md` | The report skeleton: hardware, OS, versions, dataset, protocol, caveats, table. |
 | `results/` | Committed JSON + Markdown of real runs only. |
 

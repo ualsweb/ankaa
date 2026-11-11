@@ -1,0 +1,8 @@
+# bench/telemetry (TSBS cpu-only comparison). Exact pins: the versions the harness was tested with.
+# Wheels exist for CPython 3.12 on manylinux aarch64 (Ubuntu 24.04 on Axion / Graviton) and macOS arm64.
+duckdb==2.0.0
+pyarrow==26.0.1
+pandas==3.1.1
+numpy==2.5.4
+psycopg[binary]==3.3.8
+requests==2.34.2

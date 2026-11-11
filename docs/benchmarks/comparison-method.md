@@ -16,6 +16,11 @@ protocol §6). The harness is `bench/compare/`; the correctness suite it depends
   `trades`, `quotes` (top of book reconstructed from L2), `book_deltas` and `symbols`, exported once and
   loaded identically everywhere. The bundled 20 s capture is a smoke test; a report uses a capture of hours.
 
+Telemetry counterpart: `bench/telemetry/` runs the TSBS cpu-only use case (generated DevOps CPU metrics,
+the 15 TSBS query types with fixed parameters) on ANKAA, InfluxDB 3 Core, TimescaleDB and QuestDB, with DuckDB as
+the reference, under the same rules plus its own (load timing, one engine at a time, at-rest state):
+see `bench/telemetry/README.md`.
+
 ## Fairness rules
 
 1. **Same box.** All engines run on the same instance, one at a time, nothing else running. Numbers are

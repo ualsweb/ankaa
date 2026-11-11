@@ -106,11 +106,42 @@ def render_time(dialect: str, ns: int) -> str:
         return f"toDateTime64('{_iso(ns, 9, sep=' ', suffix='')}', 9, 'UTC')"
     if dialect == "questdb":
         return f"'{_iso(ns, 6)}'"
+    if dialect == "timescaledb":
+        # PostgreSQL timestamptz has microsecond resolution
+        return f"TIMESTAMPTZ '{_iso(ns, 6, sep=' ', suffix='+00')}'"
+    if dialect == "influxdb3":
+        return f"'{_iso(ns, 9)}'"
     raise ValueError(f"unknown dialect {dialect!r}")
 
 
 def render(sql: str, dialect: str, t0_ns: int, t1_ns: int) -> str:
     return sql.replace("{T0}", render_time(dialect, t0_ns)).replace("{T1}", render_time(dialect, t1_ns))
+
+
+def parse_utc(text: str) -> int:
+    """`2016-01-02T06:57:30Z` (RFC 3339, UTC, whole seconds) -> integer nanoseconds."""
+    dt = datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp()) * 1_000_000_000
+
+
+def render_params(sql: str, dialect: str, params: dict) -> str:
+    """Fill the placeholders of the telemetry set (bench/telemetry/queries): {START}/{END} (RFC 3339 UTC
+    in the manifest, rendered as a literal of the dialect) and {HOSTS} (string literals, comma separated).
+    A placeholder whose parameter is missing is an error, so a query never runs half-rendered."""
+    out = sql
+    for key, ph in (("start", "{START}"), ("end", "{END}")):
+        if ph in out:
+            if not params.get(key):
+                raise ValueError(f"{ph} used but the manifest gives no {key!r}")
+            out = out.replace(ph, render_time(dialect, parse_utc(params[key])))
+    if "{HOSTS}" in out:
+        hosts = params.get("hosts") or []
+        if not hosts:
+            raise ValueError("{HOSTS} used but the manifest gives no hosts")
+        if any("'" in h for h in hosts):
+            raise ValueError(f"host names with quotes: {hosts}")
+        out = out.replace("{HOSTS}", ", ".join(f"'{h}'" for h in hosts))
+    return out
 
 
 def time_window(t_min_ns: int, t_max_ns: int) -> tuple[int, int]:

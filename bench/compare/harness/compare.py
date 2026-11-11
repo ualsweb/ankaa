@@ -16,6 +16,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 
@@ -141,6 +142,38 @@ def _quantile_ok(a, lo, hi, alpha: float) -> bool:
     return min(lo2, hi2) * (1 - alpha) <= a2 <= max(lo2, hi2) * (1 + alpha)
 
 
+def _fast_pass(a: pd.Series, e: pd.Series, kind: str, rtol: float) -> np.ndarray | None:
+    """Boolean mask of rows that certainly satisfy the rule (False = check the row one by one).
+
+    Only accepts what the per-value rules accept: both NULL; both integer columns and equal; both
+    numeric and (exact) equal / (approx) within rtol, compared as float64; object columns equal under
+    Python `==` (equal strings, or numbers equal by value). None = no fast path for these dtypes."""
+    an, en = a.isna().to_numpy(), e.isna().to_numpy()
+    both_null = an & en
+    num = pd.api.types.is_numeric_dtype
+    if num(a.dtype) and num(e.dtype) and not pd.api.types.is_bool_dtype(a.dtype) and not pd.api.types.is_bool_dtype(e.dtype):
+        ints = pd.api.types.is_integer_dtype(a.dtype), pd.api.types.is_integer_dtype(e.dtype)
+        if kind == "exact" and all(ints):
+            eq = a.to_numpy(dtype=np.int64, na_value=0) == e.to_numpy(dtype=np.int64, na_value=0)
+            return both_null | (eq & ~an & ~en)
+        av = a.to_numpy(dtype=np.float64, na_value=np.nan)
+        ev = e.to_numpy(dtype=np.float64, na_value=np.nan)
+        if kind == "exact" and any(ints) and np.nanmax(np.abs(np.concatenate([av, ev])), initial=0.0) >= 2.0**53:
+            return None  # an integer beyond 2^53 does not survive float64: leave it to the exact rule
+        with np.errstate(invalid="ignore"):
+            eq = (av == ev) if kind == "exact" else (np.abs(av - ev) <= rtol * np.maximum(np.abs(ev), 1e-300))
+        return both_null | (eq & ~an & ~en)
+    if kind == "exact" and (a.dtype == object or pd.api.types.is_string_dtype(a.dtype)) \
+            and (e.dtype == object or pd.api.types.is_string_dtype(e.dtype)):
+        av = a.astype(object).to_numpy(dtype=object, copy=True)
+        ev = e.astype(object).to_numpy(dtype=object, copy=True)
+        av[an] = None
+        ev[en] = None
+        eq = np.fromiter((x == y for x, y in zip(av, ev)), dtype=bool, count=len(av)) if len(av) else np.zeros(0, bool)
+        return both_null | (eq & ~an & ~en)
+    return None
+
+
 def _fmt_row(df: pd.DataFrame, i: int, cols: list[str]) -> str:
     return "{" + ", ".join(f"{c}={df.iloc[i][c]!r}" for c in cols if c in df.columns) + "}"
 
@@ -197,7 +230,16 @@ def diff_tables(
         if c in quant and f"{c}_hi" in e.columns:
             bad = [i for i in range(n) if not _quantile_ok(a.iloc[i][c], e.iloc[i][c], e.iloc[i][f"{c}_hi"], alpha)]
         else:
-            bad = [i for i in range(n) if not check(a.iloc[i][c], e.iloc[i][c])]
+            # Vectorised pre-check: rows it accepts are certainly equal under the rule; every other row
+            # goes through the per-value rule below, so the verdict is the per-value rule's alone.
+            if c in quant:
+                passed = _fast_pass(a[c], e[c], "approx", alpha)
+            elif c in approx:
+                passed = _fast_pass(a[c], e[c], "approx", approx[c])
+            else:
+                passed = _fast_pass(a[c], e[c], "exact", 0.0)
+            candidates = range(n) if passed is None else np.flatnonzero(~passed)
+            bad = [int(i) for i in candidates if not check(a[c].iat[i], e[c].iat[i])]
         if bad:
             problems.append(f"column {c!r} ({kind}): {len(bad)}/{n} rows differ; first {min(len(bad), MAX_SHOWN)}:")
             for i in bad[:MAX_SHOWN]:

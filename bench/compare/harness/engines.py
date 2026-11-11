@@ -1,4 +1,4 @@
-"""Native-client adapters. Each engine exposes:
+"""Native-client adapters (bench/compare tick set and bench/telemetry TSBS cpu-only). Each engine exposes:
 
     name, dialect, version(), load(data_dir, manifest), run(sql) -> RunResult, close()
 
@@ -16,6 +16,7 @@ import statistics
 import tempfile
 import time
 import urllib.parse
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -409,6 +410,565 @@ class QuestDBEngine(Engine):
         if self.pg is not None:
             self.pg.close()
 
+
+# ------------------------------------------------------------------------- telemetry (bench/telemetry)
+# TSBS cpu-only: one table `cpu` (ts, 10 tags, 10 float64 fields). The dataset manifest written by
+# bench/telemetry/generate.py names the tag and field columns and the three files every engine loads
+# from (cpu.parquet, cpu.csv, cpu.lp). `load()` returns a dict of facts about the load (wall time,
+# rows, method) that bench/telemetry/run.py stores next to the query times.
+
+
+def telemetry_columns(manifest: dict) -> tuple[list[str], list[str]]:
+    """(tags, fields) of the cpu table, in file order."""
+    return list(manifest["tags"]), list(manifest["fields"])
+
+
+def iter_line_batches(path: Path, lines: int) -> "Iterator[bytes]":
+    """Yield the file as byte blocks of `lines` whole lines each (the last block may be shorter)."""
+    import itertools
+
+    with path.open("rb", buffering=1 << 22) as f:
+        while True:
+            block = list(itertools.islice(f, lines))
+            if not block:
+                return
+            yield b"".join(block)
+
+
+def run_parallel(blocks: "Iterator[bytes]", send: "Callable[[bytes], None]", workers: int) -> int:
+    """Send blocks with `workers` threads, at most 2 x workers blocks in flight (the file is streamed,
+    never held in memory). Re-raises the first failure. Returns the number of blocks sent."""
+    import concurrent.futures as cf
+    import threading
+
+    slots = threading.BoundedSemaphore(2 * workers)
+    sent = 0
+    with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures: set[cf.Future] = set()
+
+        def release(_f: cf.Future) -> None:
+            slots.release()
+
+        for block in blocks:
+            slots.acquire()
+            fut = pool.submit(send, block)
+            fut.add_done_callback(release)
+            futures.add(fut)
+            sent += 1
+            done = {f for f in futures if f.done()}
+            for f in done:
+                f.result()
+            futures -= done
+        for f in cf.as_completed(futures):
+            f.result()
+    return sent
+
+
+def _wait_count(count: "Callable[[], int]", rows: int, what: str, timeout_s: float, interval_s: float = 0.2) -> float:
+    """Poll `count()` until it equals `rows`; return the seconds waited."""
+    t0 = time.monotonic()
+    seen = -1
+    while True:
+        seen = count()
+        if seen == rows:
+            return time.monotonic() - t0
+        if seen > rows:
+            raise RuntimeError(f"{what}: {seen} rows visible, {rows} were loaded")
+        if time.monotonic() - t0 > timeout_s:
+            raise RuntimeError(f"{what}: {seen} of {rows} rows visible after {timeout_s:.0f} s")
+        time.sleep(interval_s)
+
+
+def _rows_to_arrow(rows: list[tuple], names: list[str]) -> pa.Table:
+    """DB-API rows -> Arrow, column by column (no pandas round trip)."""
+    if not rows:
+        return pa.table({n: pa.array([], pa.null()) for n in names})
+    cols = list(zip(*rows))
+    return pa.table({n: pa.array(list(c)) for n, c in zip(names, cols)})
+
+
+class AnkaaServeEngine(AnkaaFlightEngine):
+    """ANKAA as a server: `ankaad serve` with a generated configuration, loaded through its own bulk
+    path (a `file` source reading cpu.csv, docs/generic-ingest.md), durable (wal_dir + checkpoint_dir),
+    queried over Arrow Flight like `ankaa-flight`.
+
+    The load clock starts when the process is spawned (the file source starts reading during start-up)
+    and stops when `ankaa_user_rows_total` on /metrics reaches the dataset's row count; a non-zero
+    `ankaa_user_rejected_total` fails the load. Rows are then visible to queries at the next snapshot
+    swap (storage.snapshot_ms, 50 ms by default); `SELECT count(*)` is checked before returning."""
+
+    name = "ankaa"
+    dialect = "ankaa"
+    timing_scope = "client-observed over Arrow Flight (pyarrow, DoGet with the SQL as ticket) until the last batch"
+
+    def __init__(self, workdir: Path, flight_port: int = 50051, metrics_port: int = 9100, token: str | None = None,
+                 warm_budget_mib: int | None = None, query_memory_mib: int | None = None, query_timeout_s: int = 600,
+                 load_timeout_s: float = 7200.0):
+        import secrets
+
+        self.ankaad = find_ankaad()
+        self.workdir = Path(workdir)
+        self.token = token or os.environ.get("ANKAA_TOKEN") or secrets.token_hex(24)
+        self.flight_port, self.metrics_port = flight_port, metrics_port
+        self.warm_budget_mib, self.query_memory_mib = warm_budget_mib, query_memory_mib
+        self.query_timeout_s, self.load_timeout_s = query_timeout_s, load_timeout_s
+        self.proc = None
+        self.log_path = self.workdir / "ankaad.log"
+        super().__init__(f"grpc://127.0.0.1:{flight_port}", self.token)
+
+    # -- process -------------------------------------------------------------------------------
+    @property
+    def pid(self) -> int | None:
+        return self.proc.pid if self.proc is not None else None
+
+    def config_text(self, data_dir: Path, manifest: dict) -> str:
+        tags, fields = telemetry_columns(manifest)
+        csv_cols = manifest["files"]["csv"]["columns"]
+        cols = ['  { name = "ts", type = "timestamp_ns" },']
+        cols += [f'  {{ name = "{t}", type = "dict" }},' for t in tags]
+        cols += [f'  {{ name = "{f}", type = "float64" }},' for f in fields]
+        mapping = ", ".join(f'{c} = "{i}"' for i, c in enumerate(csv_cols))
+        storage = [f'wal_dir = "{self.workdir / "wal"}"', f'checkpoint_dir = "{self.workdir / "segments"}"']
+        if self.warm_budget_mib:
+            storage.append(f"warm_budget_mib = {int(self.warm_budget_mib)}")
+        resources = [f"query_memory_mib = {int(self.query_memory_mib)}"] if self.query_memory_mib else []
+        return "\n".join([
+            "# generated by bench/telemetry (harness/engines.py AnkaaServeEngine); docs/generic-ingest.md",
+            "[feed]", "enabled = false", "streams = []", "",
+            "[server]", f'flight_addr = "127.0.0.1:{self.flight_port}"', f'metrics_addr = "127.0.0.1:{self.metrics_port}"',
+            'token_env = "ANKAA_TOKEN"', f"query_timeout_s = {int(self.query_timeout_s)}", "",
+            "[storage]", *storage, "",
+            "[resources]", *resources, "",
+            "[[tables]]", 'name = "cpu"', 'partition_by = "hostname"', "columns = [", *cols, "]", "",
+            "[[sources]]", 'name = "tsbs"', 'kind = "file"', f'url = "{(data_dir / manifest["files"]["csv"]["path"]).resolve()}"',
+            'format = "csv"', 'table = "cpu"', 'ts_unit = "rfc3339"', f"map = {{ {mapping} }}", "",
+        ])
+
+    def _metrics(self) -> dict[str, float]:
+        import urllib.request
+
+        req = urllib.request.Request(f"http://127.0.0.1:{self.metrics_port}/metrics",
+                                     headers={"Authorization": f"Bearer {self.token}"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            text = r.read().decode()
+        out = {}
+        for line in text.splitlines():
+            if line and not line.startswith("#"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    try:
+                        out[parts[0]] = float(parts[1])
+                    except ValueError:
+                        pass
+        return out
+
+    def _check_alive(self) -> None:
+        if self.proc is not None and self.proc.poll() is not None:
+            tail = self.log_path.read_text(errors="replace")[-3000:] if self.log_path.exists() else ""
+            raise RuntimeError(f"ankaad exited with {self.proc.returncode}; log tail:\n{tail}")
+
+    def start(self, data_dir: Path, manifest: dict) -> float:
+        """Write the config, wipe old state, spawn `ankaad serve`; return the spawn instant (perf_counter)."""
+        import shutil
+        import subprocess
+
+        for sub in ("wal", "segments"):
+            shutil.rmtree(self.workdir / sub, ignore_errors=True)
+        self.workdir.mkdir(parents=True, exist_ok=True)
+        cfg = self.workdir / "ankaad.toml"
+        cfg.write_text(self.config_text(data_dir, manifest))
+        check = subprocess.run([str(self.ankaad), "config", "check", str(cfg)], capture_output=True, text=True)
+        if check.returncode != 0:
+            raise RuntimeError(f"ankaad config check failed:\n{check.stdout}{check.stderr}")
+        env = dict(os.environ, ANKAA_TOKEN=self.token, RUST_LOG=os.environ.get("RUST_LOG", "info"))
+        log = self.log_path.open("wb")
+        t0 = time.perf_counter()
+        self.proc = subprocess.Popen([str(self.ankaad), "serve", "--config", str(cfg)], stdout=log, stderr=subprocess.STDOUT, env=env)
+        return t0
+
+    def load(self, data_dir: Path, manifest: dict) -> dict:
+        rows = int(manifest["rows"])
+        t0 = self.start(data_dir, manifest)
+        n, rejected, first_row_s = 0, 0, None
+        deadline = time.monotonic() + self.load_timeout_s
+        while True:
+            self._check_alive()
+            try:
+                m = self._metrics()
+            except OSError:
+                m = {}
+            n = int(m.get("ankaa_user_rows_total", 0))
+            rejected = int(m.get("ankaa_user_rejected_total", 0))
+            if first_row_s is None and n > 0:
+                first_row_s = time.perf_counter() - t0
+            if rejected:
+                raise RuntimeError(f"ankaad rejected {rejected} rows (see {self.log_path}, RUST_LOG=debug for details)")
+            if n >= rows:
+                break
+            if time.monotonic() > deadline:
+                raise RuntimeError(f"ankaad stored {n} of {rows} rows after {self.load_timeout_s:.0f} s")
+            time.sleep(0.05)
+        wall = time.perf_counter() - t0
+        if n != rows:
+            raise RuntimeError(f"ankaad stored {n} rows, the dataset has {rows}")
+        self.version()  # Flight is up
+        visible_wait = _wait_count(lambda: int(self.run("SELECT count(*) AS n FROM cpu").table.column(0)[0].as_py()),
+                                   rows, "ankaa", 120)
+        return {"method": "ankaad serve, [[sources]] kind=file format=csv (cpu.csv), wal_dir + checkpoint_dir",
+                "wall_s": wall, "rows": rows, "first_row_s": first_row_s, "visible_wait_s": visible_wait,
+                "config": str(self.workdir / "ankaad.toml")}
+
+    def data_paths(self) -> list[Path]:
+        return [self.workdir / "wal", self.workdir / "segments"]
+
+    def close(self) -> None:
+        import signal
+
+        if self.proc is not None and self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGINT)
+            try:
+                self.proc.wait(timeout=60)
+            except Exception:  # noqa: BLE001
+                self.proc.kill()
+                self.proc.wait()
+        self.proc = None
+
+
+class InfluxDB3Engine(Engine):
+    """InfluxDB 3 Core (the open-source edition) in Docker.
+
+    Load: the line protocol file (cpu.lp, float fields) POSTed to `/api/v3/write_lp?precision=nanosecond`
+    in batches of 10,000 lines ("The optimal batch size is 10,000 lines of line protocol or 10 MBs",
+    https://docs.influxdata.com/influxdb3/core/write-data/best-practices/optimize-writes/), several
+    requests in flight ("For high write throughput, you can send multiple concurrent write requests",
+    https://docs.influxdata.com/influxdb3/core/write-data/http-api/v3-write-lp/). Writes are acknowledged
+    after the WAL flush (no_sync=false, the default), as every other engine here is durable on ack.
+    Optional gzip bodies (`gzip=True`), which the same best-practices page recommends for network links.
+
+    Queries: Arrow Flight (`flight`, the transport of InfluxData's own v3 client libraries:
+    DoGet with a JSON ticket {database, sql_query, query_type}), or HTTP `/api/v3/query_sql?format=parquet`
+    (`http`)."""
+
+    name = "influxdb3"
+    dialect = "influxdb3"
+
+    def __init__(self, url: str = "http://127.0.0.1:8181", database: str = "tsbs", token: str | None = None,
+                 transport: str = "flight", batch_lines: int = 10_000, writers: int = 4, gzip: bool = False,
+                 load_timeout_s: float = 7200.0):
+        import requests
+
+        self.requests = requests
+        self.url = url.rstrip("/")
+        self.database = database
+        self.token = token
+        self.transport = transport
+        self.batch_lines, self.writers, self.gzip = batch_lines, writers, gzip
+        self.load_timeout_s = load_timeout_s
+        self.session = requests.Session()
+        if token:
+            self.session.headers["Authorization"] = f"Bearer {token}"
+        self.timing_scope = (
+            "client-observed over Arrow Flight (pyarrow, DoGet with the v3 JSON ticket) until the last batch"
+            if transport == "flight" else "client-observed over HTTP /api/v3/query_sql?format=parquet, Parquet decoded")
+        self._flight = None
+
+    def _flight_client(self):
+        if self._flight is None:
+            from pyarrow import flight
+
+            host = urllib.parse.urlparse(self.url)
+            self._flight = (flight, flight.FlightClient(f"grpc://{host.hostname}:{host.port or 8181}"))
+        return self._flight
+
+    def version(self) -> str:
+        r = self.session.get(f"{self.url}/ping", timeout=10)
+        if r.status_code != 200:
+            raise RuntimeError(f"influxdb3: /ping HTTP {r.status_code}: {r.text[:300]}")
+        try:
+            body = r.json()
+            return f"influxdb3 {body.get('version', '?')} (revision {body.get('revision', '?')})"
+        except ValueError:
+            return "influxdb3 " + r.headers.get("x-influxdb-version", "?")
+
+    def _write(self, block: bytes) -> None:
+        import gzip as gz
+
+        headers = {"Content-Type": "text/plain; charset=utf-8"}
+        if self.gzip:
+            block = gz.compress(block, compresslevel=1)
+            headers["Content-Encoding"] = "gzip"
+        params = {"db": self.database, "precision": "nanosecond", "accept_partial": "false"}
+        for attempt in range(5):
+            r = self.session.post(f"{self.url}/api/v3/write_lp", params=params, data=block, headers=headers, timeout=600)
+            if r.status_code in (200, 204):
+                return
+            if r.status_code in (429, 503) and attempt < 4:  # back-pressure: retry the same batch
+                time.sleep(0.5 * (attempt + 1))
+                continue
+            raise RuntimeError(f"influxdb3 write: HTTP {r.status_code}: {r.text[:1000]}")
+
+    def count(self) -> int:
+        t = self.run("SELECT count(*) AS n FROM cpu").table
+        return int(t.column(0)[0].as_py()) if t.num_rows else 0
+
+    def load(self, data_dir: Path, manifest: dict) -> dict:
+        rows = int(manifest["rows"])
+        lp = data_dir / manifest["files"]["lp"]["path"]
+        t0 = time.perf_counter()
+        batches = run_parallel(iter_line_batches(lp, self.batch_lines), self._write, self.writers)
+        acked = time.perf_counter() - t0
+        visible_wait = _wait_count(self.count, rows, "influxdb3", self.load_timeout_s, 1.0)
+        return {"method": f"HTTP /api/v3/write_lp precision=nanosecond, {self.batch_lines} lines/request, "
+                          f"{self.writers} concurrent, gzip={self.gzip}",
+                "wall_s": time.perf_counter() - t0, "acked_s": acked, "visible_wait_s": visible_wait,
+                "rows": rows, "requests": batches}
+
+    def wait_persisted(self, rows: int, timeout_s: float = 1800.0) -> dict:
+        """Block until every row is in Parquet files (`system.parquet_files`), i.e. no longer only in
+        the write buffer: the at-rest state the other engines are queried in. With
+        INFLUXDB3_FORCE_SNAPSHOT_MAX_AGE=1m (docker-compose.yml) this takes about a minute after the load."""
+        sql = ("SELECT count(*) AS files, sum(row_count) AS rows, sum(size_bytes) AS bytes "
+               "FROM system.parquet_files WHERE table_name = 'cpu'")
+        t0 = time.monotonic()
+        while True:
+            rec = self.run(sql).table.to_pylist()[0]
+            persisted = int(rec.get("rows") or 0)
+            if persisted >= rows:
+                return {"persist_wait_s": round(time.monotonic() - t0, 1), "parquet_files": int(rec["files"]),
+                        "parquet_rows": persisted, "parquet_bytes": int(rec.get("bytes") or 0)}
+            if time.monotonic() - t0 > timeout_s:
+                raise RuntimeError(f"influxdb3: {persisted} of {rows} rows in Parquet after {timeout_s:.0f} s")
+            time.sleep(2.0)
+
+    def run(self, sql: str) -> RunResult:
+        if self.transport == "flight":
+            flight, client = self._flight_client()
+            ticket = json.dumps({"database": self.database, "sql_query": sql, "query_type": "sql"}).encode()
+            opts = flight.FlightCallOptions(headers=[(b"authorization", f"Bearer {self.token}".encode())]) if self.token else None
+            t0 = time.perf_counter()
+            table = client.do_get(flight.Ticket(ticket), opts).read_all()
+            return RunResult(table, (time.perf_counter() - t0) * 1e3, None)
+        t0 = time.perf_counter()
+        r = self.session.get(f"{self.url}/api/v3/query_sql", params={"db": self.database, "q": sql, "format": "parquet"}, timeout=600)
+        if r.status_code != 200:
+            raise RuntimeError(f"influxdb3: HTTP {r.status_code}: {r.text[:2000]}\nSQL: {sql[:500]}")
+        table = pq.read_table(pa.BufferReader(r.content)) if r.content else pa.table({})
+        return RunResult(table, (time.perf_counter() - t0) * 1e3, None)
+
+    def close(self) -> None:
+        if self._flight is not None:
+            self._flight[1].close()
+            self._flight = None
+        self.session.close()
+
+
+class TimescaleDBEngine(Engine):
+    """TimescaleDB (PostgreSQL extension) in Docker, the official image (which runs timescaledb-tune on
+    first start: shared_buffers, work_mem, parallel workers sized to the container,
+    https://docs.timescale.com/self-hosted/latest/install/installation-docker/).
+
+    Schema: a hypertable on `ts` with 12-hour chunks (TSBS's default --chunk-time) and an index on
+    (hostname, ts DESC) as TSBS's loader creates (its partition index), created before the load as TSBS
+    does. Load: parallel COPY ... FROM STDIN (FORMAT csv) of cpu.csv over `workers` connections, each
+    COPY one transaction of `batch_rows` rows, the scheme of Timescale's timescaledb-parallel-copy tool
+    (https://github.com/timescale/timescaledb-parallel-copy). `columnstore()` then converts every chunk
+    to the columnstore (compression) with segmentby = hostname and orderby = ts DESC, as Timescale
+    recommends for analytical queries filtered by a device/host column
+    (https://docs.timescale.com/use-timescale/latest/compression/about-compression/), followed by
+    VACUUM ANALYZE. Queries over psycopg 3 (binary result format)."""
+
+    name = "timescaledb"
+    dialect = "timescaledb"
+    timing_scope = "client-observed over PostgreSQL wire (psycopg 3, binary results): execute + fetchall + Arrow"
+
+    def __init__(self, dsn: str = "host=127.0.0.1 port=5432 user=postgres password=tsbs dbname=postgres",
+                 workers: int = 4, batch_rows: int = 50_000, chunk_interval: str = "12 hours"):
+        import psycopg
+
+        self.psycopg = psycopg
+        self.dsn = dsn
+        self.workers, self.batch_rows, self.chunk_interval = workers, batch_rows, chunk_interval
+        self.conn = psycopg.connect(dsn, autocommit=True)
+
+    def version(self) -> str:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT extversion FROM pg_extension WHERE extname = 'timescaledb'")
+            row = cur.fetchone()
+            cur.execute("SHOW server_version")
+            pg = cur.fetchone()[0]
+        return f"timescaledb {row[0] if row else 'not installed'} on PostgreSQL {pg}"
+
+    def _exec(self, sql: str) -> None:
+        with self.conn.cursor() as cur:
+            cur.execute(sql)
+
+    def create(self, manifest: dict) -> None:
+        tags, fields = telemetry_columns(manifest)
+        cols = ["ts TIMESTAMPTZ NOT NULL"] + [f"{t} TEXT" for t in tags] + [f"{f} DOUBLE PRECISION" for f in fields]
+        self._exec("CREATE EXTENSION IF NOT EXISTS timescaledb")
+        self._exec("DROP TABLE IF EXISTS cpu")
+        self._exec(f"CREATE TABLE cpu ({', '.join(cols)})")
+        self._exec(f"SELECT create_hypertable('cpu', by_range('ts', INTERVAL '{self.chunk_interval}'))")
+        self._exec("CREATE INDEX ON cpu (hostname, ts DESC)")
+
+    def _copy(self, conn, cols: str, block: bytes) -> None:
+        with conn.cursor() as cur:
+            with cur.copy(f"COPY cpu ({cols}) FROM STDIN (FORMAT csv)") as cp:
+                cp.write(block)
+
+    def load(self, data_dir: Path, manifest: dict) -> dict:
+        import threading
+
+        rows = int(manifest["rows"])
+        csv_path = data_dir / manifest["files"]["csv"]["path"]
+        cols = ", ".join(manifest["files"]["csv"]["columns"])
+        self.create(manifest)
+        local = threading.local()
+        conns: list = []
+        lock = threading.Lock()
+
+        def send(block: bytes) -> None:
+            conn = getattr(local, "conn", None)
+            if conn is None:
+                conn = local.conn = self.psycopg.connect(self.dsn, autocommit=True)
+                with lock:
+                    conns.append(conn)
+            self._copy(conn, cols, block)
+
+        t0 = time.perf_counter()
+        try:
+            batches = run_parallel(iter_line_batches(csv_path, self.batch_rows), send, self.workers)
+        finally:
+            for c in conns:
+                c.close()
+        copy_s = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        self._exec("ANALYZE cpu")
+        analyze_s = time.perf_counter() - t1
+        n = int(self.run("SELECT count(*) AS n FROM cpu").table.column(0)[0].as_py())
+        if n != rows:
+            raise RuntimeError(f"timescaledb: cpu holds {n} rows, the dataset has {rows}")
+        return {"method": f"parallel COPY FROM STDIN (FORMAT csv), {self.workers} connections x {self.batch_rows} rows/transaction; "
+                          f"hypertable chunk_interval {self.chunk_interval}, index (hostname, ts DESC)",
+                "wall_s": copy_s, "rows": rows, "copies": batches, "analyze_s": analyze_s}
+
+    def columnstore(self) -> dict:
+        """Convert every chunk to the columnstore (compressed), in parallel over `workers` sessions, then
+        VACUUM ANALYZE. Returns timings and sizes before/after."""
+        import concurrent.futures as cf
+
+        before = self.sizes()
+        self._exec("ALTER TABLE cpu SET (timescaledb.enable_columnstore = true, "
+                   "timescaledb.segmentby = 'hostname', timescaledb.orderby = 'ts DESC')")
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT show_chunks('cpu')::text")
+            chunks = [r[0] for r in cur.fetchall()]
+
+        def convert(chunk: str) -> None:
+            with self.psycopg.connect(self.dsn, autocommit=True) as c:
+                c.execute(f"CALL convert_to_columnstore('{chunk}')")
+
+        t0 = time.perf_counter()
+        with cf.ThreadPoolExecutor(max_workers=self.workers) as pool:
+            list(pool.map(convert, chunks))
+        convert_s = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        self._exec("VACUUM ANALYZE cpu")
+        vacuum_s = time.perf_counter() - t1
+        return {"method": "ALTER TABLE cpu SET (timescaledb.enable_columnstore, segmentby = 'hostname', orderby = 'ts DESC'); "
+                          f"CALL convert_to_columnstore(chunk) for {len(chunks)} chunks, {self.workers} in parallel; VACUUM ANALYZE",
+                "wall_s": convert_s, "vacuum_analyze_s": vacuum_s, "chunks": len(chunks),
+                "bytes_before": before, "bytes_after": self.sizes()}
+
+    def sizes(self) -> dict:
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT hypertable_size('cpu'), pg_database_size(current_database())")
+            hs, db = cur.fetchone()
+        return {"hypertable_bytes": int(hs or 0), "database_bytes": int(db or 0)}
+
+    def run(self, sql: str) -> RunResult:
+        t0 = time.perf_counter()
+        with self.conn.cursor(binary=True) as cur:
+            cur.execute(sql)
+            rows = cur.fetchall()
+            names = [d.name for d in cur.description]
+        table = _rows_to_arrow(rows, names)
+        return RunResult(table, (time.perf_counter() - t0) * 1e3, None)
+
+    def close(self) -> None:
+        self.conn.close()
+
+
+class QuestDBTelemetryEngine(QuestDBEngine):
+    """QuestDB with the cpu table. Load: InfluxDB line protocol over HTTP (`POST /write`, port 9000),
+    QuestDB's recommended ingestion path (https://questdb.com/docs/reference/api/ilp/overview/), the
+    same cpu.lp file InfluxDB loads, `batch_lines` lines per request (75,000 = the HTTP auto-flush row
+    count of QuestDB's own clients, https://questdb.com/docs/configuration-string/), `writers` requests in
+    flight. The table is created first so that types are explicit: tags SYMBOL (as ILP would create them;
+    hostname with a capacity for every host, as the symbol docs advise,
+    https://questdb.com/docs/concept/symbol/), fields DOUBLE, `ts` the designated timestamp, PARTITION BY
+    DAY, WAL. The load is complete when every row is visible and the WAL is applied (`_wait_applied`).
+    Queries as QuestDBEngine (PostgreSQL wire by default)."""
+
+    def __init__(self, http_url: str = "http://127.0.0.1:9000",
+                 pg_dsn: str = "host=127.0.0.1 port=8812 user=admin password=quest dbname=qdb",
+                 transport: str = "pg", batch_lines: int = 75_000, writers: int = 4, load_timeout_s: float = 7200.0):
+        super().__init__(http_url, pg_dsn, transport)
+        self.batch_lines, self.writers, self.load_timeout_s = batch_lines, writers, load_timeout_s
+
+    def create(self, manifest: dict) -> None:
+        tags, fields = telemetry_columns(manifest)
+        hosts = int(manifest.get("hosts", 0)) or 1024
+        capacity = 1 << max(8, (hosts - 1).bit_length())
+        cols = ["ts TIMESTAMP"]
+        cols += [f"{t} SYMBOL CAPACITY {capacity} CACHE" if t == "hostname" else f"{t} SYMBOL" for t in tags]
+        cols += [f"{f} DOUBLE" for f in fields]
+        self._exec("DROP TABLE IF EXISTS cpu")
+        self._exec(f"CREATE TABLE cpu ({', '.join(cols)}) TIMESTAMP(ts) PARTITION BY DAY WAL")
+
+    def _write(self, block: bytes) -> None:
+        r = self.session.post(f"{self.http}/write", params={"precision": "n"}, data=block, timeout=600)
+        if r.status_code not in (200, 204):
+            raise RuntimeError(f"questdb ILP/HTTP: HTTP {r.status_code}: {r.text[:1000]}")
+
+    def load(self, data_dir: Path, manifest: dict) -> dict:
+        rows = int(manifest["rows"])
+        lp = data_dir / manifest["files"]["lp"]["path"]
+        self.create(manifest)
+        t0 = time.perf_counter()
+        batches = run_parallel(iter_line_batches(lp, self.batch_lines), self._write, self.writers)
+        acked = time.perf_counter() - t0
+        t1 = time.perf_counter()
+        self._wait_applied("cpu", rows, self.load_timeout_s)
+        return {"method": f"ILP over HTTP POST /write precision=n, {self.batch_lines} lines/request, {self.writers} concurrent; "
+                          "table pre-created (SYMBOL tags, DOUBLE fields, PARTITION BY DAY WAL)",
+                "wall_s": time.perf_counter() - t0, "acked_s": acked, "visible_wait_s": time.perf_counter() - t1,
+                "rows": rows, "requests": batches}
+
+
+    def sizes(self) -> dict:
+        """QuestDB's own accounting of the table on disk (`table_storage()`), when this version has it."""
+        try:
+            body = self._exec("SELECT * FROM table_storage() WHERE tableName = 'cpu'")
+        except RuntimeError as e:
+            return {"error": str(e).splitlines()[0]}
+        cols = [c["name"] for c in body.get("columns", [])]
+        rows = body.get("dataset", [])
+        return dict(zip(cols, rows[0])) if rows else {}
+
+
+class DuckDBTelemetryEngine(DuckDBEngine):
+    """DuckDB with the cpu table materialised in memory from cpu.parquet (the reference)."""
+
+    def load(self, data_dir: Path, manifest: dict) -> dict:
+        p = (data_dir / manifest["files"]["parquet"]["path"]).resolve()
+        t0 = time.perf_counter()
+        self.con.execute(f"CREATE OR REPLACE TABLE cpu AS SELECT * FROM read_parquet('{p}')")
+        wall = time.perf_counter() - t0
+        n = self.con.execute("SELECT count(*) FROM cpu").fetchall()[0][0]
+        if n != int(manifest["rows"]):
+            raise RuntimeError(f"duckdb: cpu holds {n} rows, the dataset has {manifest['rows']}")
+        return {"method": "CREATE TABLE cpu AS SELECT * FROM read_parquet(cpu.parquet), in memory", "wall_s": wall, "rows": n}
 
 # ----------------------------------------------------------------------------------------- registry
 def make_engine(name: str, args) -> Engine:
