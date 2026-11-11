@@ -122,9 +122,19 @@ struct CacheState {
 }
 
 struct Cached {
-    file: vortex::file::VortexFile,
+    file: Opened,
     bytes: usize,
     used: u64,
+}
+
+/// An opened segment file and, when it is kept in the cache, its columns as they are stored
+/// (compressed), each loaded at its first use. A column held this way is read like a warm
+/// chunk's: a slice of the compressed array is decoded, without building a scan of the file
+/// for every read (which costs several times the decode of a small range).
+#[derive(Clone)]
+struct Opened {
+    file: vortex::file::VortexFile,
+    columns: Option<Arc<Vec<std::sync::OnceLock<ArrayRef>>>>,
 }
 
 /// Counters of the segment cache ([`Encoder::segment_cache`]).
@@ -153,7 +163,7 @@ impl SegmentCache {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn get(&self, id: u64) -> Option<vortex::file::VortexFile> {
+    fn get(&self, id: u64) -> Option<Opened> {
         use std::sync::atomic::Ordering::Relaxed;
         if self.budget() == 0 {
             return None;
@@ -177,7 +187,7 @@ impl SegmentCache {
     /// Keep `file` (`bytes` long). When the budget is exceeded the least recently used eighth
     /// of it goes at once, so a workload larger than the cache pays for an eviction pass once
     /// in many inserts, not on each.
-    fn put(&self, id: u64, file: vortex::file::VortexFile, bytes: usize) {
+    fn put(&self, id: u64, file: Opened, bytes: usize) {
         let budget = self.budget();
         if bytes > budget {
             return;
@@ -532,9 +542,9 @@ impl Encoder {
 
     /// The segment file of `cold`, opened: from the cache, or read and its footer parsed (and
     /// then kept, within the cache's budget).
-    fn open_segment(&self, cold: &ColdChunk) -> Result<vortex::file::VortexFile, TierError> {
-        if let Some(file) = self.cache.get(cold.cache_id) {
-            return Ok(file);
+    fn open_segment(&self, cold: &ColdChunk) -> Result<Opened, TierError> {
+        if let Some(opened) = self.cache.get(cold.cache_id) {
+            return Ok(opened);
         }
         let bytes = std::fs::read(&cold.path).map_err(io_err(&cold.path))?;
         let len = bytes.len();
@@ -542,21 +552,73 @@ impl Encoder {
             .session
             .open_options()
             .open_buffer(ByteBuffer::from(bytes))?;
-        if self.cache.budget() > 0 {
-            self.cache.put(cold.cache_id, file.clone(), len);
+        if self.cache.budget() == 0 {
+            return Ok(Opened {
+                file,
+                columns: None,
+            });
         }
-        Ok(file)
+        let columns = (0..cold.meta.schema.len())
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
+        let opened = Opened {
+            file,
+            columns: Some(Arc::new(columns)),
+        };
+        self.cache.put(cold.cache_id, opened.clone(), len);
+        Ok(opened)
+    }
+
+    /// Column `name` of a segment as it is stored (compressed), all rows.
+    fn stored_column(
+        &self,
+        file: &vortex::file::VortexFile,
+        name: &str,
+    ) -> Result<ArrayRef, TierError> {
+        let expr = vortex::array::expr::col(name.to_owned())
+            .bind(file.dtype())?
+            .optimize_recursive()?;
+        Ok(file
+            .scan()?
+            .with_projection(expr)
+            .into_array_iter(&self.runtime)?
+            .read_all()?)
     }
 
     /// Decode `projection` (all rows, or the rows `rows`) of an opened segment.
     fn scan_segment(
         &self,
-        file: &vortex::file::VortexFile,
+        opened: &Opened,
         cold: &ColdChunk,
         projection: &[usize],
         rows: Option<core::ops::Range<usize>>,
     ) -> Result<Vec<NullableColumn>, TierError> {
         let fields = cold.meta.schema.fields();
+        let file = &opened.file;
+        if let Some(columns) = &opened.columns {
+            // a cached segment: its columns are held compressed and sliced like a warm chunk's
+            return projection
+                .iter()
+                .map(|&i| {
+                    let (Some(f), Some(slot)) = (fields.get(i), columns.get(i)) else {
+                        return Err(TierError::Vortex(format!("column {i} out of range")));
+                    };
+                    let whole = if let Some(a) = slot.get() {
+                        a.clone()
+                    } else {
+                        let a = self.stored_column(file, &f.name)?;
+                        // (another reader may have stored it meanwhile: the same column)
+                        let _ = slot.set(a.clone());
+                        a
+                    };
+                    let part = match &rows {
+                        Some(r) => whole.slice(ankaa_store::clamp_rows(r, whole.len()))?,
+                        None => whole,
+                    };
+                    self.decompress_column(&f.name, f.ty, &part)
+                })
+                .collect();
+        }
         let names: Vec<String> = projection.iter().map(|&i| fields[i].name.clone()).collect();
         let expr = select(names.iter().map(String::as_str).collect::<Vec<_>>(), root())
             .bind(file.dtype())?
@@ -1059,7 +1121,9 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn a_row_range_decodes_like_the_rows_of_the_whole() {
-        let enc = Arc::new(Encoder::new());
+        // with the segment cache: cold reads go through the columns it holds (the reads
+        // without it are covered by the round-trip tests)
+        let enc = Arc::new(Encoder::new().with_segment_cache(64 << 20));
         let dir = tempfile::tempdir().unwrap();
         let ranges = [
             0..0,

@@ -117,8 +117,9 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   and in the cold tier (row range through the segment layout). `LIMIT` without a time range decodes the
   first rows only.
 - Segment cache: `storage.segment_cache_mib` (default 256) keeps recently read cold segment files in
-  memory, compressed as on disk and with their footer parsed. A cold chunk read again skips the file read
-  and the parse, which are most of the cost of a small cold read. Metrics `ankaa_segment_cache_bytes`,
+  memory, compressed as on disk and with their footer parsed, and their columns as they are used. A cold
+  chunk read again is read like a warm one (a slice of the compressed column is decoded): measured on a
+  26,000-row chunk, 4,320 rows of 2 columns went from 61 µs to 4.6 µs. Metrics `ankaa_segment_cache_bytes`,
   `ankaa_segment_cache_reads_total{from}`.
 - Predicates on one `dict` column that are not a comparison with a literal (`LIKE`, `<`, `upper(host) = …`,
   regular expressions) are evaluated once over the names of the dictionary and answered by id, per chunk,

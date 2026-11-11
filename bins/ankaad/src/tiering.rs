@@ -118,8 +118,10 @@ struct Merge {
     lsn: (u64, u64, u32),
 }
 
-/// A sealed chunk below this many rows is small: compaction merges runs of them.
-pub const SMALL_CHUNK_ROWS: usize = ankaa_store::CHUNK_ROWS / 4;
+/// A sealed chunk below this many rows (half a chunk) is small: compaction merges runs of them.
+/// A partition therefore ends up in chunks of half a chunk or more, plus at most a few small
+/// ones at its end.
+pub const SMALL_CHUNK_ROWS: usize = ankaa_store::CHUNK_ROWS / 2;
 /// Fewest small chunks merged when the result is still small (a merge that makes a chunk of at
 /// least [`SMALL_CHUNK_ROWS`] takes two).
 const MIN_MERGE_PARTS: usize = 4;
