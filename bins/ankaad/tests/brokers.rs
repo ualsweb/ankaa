@@ -1177,10 +1177,7 @@ columns = [
     for (name, _, _) in &accepted {
         let n = first_cell(&query(
             &addr,
-            &format!(
-                "SELECT count(*) FROM readings r JOIN dictionaries d ON d.\"table\" = 'readings' \
-                 AND d.\"column\" = 'device' AND d.id = r.device WHERE d.name = '{name}'"
-            ),
+            &format!("SELECT count(*) FROM readings WHERE device = '{name}'"),
         ));
         assert_eq!(n, per_source.to_string(), "{name}");
     }
