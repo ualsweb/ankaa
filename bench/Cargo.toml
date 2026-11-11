@@ -17,10 +17,17 @@ ankaa-wal = { path = "../crates/ankaa-wal" }
 ankaa-tier = { path = "../crates/ankaa-tier" }
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 bytes = "1"
+# loadgen (end-to-end profiling): MQTT publisher
+rumqttc = { version = "0.25", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 
 [features]
 # Also benchmark the SVE2 backend (aarch64 Linux on a CPU with SVE2 only).
 sve2 = ["ankaa-simd/sve2"]
+
+[[bin]]
+name = "loadgen"
+path = "src/bin/loadgen.rs"
 
 [[bench]]
 name = "hot_paths"
