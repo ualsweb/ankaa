@@ -22,6 +22,15 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   public roots or only a private CA (`tls_ca`), and client certificates (`tls_cert`, `tls_key`); files
   checked at start. Tested against Mosquitto with TLS and mutual TLS in CI
   (`scripts/mqtt-tls-broker.sh`).
+- Kafka over TLS, with SASL, for managed Kafka: `tls = true` on a Kafka source (same rustls stack and
+  `tls_ca` / `tls_cert` / `tls_key` as MQTT, mutual TLS included) and `sasl_mechanism` (`plain`,
+  `scram-sha-256`, `scram-sha-512`) with `sasl_username` and `sasl_password_env`: the password comes from
+  the environment and is never logged or printed. SASL without TLS is refused beyond loopback unless the
+  source sets `allow_plaintext = true`. `ankaad config check` and the server start now check the TLS
+  files of every source (MQTT too) and name the source. A Kafka source that cannot connect says so every
+  30 s and stops cleanly on shutdown. Tested against Apache Kafka 3.9 in Docker with TLS, mutual TLS and
+  the three mechanisms (`scripts/kafka-tls-broker.sh`; the test is part of the brokers workflow).
+  `OAUTHBEARER`, Kerberos and MSK IAM are not supported.
 - Several readings per message: `rows = "<array path>"` stores one row per element (`$msg.<path>` reads
   the message around it); a bad element refuses only its row; at most 65,536 rows per message, new
   dictionary values of one message counted together against `max_dict_entries`.

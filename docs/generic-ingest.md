@@ -66,7 +66,7 @@ arrays and `null` are not.
 [[sources]]
 name = "racks"
 kind = "nats"                        # mqtt | nats | kafka | file
-url = "nats://127.0.0.1:4222"        # MQTT: mqtt://host:1883; Kafka: bootstrap servers; file: a path
+url = "nats://127.0.0.1:4222"        # MQTT: mqtt://host:1883; Kafka: host:port,host:port (bootstrap servers); file: a path
 subject = "racks.>"                  # MQTT topic filter, NATS subject or Kafka topic
 format = "json"                      # json | csv | sparkplug (MQTT)
 table = "telemetry"
@@ -74,6 +74,7 @@ ts_unit = "millis"                   # seconds | millis | micros | nanos | rfc33
 map = { ts = "meta.time", rack = "meta.id", temp = "temp", ok = "ok", load = "load" }
 # max_message_bytes = 1048576        # larger messages are dropped and counted (at most 16 MiB)
 # start = "latest"                   # kafka only: latest | earliest, for a partition without a saved position
+# tls = true                         # kafka only: TLS, and SASL with sasl_* (see "Kafka over TLS, with SASL")
 ```
 
 - `map` gives, per column, a JSON path (`a.b.0.c`) or a CSV field index; for an MQTT source
@@ -226,7 +227,7 @@ accepted).
 | kind | Behaviour | Guarantee |
 |---|---|---|
 | `file` | Every non-empty line is a message (NDJSON or CSV), read as a stream. The task idles after the file so the data stays queryable. | **At least once.** The read position is saved; a restart continues after the last durable line, and lines appended while the server was down are ingested on the next start. A file replaced by a different one is read from the beginning. |
-| `kafka` | Verified with Apache Kafka 3.9 (KRaft). All partitions of the topic are read concurrently, without a consumer group: the server keeps the next offset of every partition itself. Records of different partitions are merged by their Kafka timestamp before they are delivered, so a multi-partition topic arrives in time order (see below). Partitions added to the topic are picked up within 30 s and read from their beginning. Backpressure waits (nothing is dropped). | **At least once.** A restart resumes from the saved offsets, so messages published while the server was down are ingested. If the broker no longer retains a saved offset the source continues from the earliest retained one and `ankaa_kafka_offset_resets_total` increases. |
+| `kafka` | Verified with Apache Kafka 3.9 (KRaft). All partitions of the topic are read concurrently, without a consumer group: the server keeps the next offset of every partition itself (see "No Kafka consumer groups"). Records of different partitions are merged by their Kafka timestamp before they are delivered, so a multi-partition topic arrives in time order (see below). Partitions added to the topic are picked up within 30 s and read from their beginning. Backpressure waits (nothing is dropped). Plaintext by default; `tls = true` connects with TLS and `sasl_*` authenticates with SASL `PLAIN` or `SCRAM-SHA-256/512` (see "Kafka over TLS, with SASL"). | **At least once.** A restart resumes from the saved offsets, so messages published while the server was down are ingested. If the broker no longer retains a saved offset the source continues from the earliest retained one and `ankaa_kafka_offset_resets_total` increases. |
 | `mqtt` | MQTT 3.1.1, QoS 1, persistent session (client id `ankaa-<source name>`, `clean_session = false`). A message is acknowledged once it is in the ingest channel; a full channel slows the broker down instead of dropping. `url` may carry `user:password@`; `mqtts://` connects with TLS (see below). | **At least once across outages and restarts** for what the broker keeps for the session (its queue limits apply); a crash loses the messages acknowledged but not yet in the WAL group commit (milliseconds). |
 | `nats` | Core NATS subscription; the client reconnects, reconnections are counted. | **At most once.** Core NATS has no replay: messages published while the server is down, or arriving while the ingest channel is full (`ankaa_source_dropped_full_total`), are lost. |
 
@@ -268,13 +269,97 @@ subject = "plant1/#"
 # … format, table, map as above
 ```
 
-The files are read and checked when the server starts: a missing file, a file without a
-certificate, a key that does not match its certificate or a certificate without its key stops the
-start with the file named. `tls_*` on anything but an `mqtts://` source is a configuration error.
+The files are read and checked when the server starts, and by `ankaad config check`: a missing
+file, a file without a certificate, a key that does not match its certificate or a certificate
+without its key stops the start with the source and the file named. `tls_ca`, `tls_cert` and
+`tls_key` on a source that does not connect with TLS (anything but `mqtts://` or a Kafka source
+with `tls = true`) are a configuration error.
 
-Not supported yet: Kafka consumer groups (`group` is rejected), SASL and TLS options for Kafka,
-TLS for NATS, and NATS credentials files. A NATS or MQTT URL may carry `user:password@`; it is
-never logged. Connect to Kafka and NATS over a trusted network or a local TLS proxy.
+**Kafka over TLS, with SASL.** A Kafka `url` is a list of bootstrap servers without a scheme, so
+TLS has a key of its own: `tls = true`. It is the same TLS as for MQTT (rustls with the aws-lc-rs
+provider, TLS 1.3 or 1.2) with the same three optional files: the brokers' certificates are
+checked against the public roots, or against the CAs of `tls_ca` only, and `tls_cert` with
+`tls_key` adds a client certificate for listeners that ask for one (mutual TLS). Every connection
+of the source uses it: the bootstrap servers first, then each broker at the address it
+advertises. The name in a broker's certificate must match the address it is reached by.
+
+`sasl_mechanism`, `sasl_username` and `sasl_password_env` authenticate every connection with SASL
+`PLAIN`, `SCRAM-SHA-256` or `SCRAM-SHA-512`. The password is read from the environment variable
+that `sasl_password_env` names (in the systemd unit: `EnvironmentFile=`), never from the
+configuration file. It is not logged and not printed with the configuration.
+
+```toml
+[[sources]]
+name = "orders"
+kind = "kafka"
+url = "broker-1.example.com:9093,broker-2.example.com:9093"   # bootstrap servers
+subject = "orders"                           # the topic
+tls = true                                   # connect with TLS (public roots unless tls_ca is given)
+# tls_ca = "/etc/ankaa/kafka-ca.pem"         # optional: trust only this CA
+# tls_cert = "/etc/ankaa/ankaa-client.pem"   # optional, with tls_key: client certificate
+# tls_key = "/etc/ankaa/ankaa-client.key"
+sasl_mechanism = "scram-sha-512"             # plain | scram-sha-256 | scram-sha-512
+sasl_username = "ankaa"
+sasl_password_env = "KAFKA_ORDERS_PASSWORD"  # the name of the variable, not the password
+# … format, table, map as above
+```
+
+| Service | Settings, from the service's documentation |
+|---|---|
+| Confluent Cloud | `tls = true`, `sasl_mechanism = "plain"`, the API key as `sasl_username`, the API secret in the password variable |
+| Amazon MSK | `tls = true` with `sasl_mechanism = "scram-sha-512"` (port 9096), or with a client certificate (port 9094). IAM access control is not supported |
+| Aiven | `tls = true`, `tls_ca` = the project CA, and either the service's client certificate (`tls_cert`, `tls_key`) or SASL (`plain`, `scram-sha-256`, `scram-sha-512`) |
+| Redpanda Cloud | `tls = true`, `sasl_mechanism = "scram-sha-256"` or `"scram-sha-512"` |
+
+Tested against Apache Kafka 3.9 with a TLS listener, a mutual-TLS listener and the three
+mechanisms (`scripts/kafka-tls-broker.sh`, `kafka_tls_and_sasl_sources_…` in
+`bins/ankaad/tests/brokers.rs`). The managed services in the table have not been tested with live
+accounts.
+
+- **What is checked before the start** (also by `ankaad config check`), each with the source
+  named: the TLS files, as for MQTT; `tls_ca` / `tls_cert` / `tls_key` without `tls = true` (the
+  files do not switch TLS on); the three `sasl_*` keys, which go together; a password variable
+  that is unset or empty; `tls` or `sasl_*` on a source that is not Kafka.
+- **SASL without TLS is refused** unless every bootstrap server is a loopback address
+  (`localhost`, `127.0.0.0/8`, `::1`), the same line the server draws for its own listeners.
+  `PLAIN` sends the password as it is, a `SCRAM` exchange can be attacked offline by whoever
+  records it, and the data is readable in both cases. `allow_plaintext = true` on the source
+  accepts it for a private network segment, and the server says so in its log at every start.
+  The rule looks at the configured `url`: the addresses the brokers advertise for themselves are
+  not known before connecting.
+- **A refused connection does not stop the server.** A certificate that is not trusted, a missing
+  client certificate or a wrong password is the broker's answer, not a configuration error: the
+  source keeps trying. The log has the cause in `Failed to connect to broker` lines
+  (`invalid peer certificate: UnknownIssuer`, `Sasl handshake failed: … SaslAuthenticationFailed`)
+  and, every 30 s, a `kafka: no broker connection yet` line with the source id, `tls` and `sasl`.
+  A source that is in logs `kafka consuming … tls=true sasl="SCRAM-SHA-512"`.
+- **Not supported:** `OAUTHBEARER` (the server has no token provider), `GSSAPI` (Kerberos) and
+  `AWS_MSK_IAM`; they are refused as unknown values of `sasl_mechanism`. A running connection is
+  not re-authenticated (KIP-368): a broker that limits the session lifetime
+  (`connections.max.reauth.ms`) closes the connection, and the source connects again and
+  continues from its positions. IPv6 literal addresses in `url` do not work with `tls = true`
+  (a limit of the client library; refused at start). The files and the password are read once,
+  when the server starts: restart it after rotating them.
+
+**No Kafka consumer groups.** ANKAA does not join a consumer group and commits nothing to the
+broker. It fetches every partition of the topic by offset and keeps the next offset of each
+partition itself, in `sources.json` next to the WAL, advanced only once the rows before it are
+durable: the position and the data it stands for cannot disagree after a crash, which offsets
+committed to the broker cannot promise. What follows from it:
+
+- The broker's tools show no group and no lag for ANKAA (`kafka-consumer-groups.sh`, the lag page
+  of a managed service). The position is in `sources.json` and in the `kafka consuming` log line.
+- There is no rebalancing: two servers with the same source each read the whole topic. A standby
+  does not read sources; it receives the primary's log, positions included.
+- Deleting `sources.json` makes the source start over (`start` decides where).
+- With ACLs on the broker, the account needs `Describe` and `Read` on the topic and nothing on
+  any group. (From the requests the source sends; not tested against a broker with an
+  authorizer.)
+- `group` in a source is a configuration error.
+
+Not supported yet: TLS for NATS and NATS credentials files. A NATS or MQTT URL may carry
+`user:password@`; it is never logged. Connect to NATS over a trusted network or a local TLS
+proxy.
 
 An MQTT example, one table per plant measurement with the line and machine taken from the topic:
 

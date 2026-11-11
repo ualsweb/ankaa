@@ -134,6 +134,24 @@ token_env = "ANKAA_TOKEN"
 # max_message_bytes = 1048576     # larger messages are dropped and counted
 # start = "latest"                # kafka: latest | earliest, when no position is saved yet
 #
+# [[sources]]                      # Kafka over TLS with SASL (a managed service)
+# name = "orders"
+# kind = "kafka"
+# url = "broker-1.example.com:9093,broker-2.example.com:9093"   # bootstrap servers
+# subject = "orders"               # the topic; no consumer group: offsets are kept in sources.json
+# tls = true                       # TLS; the public roots unless tls_ca is given
+# tls_ca = "/etc/ankaa/kafka-ca.pem"       # optional: trust only this CA
+# tls_cert = "/etc/ankaa/client.pem"       # optional, with tls_key: client certificate (mutual TLS)
+# tls_key = "/etc/ankaa/client.key"
+# sasl_mechanism = "scram-sha-512" # plain | scram-sha-256 | scram-sha-512
+# sasl_username = "ankaa"
+# sasl_password_env = "KAFKA_ORDERS_PASSWORD"   # name of the variable that holds the password
+# allow_plaintext = false          # true: SASL without TLS beyond loopback (private network only)
+# format = "json"
+# table = "telemetry"
+# ts_unit = "millis"
+# map = { ts = "meta.time", rack = "meta.id", temp = "temp" }
+#
 # [[sources]]                      # MQTT over TLS, with the line and machine taken from the topic
 # name = "plant1"
 # kind = "mqtt"

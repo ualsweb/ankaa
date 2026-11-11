@@ -106,8 +106,9 @@ ANKAA_TOKEN=$ANKAA_TOKEN scripts/soak.sh --hours 24 --pid $! --out soak-$(date +
       is set.
 - [ ] The systemd unit from `deploy/systemd/` is used (restart on failure, resource limits) and the
       alert rules from `deploy/prometheus/alerts.yml` are loaded (`promtool check rules` passes).
-- [ ] Brokers (Kafka, NATS) are reached over a private network: their connections are not
-      encrypted by ANKAA yet.
+- [ ] Kafka sources beyond the host use `tls = true` (and `sasl_*` where the broker asks for it),
+      with the password in the environment. NATS is reached over a private network: its
+      connections are not encrypted by ANKAA yet.
 
 ## 6. Still open after launch (tracked in `docs/STATUS.md`, "Known gaps")
 

@@ -152,7 +152,7 @@
 <span class="c-key">[resources]</span>  query_memory_mib, memory_budget_mib, memlock_mib
 <span class="c-key">[feed]</span>       enabled, url, streams, depth_snapshots          <span class="c-dim"># built-in exchange feed (optional)</span>
 <span class="c-key">[[tables]]</span>   name, columns, partition_by, max_lateness_ms, retention, max_dict_entries
-<span class="c-key">[[sources]]</span>  name, kind (mqtt|kafka|nats|file), url (mqtt:// or mqtts://), subject, format (json|csv|sparkplug), table, map, rows, ts_unit, tls_ca, tls_cert, tls_key, sparkplug_rebirth
+<span class="c-key">[[sources]]</span>  name, kind (mqtt|kafka|nats|file), url (mqtt:// or mqtts://), subject, format (json|csv|sparkplug), table, map, rows, ts_unit, tls (kafka), tls_ca, tls_cert, tls_key, sasl_mechanism, sasl_username, sasl_password_env (kafka), sparkplug_rebirth
 <span class="c-key">[[continuous]]</span> name, kind (ohlcv|percentiles|rolling|asof), table, key, value, width_ns
 <span class="c-key">[replication]</span> serve_wal, standby_of
 
