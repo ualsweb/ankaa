@@ -39,11 +39,18 @@ jobs:
       - name: Install QEMU (only when not cached)
         if: steps.qemu-cache.outputs.cache-hit != 'true'
         run: |
-          for i in 1 2 3; do
-            sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static && break
-            echo "apt mirror failed (attempt $i); retrying"; sleep 30
-          done
-          mkdir -p ~/qemu && cp /usr/bin/qemu-aarch64-static ~/qemu/qemu-aarch64
+          mkdir -p ~/qemu
+          # the Ubuntu ports mirror first; if the runner cannot reach it, Debian's package of the
+          # same static binary through a container (Docker Hub and deb.debian.org, other hosts)
+          if timeout 120 sh -c 'sudo apt-get update -qq && sudo apt-get install -y -qq qemu-user-static' \
+             && [ -x /usr/bin/qemu-aarch64-static ]; then
+            cp /usr/bin/qemu-aarch64-static ~/qemu/qemu-aarch64
+          else
+            echo "Ubuntu mirror unreachable: taking qemu-user-static from Debian"
+            docker run --rm -v "$HOME/qemu:/out" debian:bookworm-slim sh -c \
+              'apt-get update -qq && apt-get install -y -qq qemu-user-static >/dev/null && cp /usr/bin/qemu-aarch64-static /out/qemu-aarch64'
+          fi
+          sudo chown "$(id -u)" ~/qemu/qemu-aarch64
       - run: echo "$HOME/qemu" >> "$GITHUB_PATH"
       - run: qemu-aarch64 --version | head -1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
