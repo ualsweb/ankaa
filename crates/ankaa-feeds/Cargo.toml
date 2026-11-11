@@ -25,7 +25,7 @@ dbn = ["dep:dbn", "dep:time"]
 # Generic message sources for user-defined tables.
 sources = ["dep:tokio", "dep:futures", "dep:tracing"]
 nats = ["sources", "dep:async-nats"]
-kafka = ["sources", "dep:rskafka"]
+kafka = ["sources", "dep:rskafka", "dep:rustls", "dep:webpki-roots"]
 mqtt = ["sources", "dep:rumqttc", "rumqttc/use-rustls-no-provider", "dep:rustls", "dep:webpki-roots"]
 
 [dependencies]

@@ -16,15 +16,30 @@
 //! differs wildly from the Kafka timestamp still get rows rejected by the ordering rule.)
 //!
 //! Positions survive reconnects. When the broker no longer retains a saved offset the source
-//! jumps to the earliest retained one and counts the reset. Plaintext brokers only (no SASL/TLS
-//! settings yet).
+//! jumps to the earliest retained one and counts the reset.
+//!
+//! **TLS and SASL** ([`Security`]). [`SourceOpts::tls_enabled`] connects every broker of the
+//! cluster with TLS ([`super::tls`]: rustls with the aws-lc-rs provider, the broker certificate
+//! checked against the public roots or only a private CA, an optional client certificate). The
+//! name checked in a broker's certificate is the host it is reached by: the bootstrap entry
+//! first, then the address each broker advertises. [`SourceOpts::sasl`] authenticates every
+//! connection with `PLAIN`, `SCRAM-SHA-256` or `SCRAM-SHA-512`, which is what the client library
+//! implements with a user name and a password; `OAUTHBEARER` (it needs a token provider),
+//! `GSSAPI` and `AWS_MSK_IAM` are not available. There is no re-authentication of a running
+//! connection (KIP-368): a broker that limits the session lifetime closes the connection, and
+//! the source connects again and continues from its positions.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 
+use rskafka::client::{ClientBuilder, Credentials, SaslConfig};
 use tokio::sync::{mpsc, watch};
 
-use super::{SourceOpts, SourceStats, deliver_wait, oversized, send_state, shutdown_wait};
+use super::{
+    Sasl, SaslMechanism, SourceOpts, SourceStats, deliver_wait, oversized, send_state,
+    shutdown_wait,
+};
 use crate::capture::Frame;
 
 /// One fetched record waiting for its turn: `(merge timestamp, offset, value)`.
@@ -37,6 +52,80 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// A partition that returns nothing although the broker says it has more holds the merge
 /// back at most this long.
 const STALL_GRACE: Duration = Duration::from_secs(2);
+
+/// While no broker of the bootstrap list accepts the connection, say so this often (the client
+/// library keeps trying on its own and names the cause in its own log lines).
+const NOT_CONNECTED_REMINDER: Duration = Duration::from_secs(30);
+
+/// What a connection needs beyond the address, built once when the source starts: the TLS
+/// client configuration and the SASL credentials.
+pub struct Security {
+    tls: Option<Arc<rustls::ClientConfig>>,
+    sasl: Option<SaslConfig>,
+    mechanism: Option<SaslMechanism>,
+}
+
+impl std::fmt::Debug for Security {
+    /// The credentials are left out (the client library's own `Debug` would print the password).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Security")
+            .field("tls", &self.tls())
+            .field("sasl", &self.sasl())
+            .finish()
+    }
+}
+
+impl Security {
+    /// Read the TLS files (when TLS is on) and prepare the credentials. An error names the file
+    /// and what is wrong with it.
+    pub fn new(opts: &SourceOpts) -> Result<Self, String> {
+        let tls = if opts.tls_enabled {
+            Some(super::tls::client_config(&opts.tls)?)
+        } else {
+            None
+        };
+        Ok(Self {
+            tls,
+            sasl: opts.sasl.as_ref().map(sasl_config),
+            mechanism: opts.sasl.as_ref().map(|s| s.mechanism),
+        })
+    }
+
+    /// True when connections use TLS.
+    #[must_use]
+    pub fn tls(&self) -> bool {
+        self.tls.is_some()
+    }
+
+    /// Name of the SASL mechanism, `none` without SASL (for log lines).
+    #[must_use]
+    pub fn sasl(&self) -> &'static str {
+        self.mechanism.map_or("none", SaslMechanism::name)
+    }
+
+    /// A client builder for `servers` with these settings. Every connection the client opens
+    /// (bootstrap, then one per partition leader) uses them.
+    fn builder(&self, servers: Vec<String>) -> ClientBuilder {
+        let mut builder = ClientBuilder::new(servers);
+        if let Some(tls) = &self.tls {
+            builder = builder.tls_config(Arc::clone(tls));
+        }
+        if let Some(sasl) = &self.sasl {
+            builder = builder.sasl_config(sasl.clone());
+        }
+        builder
+    }
+}
+
+/// The client library's form of the credentials.
+fn sasl_config(sasl: &Sasl) -> SaslConfig {
+    let credentials = Credentials::new(sasl.username.clone(), sasl.password.clone());
+    match sasl.mechanism {
+        SaslMechanism::Plain => SaslConfig::Plain(credentials),
+        SaslMechanism::ScramSha256 => SaslConfig::ScramSha256(credentials),
+        SaslMechanism::ScramSha512 => SaslConfig::ScramSha512(credentials),
+    }
+}
 
 /// Parse `0=12,1=40` into partition → next offset.
 fn parse_state(state: &str) -> BTreeMap<i32, i64> {
@@ -143,11 +232,18 @@ pub async fn run(
     tx: mpsc::Sender<Frame>,
     mut shutdown: watch::Receiver<bool>,
 ) -> SourceStats {
-    use rskafka::client::ClientBuilder;
     use rskafka::client::error::{Error as KafkaError, ProtocolError};
     use rskafka::client::partition::{OffsetAt, UnknownTopicHandling};
 
     let mut stats = SourceStats::default();
+    let security = match Security::new(opts) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(source_id, %bootstrap, error = %e, "kafka source not started: TLS configuration");
+            return stats;
+        }
+    };
+    let (tls, sasl) = (security.tls(), security.sasl());
     let servers: Vec<String> = bootstrap
         .split(',')
         .map(|s| s.trim().to_owned())
@@ -188,10 +284,28 @@ pub async fn run(
         }
         // what was fetched but not delivered is fetched again
         merge.clear();
-        let client = match ClientBuilder::new(servers.clone()).build().await {
+        // the client library retries inside `build` for as long as no broker accepts the
+        // connection (unreachable, certificate not trusted, credentials refused): stay
+        // responsive to shutdown and keep saying which source is waiting
+        let connecting = security.builder(servers.clone()).build();
+        tokio::pin!(connecting);
+        let connected = loop {
+            tokio::select! {
+                r = &mut connecting => break r,
+                () = shutdown_wait(&mut shutdown) => {
+                    final_state(&tx, source_id, &delivered, &reported).await;
+                    return stats;
+                }
+                () = tokio::time::sleep(NOT_CONNECTED_REMINDER) => {
+                    tracing::warn!(source_id, %bootstrap, tls, sasl,
+                        "kafka: no broker connection yet; still trying (the cause is in the \"Failed to connect to broker\" lines)");
+                }
+            }
+        };
+        let client = match connected {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(source_id, %bootstrap, error = %e, "kafka connect failed; retrying");
+                tracing::warn!(source_id, %bootstrap, tls, sasl, error = %e, "kafka connect failed; retrying");
                 retry!()
             }
         };
@@ -246,7 +360,7 @@ pub async fn run(
         let ids: Vec<i32> = clients.iter().map(|(p, _)| *p).collect();
         // next offset to fetch (ahead of `delivered` by what is buffered)
         let mut fetch_next: BTreeMap<i32, i64> = delivered.clone();
-        tracing::info!(source_id, %topic, partitions = clients.len(), positions = %format_state(&delivered), "kafka consuming");
+        tracing::info!(source_id, %topic, partitions = clients.len(), tls, sasl, positions = %format_state(&delivered), "kafka consuming");
         let mut last_report = tokio::time::Instant::now();
         let mut last_metadata = tokio::time::Instant::now();
         let mut stalled_since: BTreeMap<i32, tokio::time::Instant> = BTreeMap::new();
@@ -429,6 +543,112 @@ mod tests {
         assert_eq!(format_state(&m), "0=12,1=0,3=40");
         assert_eq!(parse_state("").len(), 0);
         assert_eq!(parse_state("x=1,2=y,-1,4=-9").len(), 0);
+    }
+
+    fn sasl(mechanism: SaslMechanism) -> Sasl {
+        Sasl {
+            mechanism,
+            username: "api-key".into(),
+            password: "s3cret-p4ss".into(),
+        }
+    }
+
+    /// Each mechanism reaches the client library as itself, with the credentials unchanged.
+    #[test]
+    fn sasl_mechanisms_map_to_the_client() {
+        for m in [
+            SaslMechanism::Plain,
+            SaslMechanism::ScramSha256,
+            SaslMechanism::ScramSha512,
+        ] {
+            let credentials = match (m, sasl_config(&sasl(m))) {
+                (SaslMechanism::Plain, SaslConfig::Plain(c))
+                | (SaslMechanism::ScramSha256, SaslConfig::ScramSha256(c))
+                | (SaslMechanism::ScramSha512, SaslConfig::ScramSha512(c)) => c,
+                (m, other) => panic!("{m:?} became {other:?}"),
+            };
+            assert_eq!(credentials.username, "api-key");
+            assert_eq!(credentials.password, "s3cret-p4ss");
+        }
+        assert_eq!(SaslMechanism::Plain.name(), "PLAIN");
+        assert_eq!(SaslMechanism::ScramSha256.name(), "SCRAM-SHA-256");
+        assert_eq!(SaslMechanism::ScramSha512.name(), "SCRAM-SHA-512");
+    }
+
+    /// What a connection is built with: nothing by default (plaintext, as before), TLS only
+    /// when asked for, SASL with or without it; the password is in no `Debug` output.
+    #[test]
+    fn connection_security_follows_the_options() {
+        use crate::sources::{TlsFiles, Transport};
+        let dir = tempfile::tempdir().unwrap();
+        let ca = rcgen::generate_simple_self_signed(vec!["broker".into()]).unwrap();
+        let ca_pem = dir.path().join("ca.pem");
+        std::fs::write(&ca_pem, ca.cert.pem()).unwrap();
+        let private_ca = TlsFiles {
+            ca: Some(ca_pem),
+            ..TlsFiles::default()
+        };
+        let missing = TlsFiles {
+            ca: Some(dir.path().join("missing.pem")),
+            ..TlsFiles::default()
+        };
+
+        let s = Security::new(&SourceOpts::default()).unwrap();
+        assert!(!s.tls() && s.sasl.is_none());
+        assert_eq!(s.sasl(), "none");
+        // certificate files alone do not switch TLS on (and are not read)
+        let s = Security::new(&SourceOpts {
+            tls: missing.clone(),
+            ..SourceOpts::default()
+        })
+        .unwrap();
+        assert!(!s.tls());
+        // TLS with the public roots; TLS with a private CA and SASL
+        let s = Security::new(&SourceOpts {
+            tls_enabled: true,
+            ..SourceOpts::default()
+        })
+        .unwrap();
+        assert!(s.tls() && s.sasl.is_none());
+        let opts = SourceOpts {
+            tls_enabled: true,
+            tls: private_ca,
+            sasl: Some(sasl(SaslMechanism::ScramSha512)),
+            ..SourceOpts::default()
+        };
+        let s = Security::new(&opts).unwrap();
+        assert!(s.tls() && matches!(s.sasl, Some(SaslConfig::ScramSha512(_))));
+        assert_eq!(s.sasl(), "SCRAM-SHA-512");
+        let _ = s.builder(vec!["broker:9093".to_owned()]);
+        for shown in [format!("{opts:?}"), format!("{s:?}")] {
+            assert!(!shown.contains("s3cret-p4ss"), "{shown}");
+        }
+        assert!(format!("{opts:?}").contains("api-key"));
+        // SASL without TLS (a loopback broker)
+        let s = Security::new(&SourceOpts {
+            sasl: Some(sasl(SaslMechanism::Plain)),
+            ..SourceOpts::default()
+        })
+        .unwrap();
+        assert!(!s.tls() && matches!(s.sasl, Some(SaslConfig::Plain(_))));
+        assert_eq!(s.sasl(), "PLAIN");
+        // a bad file is refused with its name, also by the check that runs before the start
+        let bad = SourceOpts {
+            tls_enabled: true,
+            tls: missing,
+            ..SourceOpts::default()
+        };
+        assert!(Security::new(&bad).unwrap_err().contains("missing.pem"));
+        let transport = Transport::Kafka {
+            bootstrap: "broker:9093".into(),
+            topic: "t".into(),
+        };
+        assert!(
+            crate::sources::check(&transport, &bad)
+                .unwrap_err()
+                .contains("missing.pem")
+        );
+        crate::sources::check(&transport, &opts).unwrap();
     }
 
     /// Two partitions with interleaved timestamps come out in time order, and nothing newer

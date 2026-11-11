@@ -166,6 +166,33 @@ pub enum SourceKind {
     Mqtt,
 }
 
+/// SASL mechanism of a Kafka source. The names are Kafka's, in lower case; the upper-case
+/// spelling of a broker's `sasl.mechanism` is accepted too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SaslMechanism {
+    /// `PLAIN` (RFC 4616): the password itself is sent; only safe inside TLS.
+    #[serde(rename = "plain", alias = "PLAIN")]
+    Plain,
+    /// `SCRAM-SHA-256` (RFC 7677): challenge-response, the password is not sent.
+    #[serde(rename = "scram-sha-256", alias = "SCRAM-SHA-256")]
+    ScramSha256,
+    /// `SCRAM-SHA-512`.
+    #[serde(rename = "scram-sha-512", alias = "SCRAM-SHA-512")]
+    ScramSha512,
+}
+
+impl SaslMechanism {
+    /// The mechanism name as Kafka spells it.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Plain => "PLAIN",
+            Self::ScramSha256 => "SCRAM-SHA-256",
+            Self::ScramSha512 => "SCRAM-SHA-512",
+        }
+    }
+}
+
 /// Unit of the timestamp field as it arrives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -184,6 +211,8 @@ pub enum TimeUnit {
 }
 
 /// One message source → one user table.
+// each bool is an independent key of the configuration file, not a state of the source
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceConfig {
@@ -223,15 +252,38 @@ pub struct SourceConfig {
     /// the element, `$msg.<path>` from the message around it. Unset: one row per message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rows: Option<String>,
-    /// `mqtts://` only: PEM file of the CA(s) to trust instead of the public roots.
+    /// Kafka: connect with TLS. (The Kafka `url` is a server list without a scheme; an MQTT
+    /// source asks for TLS with an `mqtts://` url instead.)
+    #[serde(default)]
+    pub tls: bool,
+    /// TLS sources (`mqtts://`, or Kafka with `tls = true`): PEM file of the CA(s) to trust
+    /// instead of the public roots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_ca: Option<PathBuf>,
-    /// `mqtts://` only: PEM client certificate chain (with `tls_key`).
+    /// TLS sources: PEM client certificate chain (with `tls_key`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_cert: Option<PathBuf>,
-    /// `mqtts://` only: PEM private key of `tls_cert`.
+    /// TLS sources: PEM private key of `tls_cert`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls_key: Option<PathBuf>,
+    /// Kafka: authenticate with SASL using this mechanism (with `sasl_username` and
+    /// `sasl_password_env`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sasl_mechanism: Option<SaslMechanism>,
+    /// Kafka SASL user name (for a managed service, often an API key id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sasl_username: Option<String>,
+    /// Environment variable holding the Kafka SASL password (never the password itself).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sasl_password_env: Option<String>,
+    /// Resolved SASL password (from `sasl_password_env`); never serialized, redacted in `Debug`.
+    #[serde(skip)]
+    pub sasl_password: Option<Secret>,
+    /// Kafka: accept SASL without TLS to a broker beyond loopback. Off by default: a `PLAIN`
+    /// password and all data would cross the network in clear text. Only for a private network
+    /// segment.
+    #[serde(default)]
+    pub allow_plaintext: bool,
     /// Sparkplug: ask an edge node to publish its BIRTH again (`NCMD` `Node Control/Rebirth`)
     /// when its DATA arrives before any BIRTH since the server started. Needs permission to
     /// publish on `spBv1.0/<group>/NCMD/<node>`.
@@ -254,8 +306,125 @@ impl std::fmt::Debug for SourceConfig {
             .field("ts_from_receive", &self.ts_from_receive)
             .field("start", &self.start)
             .field("max_message_bytes", &self.max_message_bytes)
+            .field("tls", &self.tls)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .field("sasl_username", &self.sasl_username)
+            .field("sasl_password_env", &self.sasl_password_env)
+            .field("sasl_password", &self.sasl_password)
+            .field("allow_plaintext", &self.allow_plaintext)
             .finish_non_exhaustive()
     }
+}
+
+impl SourceConfig {
+    /// True when the source connects with TLS: an `mqtts://` url, or Kafka with `tls = true`.
+    #[must_use]
+    pub fn uses_tls(&self) -> bool {
+        match self.kind {
+            SourceKind::Mqtt => self.url.starts_with("mqtts://"),
+            SourceKind::Kafka => self.tls,
+            SourceKind::Nats | SourceKind::File => false,
+        }
+    }
+
+    /// True when every Kafka bootstrap server of `url` is a loopback address (`localhost`,
+    /// `127.0.0.0/8`, `::1`). Only the configured list is looked at: where a broker's advertised
+    /// listeners point is not known before connecting.
+    #[must_use]
+    pub fn kafka_bootstrap_is_loopback(&self) -> bool {
+        let mut hosts = kafka_hosts(&self.url).peekable();
+        hosts.peek().is_some()
+            && hosts.all(|h| {
+                h.eq_ignore_ascii_case("localhost")
+                    || h.parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            })
+    }
+
+    /// TLS and SASL settings: which keys go together, on which transport, and that a password
+    /// does not cross a network in clear text by accident. The reason comes without the
+    /// `sources.<name>:` prefix.
+    fn validate_connection_security(&self) -> Result<(), String> {
+        let kafka = self.kind == SourceKind::Kafka;
+        if self.tls && !kafka {
+            return Err(
+                "tls = true is for Kafka sources (an MQTT source uses an mqtts:// url)".to_owned(),
+            );
+        }
+        let has_tls_files =
+            self.tls_ca.is_some() || self.tls_cert.is_some() || self.tls_key.is_some();
+        if has_tls_files && !self.uses_tls() {
+            return Err(if kafka {
+                "tls_ca / tls_cert / tls_key need tls = true".to_owned()
+            } else {
+                "tls_ca / tls_cert / tls_key need an mqtts:// source (or a Kafka source with tls = true)"
+                    .to_owned()
+            });
+        }
+        if self.tls_cert.is_some() != self.tls_key.is_some() {
+            return Err("tls_cert and tls_key must be set together".to_owned());
+        }
+        // the client library takes the TLS server name from the text before the first `:`
+        if kafka && self.tls && self.url.contains('[') {
+            return Err(
+                "tls = true does not work with IPv6 literal addresses in url; use host names or IPv4 addresses"
+                    .to_owned(),
+            );
+        }
+        let sasl_keys = [
+            self.sasl_mechanism.is_some(),
+            self.sasl_username.is_some(),
+            self.sasl_password_env.is_some(),
+        ];
+        let sasl = sasl_keys.contains(&true);
+        if !kafka && (sasl || self.allow_plaintext) {
+            return Err(
+                "sasl_mechanism / sasl_username / sasl_password_env / allow_plaintext are for Kafka sources"
+                    .to_owned(),
+            );
+        }
+        if sasl {
+            if sasl_keys.contains(&false) {
+                return Err(
+                    "sasl_mechanism, sasl_username and sasl_password_env must be set together"
+                        .to_owned(),
+                );
+            }
+            if self.sasl_username.as_deref().is_none_or(str::is_empty) {
+                return Err("sasl_username is empty".to_owned());
+            }
+            if self.sasl_password.is_none() {
+                return Err(format!(
+                    "sasl_password_env names a variable ({}) that is unset or empty",
+                    self.sasl_password_env.as_deref().unwrap_or_default()
+                ));
+            }
+            if !self.tls && !self.allow_plaintext && !self.kafka_bootstrap_is_loopback() {
+                return Err(
+                    "SASL without TLS to a broker beyond loopback is refused: a PLAIN password and all data would cross the network in clear text, and a SCRAM exchange can be attacked offline. Set tls = true, or allow_plaintext = true for a private network segment"
+                        .to_owned(),
+                );
+            }
+        }
+        if self.allow_plaintext && (self.tls || !sasl) {
+            return Err(
+                "allow_plaintext only applies to SASL without TLS; remove it (or tls = true)"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Host part of every entry of a Kafka bootstrap list (`host:port,[v6]:port,host`).
+fn kafka_hosts(url: &str) -> impl Iterator<Item = &str> {
+    url.split(',')
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(|e| match e.strip_prefix('[') {
+            Some(rest) => rest.split(']').next().unwrap_or(rest),
+            None => e.rsplit_once(':').map_or(e, |(host, _)| host),
+        })
 }
 
 /// Continuous query kinds.
@@ -614,7 +783,8 @@ impl Config {
         toml::from_str(text).map_err(|e| ConfigError::Parse(e.to_string()))
     }
 
-    /// Fill `server.token` / `server.metrics_token` from their `*_env` names when not already set.
+    /// Fill `server.token` / `server.metrics_token`, the replication token and the SASL password
+    /// of every source from their `*_env` names when not already set.
     pub fn resolve_secrets(&mut self) {
         if self.server.token.is_none()
             && let Some(var) = &self.server.token_env
@@ -636,6 +806,15 @@ impl Config {
             && !v.is_empty()
         {
             self.replication.token = Some(Secret::new(v));
+        }
+        for s in &mut self.sources {
+            if s.sasl_password.is_none()
+                && let Some(var) = &s.sasl_password_env
+                && let Ok(v) = std::env::var(var)
+                && !v.is_empty()
+            {
+                s.sasl_password = Some(Secret::new(v));
+            }
         }
     }
 
@@ -973,18 +1152,8 @@ impl Config {
                     ));
                 }
             }
-            let has_tls = s.tls_ca.is_some() || s.tls_cert.is_some() || s.tls_key.is_some();
-            if has_tls && !(s.kind == SourceKind::Mqtt && s.url.starts_with("mqtts://")) {
-                return inv(format!(
-                    "sources.{}: tls_ca / tls_cert / tls_key need an mqtts:// source",
-                    s.name
-                ));
-            }
-            if s.tls_cert.is_some() != s.tls_key.is_some() {
-                return inv(format!(
-                    "sources.{}: tls_cert and tls_key must be set together",
-                    s.name
-                ));
+            if let Err(reason) = s.validate_connection_security() {
+                return inv(format!("sources.{}: {reason}", s.name));
             }
             if s.kind != SourceKind::Mqtt && s.map.values().any(|v| v.trim().starts_with("$topic"))
             {
@@ -1455,12 +1624,215 @@ standby_of = "10.0.0.1:50051"
             ts_unit: TimeUnit::Nanos,
             ts_from_receive: true,
             rows: None,
+            tls: false,
             tls_ca: None,
             tls_cert: None,
             tls_key: None,
+            sasl_mechanism: Some(SaslMechanism::Plain),
+            sasl_username: Some("key".into()),
+            sasl_password_env: Some("KAFKA_PASSWORD".into()),
+            sasl_password: Some(Secret::new("p4ssw0rd".into())),
+            allow_plaintext: false,
             sparkplug_rebirth: false,
         };
-        assert!(!format!("{s:?}").contains("s3cret"));
+        let shown = format!("{s:?}");
+        assert!(!shown.contains("s3cret") && !shown.contains("p4ssw0rd"));
+        assert!(shown.contains("KAFKA_PASSWORD") && shown.contains("***"));
+    }
+
+    /// A config with one Kafka source: `url`, and `extra` lines appended to the source.
+    fn kafka_cfg(url: &str, extra: &str) -> String {
+        format!(
+            r#"
+[feed]
+enabled = false
+streams = []
+[[tables]]
+name = "t"
+columns = [{{ name = "ts", type = "timestamp_ns" }}, {{ name = "v", type = "float64" }}]
+[[sources]]
+name = "events"
+kind = "kafka"
+url = "{url}"
+subject = "events"
+format = "json"
+table = "t"
+map = {{ ts = "t", v = "v" }}
+{extra}
+"#
+        )
+    }
+
+    /// Parse and validate with the SASL password of every source set to `password` (the tests
+    /// do not touch the process environment).
+    fn kafka_check(url: &str, extra: &str, password: Option<&str>) -> Result<Config, String> {
+        let mut c = Config::parse_toml(&kafka_cfg(url, extra)).map_err(|e| e.to_string())?;
+        for s in &mut c.sources {
+            s.sasl_password = password.map(|p| Secret::new(p.to_owned()));
+        }
+        c.validate().map_err(|e| e.to_string())?;
+        Ok(c)
+    }
+
+    #[test]
+    fn kafka_tls_settings() {
+        let ok = |url: &str, extra: &str| kafka_check(url, extra, None).unwrap();
+        let err = |url: &str, extra: &str| kafka_check(url, extra, None).unwrap_err();
+        // plaintext stays the default; TLS is asked for explicitly
+        assert!(!ok("broker:9092", "").sources[0].uses_tls());
+        assert!(ok("broker:9093", "tls = true").sources[0].uses_tls());
+        ok("b1:9093,b2:9093", "tls = true\ntls_ca = \"ca.pem\"");
+        ok(
+            "broker:9093",
+            "tls = true\ntls_ca = \"ca.pem\"\ntls_cert = \"c.pem\"\ntls_key = \"k.pem\"",
+        );
+        // certificate files do not switch TLS on by themselves
+        let e = err("broker:9092", "tls_ca = \"ca.pem\"");
+        assert!(
+            e.contains("sources.events") && e.contains("need tls = true"),
+            "{e}"
+        );
+        assert!(
+            err("broker:9092", "tls = false\ntls_cert = \"c.pem\"").contains("need tls = true")
+        );
+        assert!(err("broker:9093", "tls = true\ntls_cert = \"c.pem\"").contains("together"));
+        assert!(err("broker:9093", "tls = true\ntls_key = \"k.pem\"").contains("together"));
+        assert!(err("[::1]:9093", "tls = true").contains("IPv6"));
+        ok("[::1]:9092", "");
+        // `tls` is the Kafka switch: MQTT has its url scheme
+        let mqtt = kafka_cfg("mqtt://broker", "tls = true").replace("kafka", "mqtt");
+        let e = Config::from_toml(&mqtt).unwrap_err().to_string();
+        assert!(e.contains("mqtts://"), "{e}");
+        assert!(
+            Config::from_toml(&kafka_cfg("broker:9092", "tls = \"yes\""))
+                .unwrap_err()
+                .to_string()
+                .contains("parse error")
+        );
+    }
+
+    #[test]
+    fn kafka_sasl_settings() {
+        let sasl = |mechanism: &str| {
+            format!(
+                "sasl_mechanism = \"{mechanism}\"\nsasl_username = \"key\"\nsasl_password_env = \"ANKAA_TEST_KAFKA_PW\""
+            )
+        };
+        let tls_sasl = |mechanism: &str| format!("tls = true\n{}", sasl(mechanism));
+        let pw = Some("p4ssw0rd-from-env");
+        for (text, want) in [
+            ("plain", SaslMechanism::Plain),
+            ("PLAIN", SaslMechanism::Plain),
+            ("scram-sha-256", SaslMechanism::ScramSha256),
+            ("SCRAM-SHA-256", SaslMechanism::ScramSha256),
+            ("scram-sha-512", SaslMechanism::ScramSha512),
+            ("SCRAM-SHA-512", SaslMechanism::ScramSha512),
+        ] {
+            let c = kafka_check("broker:9093", &tls_sasl(text), pw).unwrap();
+            assert_eq!(c.sources[0].sasl_mechanism, Some(want));
+            assert_eq!(want.name(), text.to_ascii_uppercase());
+        }
+        // mechanisms the client library does not have are not accepted
+        for unsupported in ["oauthbearer", "gssapi", "aws_msk_iam", "scram-sha-1"] {
+            let e = kafka_check("broker:9093", &tls_sasl(unsupported), pw).unwrap_err();
+            assert!(
+                e.contains("parse error") && e.contains("scram-sha-512"),
+                "{e}"
+            );
+        }
+        // the three keys go together
+        for partial in [
+            "sasl_mechanism = \"plain\"",
+            "sasl_username = \"key\"",
+            "sasl_password_env = \"ANKAA_TEST_KAFKA_PW\"",
+            "sasl_mechanism = \"plain\"\nsasl_username = \"key\"",
+        ] {
+            let e = kafka_check("broker:9093", &format!("tls = true\n{partial}"), pw).unwrap_err();
+            assert!(e.contains("must be set together"), "{e}");
+        }
+        let empty_user = tls_sasl("plain").replace("\"key\"", "\"\"");
+        assert!(
+            kafka_check("broker:9093", &empty_user, pw)
+                .unwrap_err()
+                .contains("sasl_username is empty")
+        );
+        // a password variable that is not set stops the start, with the source and the variable
+        let e = kafka_check("broker:9093", &tls_sasl("plain"), None).unwrap_err();
+        assert!(
+            e.contains("sources.events")
+                && e.contains("ANKAA_TEST_KAFKA_PW")
+                && e.contains("unset or empty"),
+            "{e}"
+        );
+        // without TLS: loopback brokers only, unless allowed explicitly
+        for local in [
+            "127.0.0.1:9092",
+            "localhost:9092",
+            "LOCALHOST:9092, 127.0.0.2:9093",
+            "[::1]:9092",
+        ] {
+            kafka_check(local, &sasl("scram-sha-512"), pw).unwrap();
+        }
+        for remote in [
+            "broker:9092",
+            "10.0.0.5:9092",
+            "127.0.0.1:9092,broker:9092",
+            "localhost.example.com:9092",
+            "[2001:db8::1]:9092",
+        ] {
+            let e = kafka_check(remote, &sasl("scram-sha-512"), pw).unwrap_err();
+            assert!(
+                e.contains("sources.events") && e.contains("SASL without TLS"),
+                "{remote}: {e}"
+            );
+            kafka_check(
+                remote,
+                &format!("{}\nallow_plaintext = true", sasl("plain")),
+                pw,
+            )
+            .unwrap();
+        }
+        // allow_plaintext is not a general switch
+        assert!(
+            kafka_check(
+                "broker:9093",
+                &format!("{}\nallow_plaintext = true", tls_sasl("plain")),
+                pw
+            )
+            .unwrap_err()
+            .contains("allow_plaintext only applies")
+        );
+        assert!(
+            kafka_check("broker:9092", "allow_plaintext = true", None)
+                .unwrap_err()
+                .contains("allow_plaintext only applies")
+        );
+        // SASL is a Kafka setting
+        let nats = kafka_cfg("nats://broker:4222", &sasl("plain")).replace("kafka", "nats");
+        let e = Config::from_toml(&nats).unwrap_err().to_string();
+        assert!(e.contains("are for Kafka sources"), "{e}");
+    }
+
+    /// The password comes from the environment, is never written by `to_toml` and never shown.
+    #[test]
+    fn kafka_sasl_password_is_resolved_from_the_environment_and_never_printed() {
+        // PATH is set in every test environment: its value stands in for a password
+        let Ok(path) = std::env::var("PATH") else {
+            return;
+        };
+        let extra = "tls = true\nsasl_mechanism = \"scram-sha-256\"\nsasl_username = \"key\"\nsasl_password_env = \"PATH\"";
+        let c = Config::from_toml(&kafka_cfg("broker:9093", extra)).unwrap();
+        let s = &c.sources[0];
+        assert_eq!(s.sasl_password.as_ref().map(Secret::expose), Some(&*path));
+        let (toml, debug) = (c.to_toml(), format!("{c:?}"));
+        assert!(toml.contains("sasl_password_env = \"PATH\""));
+        assert!(!toml.contains("sasl_password ="), "{toml}");
+        assert!(!toml.contains(&path) && !debug.contains(&path));
+        let unset = extra.replace("\"PATH\"", "\"ANKAA_TEST_UNSET_KAFKA_PASSWORD\"");
+        let e = Config::from_toml(&kafka_cfg("broker:9093", &unset))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("ANKAA_TEST_UNSET_KAFKA_PASSWORD"), "{e}");
     }
 
     #[test]

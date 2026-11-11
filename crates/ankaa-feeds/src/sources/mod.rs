@@ -6,8 +6,10 @@
 //!
 //! - `file`: a file replayed line by line (NDJSON / CSV), for tests and backfills.
 //! - `nats` (feature `nats`): a NATS core subject (at most once: no replay after a restart).
-//! - `kafka` (feature `kafka`): a Kafka topic, all partitions.
+//! - `kafka` (feature `kafka`): a Kafka topic, all partitions; TLS and SASL for managed brokers.
 //! - `mqtt` (feature `mqtt`): an MQTT topic filter, at-least-once with a persistent session.
+//!
+//! Sources that connect with TLS share one client configuration ([`tls`]).
 //!
 //! **Positions.** File and Kafka sources report how far they have read with in-band control
 //! frames ([`crate::capture::source_state_payload`]). The server persists the newest state it
@@ -28,6 +30,8 @@ pub mod kafka;
 pub mod mqtt;
 #[cfg(feature = "nats")]
 pub mod nats;
+#[cfg(any(feature = "kafka", feature = "mqtt"))]
+pub mod tls;
 
 /// Counters returned when a source task ends.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -54,8 +58,12 @@ pub struct SourceOpts {
     pub resume: Option<String>,
     /// MQTT client id (the broker keeps the session under it); `ankaa-<source id>` when unset.
     pub client_id: Option<String>,
-    /// TLS files of an `mqtts://` source.
+    /// Kafka: connect with TLS. (An MQTT source connects with TLS when its URL says `mqtts://`.)
+    pub tls_enabled: bool,
+    /// TLS files of a source that connects with TLS.
     pub tls: TlsFiles,
+    /// Kafka: authenticate with SASL.
+    pub sasl: Option<Sasl>,
     /// MQTT Sparkplug: ask edge nodes whose DATA arrives before their BIRTH to publish the
     /// BIRTH again (`NCMD`, `Node Control/Rebirth`).
     pub sparkplug_rebirth: bool,
@@ -72,6 +80,29 @@ pub struct TlsFiles {
     pub key: Option<std::path::PathBuf>,
 }
 
+pub use ankaa_core::config::SaslMechanism;
+
+/// SASL credentials of a Kafka source. `Debug` never shows the password.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Sasl {
+    /// Mechanism.
+    pub mechanism: SaslMechanism,
+    /// User name.
+    pub username: String,
+    /// Password (pass it on; do not log it).
+    pub password: String,
+}
+
+impl std::fmt::Debug for Sasl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sasl")
+            .field("mechanism", &self.mechanism)
+            .field("username", &self.username)
+            .field("password", &"***")
+            .finish()
+    }
+}
+
 impl Default for SourceOpts {
     fn default() -> Self {
         Self {
@@ -79,7 +110,9 @@ impl Default for SourceOpts {
             start_earliest: false,
             resume: None,
             client_id: None,
+            tls_enabled: false,
             tls: TlsFiles::default(),
+            sasl: None,
             sparkplug_rebirth: false,
         }
     }
@@ -215,6 +248,23 @@ pub enum Transport {
         /// Topic filter (`+` / `#` wildcards allowed).
         topic: String,
     },
+}
+
+/// Check what a source reads from disk before it connects: the TLS files of an `mqtts://` or
+/// Kafka TLS source. A source with a bad file would stop when it starts; calling this first
+/// (server start, `ankaad config check`) stops the start instead, with the file named.
+/// Transports that are not compiled in have nothing to check.
+#[allow(unused_variables)]
+pub fn check(transport: &Transport, opts: &SourceOpts) -> Result<(), String> {
+    match transport {
+        #[cfg(feature = "mqtt")]
+        Transport::Mqtt { url, .. } if mqtt::parse_url(url).is_ok_and(|broker| broker.tls) => {
+            tls::client_config(&opts.tls).map(|_| ())
+        }
+        #[cfg(feature = "kafka")]
+        Transport::Kafka { .. } => kafka::Security::new(opts).map(|_| ()),
+        _ => Ok(()),
+    }
 }
 
 /// Run a source until shutdown. Unavailable transports (feature not compiled) return at once

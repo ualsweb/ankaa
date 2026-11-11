@@ -1150,3 +1150,127 @@ width_ns = 60000000000
     );
     stop(s);
 }
+
+/// `config check` and the server start refuse a source whose TLS files or SASL password are
+/// not usable, and say which source: nothing waits for the first connection to find out.
+/// No broker is needed: the checks run before any source connects.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn source_tls_files_and_sasl_password_are_checked_before_the_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let garbage = dir.path().join("garbage.pem");
+    std::fs::write(&garbage, "not a certificate\n").unwrap();
+    let missing = dir.path().join("missing-ca.pem");
+    let (flight, metrics) = (free_port(), free_port());
+    let config = |kind: &str, url: &str, settings: &str| {
+        format!(
+            r#"
+[feed]
+enabled = false
+streams = []
+[server]
+flight_addr = "127.0.0.1:{flight}"
+metrics_addr = "127.0.0.1:{metrics}"
+[[tables]]
+name = "t"
+columns = [{{ name = "ts", type = "timestamp_ns" }}, {{ name = "v", type = "float64" }}]
+[[sources]]
+name = "managed"
+kind = "{kind}"
+url = "{url}"
+subject = "events"
+format = "json"
+table = "t"
+map = {{ ts = "t", v = "v" }}
+{settings}
+"#
+        )
+    };
+    // run `ankaad <args> <config>` with the SASL password variable set or not
+    let var = "ANKAA_TEST_E2E_KAFKA_PASSWORD";
+    let run = |args: &[&str], text: &str, password: Option<&str>| {
+        let path = dir.path().join("check.toml");
+        std::fs::write(&path, text).unwrap();
+        let mut cmd = Command::new(bin());
+        cmd.args(args)
+            .arg(&path)
+            .env("ANKAA_TOKEN", "t0k3n")
+            .env_remove(var);
+        if let Some(p) = password {
+            cmd.env(var, p);
+        }
+        let out = cmd.output().unwrap();
+        let text = String::from_utf8_lossy(&out.stderr) + String::from_utf8_lossy(&out.stdout);
+        (out.status.success(), strip_ansi(&text))
+    };
+    let check = |text: &str, password: Option<&str>| run(&["config", "check"], text, password);
+    let sasl = format!(
+        "tls = true\nsasl_mechanism = \"scram-sha-512\"\nsasl_username = \"key\"\nsasl_password_env = \"{var}\""
+    );
+    let secret = "p4ssw0rd-that-must-not-be-printed";
+
+    // accepted: TLS with the public roots, and SASL inside it with the password in the environment
+    let (ok, out) = check(&config("kafka", "broker.example:9093", "tls = true"), None);
+    assert!(ok, "{out}");
+    let (ok, out) = check(&config("kafka", "broker.example:9093", &sasl), Some(secret));
+    assert!(ok && !out.contains(secret), "{out}");
+
+    // a CA file that does not exist, and one without a certificate, for Kafka and for MQTT
+    for (kind, url, switch) in [
+        ("kafka", "broker.example:9093", "tls = true\n"),
+        ("mqtt", "mqtts://broker.example", ""),
+    ] {
+        for (file, reason) in [
+            (&missing, "missing-ca.pem"),
+            (&garbage, "no PEM certificate"),
+        ] {
+            let settings = format!("{switch}tls_ca = \"{}\"", file.display());
+            let (ok, out) = check(&config(kind, url, &settings), None);
+            assert!(!ok, "{kind}: {out}");
+            assert!(
+                out.contains("source managed") && out.contains(reason),
+                "{kind}: {out}"
+            );
+        }
+    }
+    // the password variable is not set: refused with the source and the variable, not the value
+    let (ok, out) = check(&config("kafka", "broker.example:9093", &sasl), None);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("sources.managed") && out.contains(var),
+        "{out}"
+    );
+    // SASL without TLS beyond loopback
+    let no_tls = sasl.replace("tls = true\n", "");
+    let (ok, out) = check(
+        &config("kafka", "broker.example:9092", &no_tls),
+        Some(secret),
+    );
+    assert!(!ok && out.contains("SASL without TLS"), "{out}");
+    assert!(!out.contains(secret), "{out}");
+    let (ok, out) = check(&config("kafka", "127.0.0.1:9092", &no_tls), Some(secret));
+    assert!(ok, "{out}");
+
+    // the server start stops the same way, before it listens
+    let serve = |text: &str, password: Option<&str>| {
+        run(
+            &["serve", "--duration-secs", "1", "--config"],
+            text,
+            password,
+        )
+    };
+    let bad_ca = format!("tls = true\ntls_ca = \"{}\"", missing.display());
+    let (ok, out) = serve(&config("kafka", "broker.example:9093", &bad_ca), None);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("source managed") && out.contains("missing-ca.pem"),
+        "{out}"
+    );
+    assert!(!out.contains("flight listening"), "{out}");
+    let (ok, out) = serve(&config("kafka", "broker.example:9093", &sasl), None);
+    assert!(!ok, "{out}");
+    assert!(
+        out.contains("sources.managed") && out.contains(var),
+        "{out}"
+    );
+}

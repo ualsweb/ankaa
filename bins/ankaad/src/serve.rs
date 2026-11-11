@@ -376,12 +376,75 @@ impl Ingest {
     }
 }
 
+/// How a `[[sources]]` entry connects: its transport and options (the read position is filled
+/// in after recovery).
+fn source_connection(
+    s: &ankaa_core::config::SourceConfig,
+) -> (
+    ankaa_feeds::sources::Transport,
+    ankaa_feeds::sources::SourceOpts,
+) {
+    use ankaa_feeds::sources::{Sasl, SourceOpts, TlsFiles, Transport};
+    let transport = match s.kind {
+        SourceKind::File => Transport::File(std::path::PathBuf::from(&s.url)),
+        SourceKind::Nats => Transport::Nats {
+            url: s.url.clone(),
+            subject: s.subject.clone(),
+        },
+        SourceKind::Kafka => Transport::Kafka {
+            bootstrap: s.url.clone(),
+            topic: s.subject.clone(),
+        },
+        SourceKind::Mqtt => Transport::Mqtt {
+            url: s.url.clone(),
+            topic: s.subject.clone(),
+        },
+    };
+    // validation has made sure the three SASL settings come together, with a password
+    let sasl = match (&s.sasl_mechanism, &s.sasl_username, &s.sasl_password) {
+        (Some(mechanism), Some(username), Some(password)) => Some(Sasl {
+            mechanism: *mechanism,
+            username: username.clone(),
+            password: password.expose().to_owned(),
+        }),
+        _ => None,
+    };
+    let opts = SourceOpts {
+        max_message_bytes: s.max_message_bytes,
+        start_earliest: s.start == ankaa_core::config::SourceStart::Earliest,
+        resume: None,
+        client_id: Some(format!("ankaa-{}", s.name)),
+        tls_enabled: s.tls,
+        tls: TlsFiles {
+            ca: s.tls_ca.clone(),
+            cert: s.tls_cert.clone(),
+            key: s.tls_key.clone(),
+        },
+        sasl,
+        sparkplug_rebirth: s.sparkplug_rebirth,
+    };
+    (transport, opts)
+}
+
+/// Check what the sources read from disk before they connect (the TLS files of `mqtts://` and
+/// Kafka TLS sources): a missing or invalid file stops the start, and `config check`, with the
+/// source and the file named, rather than the source later.
+pub fn check_sources(cfg: &ankaa_core::Config) -> anyhow::Result<()> {
+    for s in &cfg.sources {
+        let (transport, opts) = source_connection(s);
+        ankaa_feeds::sources::check(&transport, &opts)
+            .map_err(|e| anyhow::anyhow!("source {}: TLS: {e}", s.name))?;
+    }
+    Ok(())
+}
+
 /// Run the server until Ctrl-C or `duration`.
 #[allow(clippy::too_many_lines)]
 pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let cfg = &opts.config;
     cfg.validate()?;
     cfg.check_resources()?;
+    check_sources(cfg)?;
     let token: Option<String> = cfg.server.token.as_ref().map(|t| t.expose().to_owned());
     let tls = match (&cfg.server.tls_cert, &cfg.server.tls_key) {
         (Some(cert), Some(key)) => Some(TlsFiles {
@@ -502,39 +565,12 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         // ids are stable across restarts and config edits: WAL frames name their source by id
         let id = ingest.states.id_for(&s.name)?;
         ingest.tables.add_source(id, &s.name, ti, mapper, csv);
-        let transport = match s.kind {
-            SourceKind::File => {
-                ankaa_feeds::sources::Transport::File(std::path::PathBuf::from(&s.url))
-            }
-            SourceKind::Nats => ankaa_feeds::sources::Transport::Nats {
-                url: s.url.clone(),
-                subject: s.subject.clone(),
-            },
-            SourceKind::Kafka => ankaa_feeds::sources::Transport::Kafka {
-                bootstrap: s.url.clone(),
-                topic: s.subject.clone(),
-            },
-            SourceKind::Mqtt => ankaa_feeds::sources::Transport::Mqtt {
-                url: s.url.clone(),
-                topic: s.subject.clone(),
-            },
-        };
-        let opts = ankaa_feeds::sources::SourceOpts {
-            max_message_bytes: s.max_message_bytes,
-            start_earliest: s.start == ankaa_core::config::SourceStart::Earliest,
-            resume: None, // filled in after recovery
-            client_id: Some(format!("ankaa-{}", s.name)),
-            tls: ankaa_feeds::sources::TlsFiles {
-                ca: s.tls_ca.clone(),
-                cert: s.tls_cert.clone(),
-                key: s.tls_key.clone(),
-            },
-            sparkplug_rebirth: s.sparkplug_rebirth,
-        };
-        // a bad certificate file stops the start, with the reason, rather than the source later
-        if s.kind == SourceKind::Mqtt && s.url.starts_with("mqtts://") {
-            ankaa_feeds::sources::mqtt::tls_config(&opts.tls)
-                .map_err(|e| anyhow::anyhow!("source {}: TLS: {e}", s.name))?;
+        let (transport, opts) = source_connection(s);
+        if s.sasl_mechanism.is_some() && !s.tls && !s.kafka_bootstrap_is_loopback() {
+            warn!(
+                source = %s.name,
+                "Kafka SASL without TLS beyond loopback (allow_plaintext): the authentication exchange and the data are not encrypted"
+            );
         }
         source_transports.push((id, s.name.clone(), transport, opts));
     }

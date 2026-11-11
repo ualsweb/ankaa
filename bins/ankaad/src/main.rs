@@ -538,6 +538,8 @@ async fn main() -> anyhow::Result<()> {
                 let cfg = ankaa_core::Config::from_toml(&text)?;
                 // dry run: validates limits and paths without creating directories
                 cfg.check_resources_dry_run()?;
+                // TLS files of the sources: read and parsed, as the server does at start
+                serve::check_sources(&cfg)?;
                 println!("{}: ok", file.display());
                 Ok(())
             }
