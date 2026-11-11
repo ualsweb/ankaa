@@ -138,6 +138,48 @@
   </div>
 </section>
 
+<section id="telemetry">
+  <div class="wrap">
+    <p class="kicker">Telemetry comparison</p>
+    <h2>The TSBS workload, 26 million rows, three engines on one VM.</h2>
+    <p class="sub">TSBS <code>cpu-only</code>: 1,000 hosts, 3 days at 10 s, 10 tags and 10 fields per row, loaded into each engine on the same c4a-standard-4 VM, one engine at a time. 20 runs after 3 warm-ups; median milliseconds, client-observed; every answer checked against DuckDB on the same rows before it is timed.</p>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Load and storage</th><th class="num">ANKAA</th><th class="num">TimescaleDB 2.31</th><th class="num">QuestDB 10.1</th></tr></thead>
+        <tbody>
+          <tr><td>Load, rows per second</td><td class="num best">1,106,552</td><td class="num">383,254</td><td class="num">801,304</td></tr>
+          <tr><td>Disk at rest, MiB</td><td class="num best">426</td><td class="num">1,311</td><td class="num">5,841</td></tr>
+          <tr><td>Peak memory during the load, MiB</td><td class="num">5,125</td><td class="num best">37 <span style="color:var(--ink-faint)">(plus page cache)</span></td><td class="num">491</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="tbl-wrap">
+      <table>
+        <thead><tr><th>Query</th><th class="num">ANKAA</th><th class="num">TimescaleDB columnstore</th><th class="num">TimescaleDB rowstore</th><th class="num">QuestDB</th></tr></thead>
+        <tbody>
+          <tr><td>1 host, 1 h, 1 metric <span class="tag" style="margin:0">single-groupby-1-1-1</span></td><td class="num">0.74</td><td class="num best">0.22</td><td class="num">0.29</td><td class="num">1.18</td></tr>
+          <tr><td>1 host, 12 h, 1 metric <span class="tag" style="margin:0">single-groupby-1-1-12</span></td><td class="num best">0.75</td><td class="num">1.15</td><td class="num">2.33</td><td class="num">3.98</td></tr>
+          <tr><td>8 hosts, 1 h, 1 metric <span class="tag" style="margin:0">single-groupby-1-8-1</span></td><td class="num best">0.74</td><td class="num">0.74</td><td class="num">1.52</td><td class="num">1.40</td></tr>
+          <tr><td>1 host, 1 h, 5 metrics <span class="tag" style="margin:0">single-groupby-5-1-1</span></td><td class="num">0.78</td><td class="num best">0.32</td><td class="num">0.41</td><td class="num">1.30</td></tr>
+          <tr><td>1 host, 12 h, 5 metrics <span class="tag" style="margin:0">single-groupby-5-1-12</span></td><td class="num best">0.88</td><td class="num">1.87</td><td class="num">2.92</td><td class="num">3.44</td></tr>
+          <tr><td>8 hosts, 1 h, 5 metrics <span class="tag" style="margin:0">single-groupby-5-8-1</span></td><td class="num best">0.88</td><td class="num">1.71</td><td class="num">1.80</td><td class="num">1.10</td></tr>
+          <tr><td>Max of 10 metrics by hour, 1 host <span class="tag" style="margin:0">cpu-max-all-1</span></td><td class="num best">0.88</td><td class="num">1.08</td><td class="num">2.31</td><td class="num">1.63</td></tr>
+          <tr><td>Max of 10 metrics by hour, 8 hosts <span class="tag" style="margin:0">cpu-max-all-8</span></td><td class="num best">1.01</td><td class="num">10.4</td><td class="num">15.7</td><td class="num">4.59</td></tr>
+          <tr><td>All hosts by hour, 1 metric <span class="tag" style="margin:0">double-groupby-1</span></td><td class="num best">14.6</td><td class="num">671</td><td class="num">1,052</td><td class="num">71.4</td></tr>
+          <tr><td>All hosts by hour, 5 metrics <span class="tag" style="margin:0">double-groupby-5</span></td><td class="num best">34.1</td><td class="num">1,081</td><td class="num">1,349</td><td class="num">93.2</td></tr>
+          <tr><td>All hosts by hour, 10 metrics <span class="tag" style="margin:0">double-groupby-all</span></td><td class="num best">59.2</td><td class="num">1,568</td><td class="num">1,707</td><td class="num">138</td></tr>
+          <tr><td>Rows over a threshold, 1 host <span class="tag" style="margin:0">high-cpu-1</span></td><td class="num best">0.83</td><td class="num">1.61</td><td class="num">4.07</td><td class="num">6.02</td></tr>
+          <tr><td>Rows over a threshold, all hosts (384,179 rows) <span class="tag" style="margin:0">high-cpu-all</span></td><td class="num best">58.2</td><td class="num">1,371</td><td class="num">1,823</td><td class="num">631</td></tr>
+          <tr><td>Last 5 minutes with data <span class="tag" style="margin:0">groupby-orderby-limit</span></td><td class="num">8.77</td><td class="num">44.1</td><td class="num best">4.13</td><td class="num">9.44</td></tr>
+          <tr><td>Last reading of every host <span class="tag" style="margin:0">lastpoint</span></td><td class="num best">0.80</td><td class="num">387</td><td class="num">30.6</td><td class="num">2.28</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="note"><b>Where ANKAA loses.</b> Two one-host, one-hour queries, which TimescaleDB answers from an index in a few hundred microseconds while ANKAA pays 0.3 ms of Arrow Flight round trip and 0.3 ms of query planning for 30 µs of work; the newest five minutes against TimescaleDB's rowstore; and memory, where ANKAA peaked at 5.1 GiB during the load and kept it. InfluxDB 3 Core 3.12 did not complete on this 16 GB VM (out of memory in its deduplication sort, twice) and is left out rather than tuned by us.</p>
+    <p class="note">One VM size, four cores, one run, 1,000 series, clients on different protocols. Nothing here says how the engines compare with 100,000 series, on 64 cores or under concurrent load. <a href="https://github.com/ualsweb/ankaa/blob/main/docs/benchmarks/2026-11-11-axion-telemetry-comparison.md">The note</a> has the method, the raw results, how the day started (ANKAA lost 11 of 15 before the changes it describes) and the profile behind every change.</p>
+  </div>
+</section>
+
 <section id="soak">
   <div class="wrap">
     <p class="kicker">Endurance</p>
