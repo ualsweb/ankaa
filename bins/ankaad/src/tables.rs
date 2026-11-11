@@ -255,6 +255,13 @@ impl Tables {
             }
         };
         let listens = self.continuous.listens(&t.name);
+        if n == 0 {
+            return out;
+        }
+        // one lock for the whole message: the stale check, partition creation and the append
+        // of every row happen under it (the dictionaries live outside the table)
+        let mut w = t.table.writer();
+        let lateness = t.table.max_lateness();
         for r in 0..n {
             let parsed = match src.mapper.parsed(r) {
                 Ok(p) => p,
@@ -271,16 +278,14 @@ impl Tables {
             }
             if !self.replaying
                 && let Some(k) = parsed.key
-                && t.table
-                    .partition_watermark(k as usize)
-                    .is_some_and(|wm| parsed.ts < wm.saturating_sub(t.table.max_lateness()))
+                && w.partition_watermark(k as usize)
+                    .is_some_and(|wm| parsed.ts < wm.saturating_sub(lateness))
             {
                 out.reject(MapError::Malformed(STALE));
                 continue;
             }
             let (key, row) = src.mapper.finish_row(r, &mut t.dicts);
-            let part = t.table.partition_for(key);
-            match t.table.append_row_stored(part, row) {
+            match w.append_row_stored(key, row) {
                 Ok(stored) => {
                     out.rows += 1;
                     // rows skipped during recovery are already in a segment: they must not

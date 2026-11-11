@@ -77,14 +77,54 @@ struct Ingest {
     /// not reach the log (the books would wait for it forever), or the log has outgrown its
     /// budget and can only be truncated behind a new starting point for the books.
     rebase_books: bool,
+    /// Counters of the frames handled since the last [`Self::flush_tally`]: plain integers in
+    /// the ingest thread, published to the shared atomics once per batch rather than with
+    /// three atomic read-modify-writes per message.
+    tally: Tally,
+}
+
+/// Per-batch counters (see [`Ingest::tally`]).
+#[derive(Default)]
+struct Tally {
+    frames: u64,
+    user_rows: u64,
+    user_rejected: u64,
 }
 
 impl Ingest {
     /// Handle one frame that the WAL numbered `lsn` (0 = not in the WAL).
     fn handle_frame_lsn(&mut self, frame: &Frame, lsn: u64) {
+        self.handle_frame_lsn_batched(frame, lsn);
+        self.flush_tally();
+    }
+
+    /// [`Self::handle_frame_lsn`] without publishing the counters: for frames handled in a
+    /// batch, which calls [`Self::flush_tally`] once at its end.
+    fn handle_frame_lsn_batched(&mut self, frame: &Frame, lsn: u64) {
         self.tables.set_lsn(lsn);
         self.lsn = lsn;
         self.handle_frame(frame);
+    }
+
+    /// Publish the counters gathered since the last call.
+    fn flush_tally(&mut self) {
+        let t = std::mem::take(&mut self.tally);
+        if t.frames > 0 {
+            self.metrics.frames.fetch_add(t.frames, Ordering::Relaxed);
+        }
+        if t.user_rows > 0 {
+            self.metrics
+                .user_rows
+                .fetch_add(t.user_rows, Ordering::Relaxed);
+            self.metrics
+                .events
+                .fetch_add(t.user_rows, Ordering::Relaxed);
+        }
+        if t.user_rejected > 0 {
+            self.metrics
+                .user_rejected
+                .fetch_add(t.user_rejected, Ordering::Relaxed);
+        }
     }
 
     /// A frame the WAL did not take (stalled disk, or larger than a record may be): it is
@@ -139,7 +179,7 @@ impl Ingest {
     }
 
     fn handle_frame(&mut self, frame: &Frame) {
-        self.metrics.frames.fetch_add(1, Ordering::Relaxed);
+        self.tally.frames += 1;
         match frame.kind {
             FrameKind::Control => {
                 if frame.payload.as_ref() == b"connect" {
@@ -180,18 +220,9 @@ impl Ingest {
                     return;
                 };
                 let done = self.tables.ingest_user(source_id, msg, frame.recv_ns);
-                if done.rows > 0 {
-                    self.metrics
-                        .user_rows
-                        .fetch_add(done.rows as u64, Ordering::Relaxed);
-                    self.metrics
-                        .events
-                        .fetch_add(done.rows as u64, Ordering::Relaxed);
-                }
+                self.tally.user_rows += done.rows as u64;
                 if done.rejected > 0 {
-                    self.metrics
-                        .user_rejected
-                        .fetch_add(done.rejected as u64, Ordering::Relaxed);
+                    self.tally.user_rejected += done.rejected as u64;
                     if let Some(e) = done.error {
                         tracing::debug!(source_id, rejected = done.rejected, error = %e, "user rows rejected");
                     }
@@ -319,6 +350,7 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         positions_frozen: false,
         connects: Vec::new(),
         rebase_books: false,
+        tally: Tally::default(),
     };
 
     // User-defined tables, their sources and the continuous queries (before recovery so that
@@ -479,7 +511,10 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             let t0 = Instant::now();
             ingest.recovering = true;
             ingest.tables.replaying = true;
-            let n = wal_writer::recover(dir, |frame, lsn| ingest.handle_frame_lsn(&frame, lsn))?;
+            let n = wal_writer::recover(dir, |frame, lsn| {
+                ingest.handle_frame_lsn_batched(&frame, lsn);
+            })?;
+            ingest.flush_tally();
             ingest.recovering = false;
             ingest.tables.replaying = false;
             metrics.wal_recovered_frames.store(n, Ordering::Relaxed);
@@ -670,6 +705,8 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
 
     // Source
     let (tx, mut rx) = mpsc::channel::<Frame>(65_536);
+    // frames taken from the channel in one wake-up (reused)
+    let mut inbox: Vec<Frame> = Vec::with_capacity(INGEST_BATCH);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let streams: Vec<&str> = cfg.feed.streams.iter().map(String::as_str).collect();
     let depth_syms = depth_symbols(&streams);
@@ -855,31 +892,15 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 }
                 metrics.replication_applied_lsn.store(rec.lsn, Ordering::Relaxed);
             }
-            frame = rx.recv() => {
-                let Some(frame) = frame else { warn!("source ended"); break; };
-                if ingest.discard_after_loss(&frame) {
-                    // must not reach the log either: recovery would take it as valid
-                    continue;
-                }
-                // With a WAL, a frame is ingested only once the log has taken it (the push waits
-                // for the log when it is behind): tables and log always agree.
-                let lsn = if let Some(w) = &wal {
-                    let Some(lsn) = w.push(frame.clone(), &metrics) else {
-                        if ingest.frame_not_logged(&frame) {
-                            exit_err = Some(anyhow::anyhow!(
-                                "the WAL did not accept a user-source message within {} s; stopping so that the sources read again from their last saved position on restart",
-                                wal_writer::PUSH_WAIT.as_secs()
-                            ));
-                            break;
-                        }
-                        continue;
-                    };
-                    lsn
-                } else {
-                    0
+            n = rx.recv_many(&mut inbox, INGEST_BATCH) => {
+                if n == 0 { warn!("source ended"); break; }
+                let Ok(is_connect) = ingest_frames(&mut ingest, wal.as_ref(), &metrics, &mut inbox) else {
+                    exit_err = Some(anyhow::anyhow!(
+                        "the WAL did not accept a user-source message within {} s; stopping so that the sources read again from their last saved position on restart",
+                        wal_writer::PUSH_WAIT.as_secs()
+                    ));
+                    break;
                 };
-                let is_connect = frame.kind == FrameKind::Control && frame.payload.as_ref() == b"connect";
-                ingest.handle_frame_lsn(&frame, lsn);
                 if fetch_depth {
                     // (re)connect: every depth symbol needs a snapshot; resyncs: the named symbols
                     let mut wanted: Vec<String> = Vec::new();
@@ -1279,6 +1300,97 @@ async fn run_file_source(
 }
 
 /// Render a task join result for logs.
+/// Frames the ingest loop takes from the source channel per wake-up. Under load the loop
+/// finds many frames queued and handles them as one batch (one WAL hand-off, one counter
+/// update); at a trickle a batch is a single frame and nothing waits to fill one. 1,024 frames
+/// of ~100 bytes stay well inside the L2 cache while they are logged and ingested.
+const INGEST_BATCH: usize = 1024;
+
+/// Log and ingest the frames in `inbox` (emptied), in order. With a WAL, a frame is ingested
+/// only once the log has taken it (the push waits for the log when it is behind), so tables
+/// and log always agree; the frames go to the log as runs, one hand-off per run. Returns
+/// whether a `connect` frame was among them, or `Err` when a user-source message could not be
+/// logged and the server has to stop (see [`Ingest::frame_not_logged`]).
+fn ingest_frames(
+    ingest: &mut Ingest,
+    wal: Option<&WalHandle>,
+    metrics: &Metrics,
+    inbox: &mut Vec<Frame>,
+) -> Result<bool, ()> {
+    let mut saw_connect = false;
+    let mut run: Vec<Frame> = Vec::with_capacity(inbox.len());
+    let mut frames = inbox.drain(..);
+    let result = loop {
+        let Some(f) = frames.next() else {
+            let lost = log_and_ingest(
+                ingest,
+                wal,
+                metrics,
+                std::mem::take(&mut run),
+                &mut saw_connect,
+            );
+            break if lost { Err(()) } else { Ok(saw_connect) };
+        };
+        // must not reach the log either: recovery would take it as valid
+        if ingest.discard_after_loss(&f) {
+            continue;
+        }
+        // too large for a record: not logged, so not ingested; the run before it goes first
+        if wal.is_some_and(|_| WalHandle::too_large(&f, metrics)) {
+            let lost = log_and_ingest(
+                ingest,
+                wal,
+                metrics,
+                std::mem::take(&mut run),
+                &mut saw_connect,
+            );
+            if lost || ingest.frame_not_logged(&f) {
+                break Err(());
+            }
+            continue;
+        }
+        run.push(f);
+    };
+    drop(frames);
+    ingest.flush_tally();
+    result
+}
+
+/// Hand `run` to the log in one push, then ingest it under consecutive LSNs. Returns `true`
+/// when the log did not take it and a user-source message was among the frames lost.
+fn log_and_ingest(
+    ingest: &mut Ingest,
+    wal: Option<&WalHandle>,
+    metrics: &Metrics,
+    run: Vec<Frame>,
+    saw_connect: &mut bool,
+) -> bool {
+    if run.is_empty() {
+        return false;
+    }
+    let run = Arc::new(run);
+    // LSN of the next frame, and its step: 0 and 0 without a log
+    let (mut lsn, step) = match wal {
+        None => (0, 0),
+        Some(w) => {
+            let Some(first) = w.push_batch(&run, metrics) else {
+                let mut stop = false;
+                for f in run.iter() {
+                    stop |= ingest.frame_not_logged(f);
+                }
+                return stop;
+            };
+            (first, 1)
+        }
+    };
+    for f in run.iter() {
+        *saw_connect |= f.kind == FrameKind::Control && f.payload.as_ref() == b"connect";
+        ingest.handle_frame_lsn_batched(f, lsn);
+        lsn += step;
+    }
+    false
+}
+
 fn describe_join<T: std::fmt::Debug>(
     r: Result<anyhow::Result<T>, tokio::task::JoinError>,
 ) -> String {
@@ -1377,6 +1489,7 @@ mod tests {
             positions_frozen: false,
             connects: Vec::new(),
             rebase_books: false,
+            tally: Tally::default(),
         }
     }
 

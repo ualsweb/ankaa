@@ -15,12 +15,17 @@
 //! A failed commit is retried until it succeeds (nothing is received meanwhile, so the queue
 //! pushes back) and the buffer is never discarded.
 //!
+//! **Batches.** The ingest loop hands over every frame it found queued in one message
+//! ([`WalHandle::push_batch`]): one channel operation, and at most one thread wake-up, per
+//! batch instead of per frame. The frames are shared (`Arc`), not copied: the ingest loop
+//! reads them while this thread encodes them straight into the log's buffer.
+//!
 //! Recovery replays every durable frame through the same decoder/appender path as live data.
 
 use std::cell::Cell;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{
     Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError, sync_channel,
 };
@@ -28,7 +33,6 @@ use std::time::{Duration, Instant};
 
 use ankaa_feeds::capture::{Frame, decode_frame, encode_frame};
 use ankaa_wal::{Wal, WalConfig, replay};
-use bytes::BytesMut;
 use tracing::{info, warn};
 
 use crate::metrics::Metrics;
@@ -36,6 +40,8 @@ use crate::metrics::Metrics;
 /// Messages to the owner thread.
 enum Msg {
     Frame(Frame),
+    /// Frames appended in order under consecutive LSNs.
+    Frames(Arc<Vec<Frame>>),
     /// A record replicated from a primary: appended verbatim (same payload, same epoch).
     Raw {
         epoch: u64,
@@ -52,6 +58,9 @@ pub const MAX_FRAME_PAYLOAD: usize = ankaa_feeds::capture::MAX_FRAME_LEN as usiz
 pub const PUSH_WAIT: Duration = Duration::from_secs(2);
 /// How long a standby waits for its own log before it stops.
 const REPLICATED_PUSH_WAIT: Duration = Duration::from_secs(30);
+/// Frames queued for the writer at most (single frames and batches alike): the bound on the
+/// memory the queue holds, whatever the batch size.
+const MAX_QUEUED_FRAMES: usize = 65_536;
 /// Oldest buffered record → commit.
 const COMMIT_INTERVAL: Duration = Duration::from_millis(10);
 /// Buffered bytes that force a commit even while more records are queued.
@@ -67,6 +76,8 @@ pub struct WalHandle {
     next_lsn: Cell<u64>,
     /// Tells the owner to stop retrying a failing commit (shutdown).
     stop: Arc<AtomicBool>,
+    /// Frames sent and not yet appended (see [`MAX_QUEUED_FRAMES`]).
+    queued: Arc<AtomicUsize>,
 }
 
 /// Run a short blocking wait without starving the async runtime's other tasks.
@@ -77,6 +88,30 @@ fn blocking<R>(f: impl FnOnce() -> R) -> R {
         }
         _ => f(),
     }
+}
+
+/// Wait (up to `wait`) until `n` more frames fit in the queue; `false` on timeout. A batch
+/// larger than the bound is let through once the queue is empty, so it can never wait forever.
+fn room_for(queued: &AtomicUsize, n: usize, wait: Duration) -> bool {
+    let fits = || {
+        let q = queued.load(Ordering::Relaxed);
+        q == 0 || q + n <= MAX_QUEUED_FRAMES
+    };
+    if fits() {
+        return true;
+    }
+    blocking(|| {
+        let deadline = Instant::now() + wait;
+        loop {
+            std::thread::sleep(Duration::from_micros(200));
+            if fits() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+    })
 }
 
 /// Send with a deadline (`std`'s bounded channel has no timed send).
@@ -117,14 +152,58 @@ impl WalHandle {
             metrics.wal_oversized.fetch_add(1, Ordering::Relaxed);
             return None;
         }
-        let tx = self.tx.as_ref()?;
-        if send_within(tx, Msg::Frame(frame), PUSH_WAIT).is_err() {
+        if !self.send(Msg::Frame(frame), 1) {
             metrics.wal_dropped.fetch_add(1, Ordering::Relaxed);
             return None;
         }
         let lsn = self.next_lsn.get();
         self.next_lsn.set(lsn + 1);
         Some(lsn)
+    }
+
+    /// True (and counted) when `frame` is larger than a log record may be: [`Self::push`]
+    /// refuses it, and it must be kept out of a [`Self::push_batch`].
+    pub fn too_large(frame: &Frame, metrics: &Metrics) -> bool {
+        let big = frame.payload.len() > MAX_FRAME_PAYLOAD;
+        if big {
+            metrics.wal_oversized.fetch_add(1, Ordering::Relaxed);
+        }
+        big
+    }
+
+    /// Enqueue frames for durable append, in order, and return the LSN of the first; frame
+    /// `i` gets that LSN + `i`. All or nothing: `None` means **none** of them is in the log
+    /// (same cases as [`Self::push`]). Every frame must have passed [`Self::too_large`].
+    pub fn push_batch(&self, frames: &Arc<Vec<Frame>>, metrics: &Metrics) -> Option<u64> {
+        debug_assert!(frames.iter().all(|f| f.payload.len() <= MAX_FRAME_PAYLOAD));
+        let n = frames.len() as u64;
+        if n == 0 {
+            return Some(self.next_lsn.get());
+        }
+        if !self.send(Msg::Frames(Arc::clone(frames)), frames.len()) {
+            metrics.wal_dropped.fetch_add(n, Ordering::Relaxed);
+            return None;
+        }
+        let lsn = self.next_lsn.get();
+        self.next_lsn.set(lsn + n);
+        Some(lsn)
+    }
+
+    /// Queue `msg` holding `frames` frames, waiting (up to [`PUSH_WAIT`]) for room.
+    fn send(&self, msg: Msg, frames: usize) -> bool {
+        let Some(tx) = self.tx.as_ref() else {
+            return false;
+        };
+        if !room_for(&self.queued, frames, PUSH_WAIT) {
+            return false;
+        }
+        // counted before the send: the writer may append (and subtract) before it returns
+        self.queued.fetch_add(frames, Ordering::Relaxed);
+        if send_within(tx, msg, PUSH_WAIT).is_err() {
+            self.queued.fetch_sub(frames, Ordering::Relaxed);
+            return false;
+        }
+        true
     }
 
     /// LSN the next accepted record will receive.
@@ -244,11 +323,12 @@ pub fn start(dir: &Path, metrics: Arc<Metrics>, min_next_lsn: u64) -> anyhow::Re
     let (tx, rx): (SyncSender<Msg>, Receiver<Msg>) = sync_channel(65_536);
     let stop = Arc::new(AtomicBool::new(false));
     let stopping = stop.clone();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let appended_frames = queued.clone();
     let soft_bytes = 256 * 1024;
     let thread = std::thread::Builder::new()
         .name("ankaa-wal".into())
         .spawn(move || {
-            let mut buf = BytesMut::with_capacity(4096);
             let epoch = 1u64;
             // Commit, retrying until it succeeds: while it fails nothing is received, so the
             // queue fills and the ingest loop waits. Gives up only when the server is stopping.
@@ -317,21 +397,42 @@ pub fn start(dir: &Path, metrics: Arc<Metrics>, min_next_lsn: u64) -> anyhow::Re
                             }
                         }
                     }
+                    Ok(Msg::Frames(frames)) => {
+                        for frame in frames.iter() {
+                            let appended = wal.append_with(epoch, |b| encode_frame(frame, b));
+                            note_append(appended, &metrics);
+                            // a batch of large frames must not grow the buffer without bound
+                            if wal.pending_bytes() >= COMMIT_MAX_BYTES {
+                                commit(&mut wal, &metrics);
+                                first_pending = None;
+                            }
+                        }
+                        appended_frames.fetch_sub(frames.len(), Ordering::Relaxed);
+                        // the last reference usually: the frames are freed here, off the
+                        // ingest thread
+                        drop(frames);
+                        first_pending.get_or_insert_with(Instant::now);
+                        metrics
+                            .wal_pending_bytes
+                            .store(wal.pending_bytes() as u64, Ordering::Relaxed);
+                        if wal.pending_bytes() >= COMMIT_MAX_BYTES
+                            || first_pending.is_some_and(|t| t.elapsed() >= COMMIT_INTERVAL)
+                        {
+                            commit(&mut wal, &metrics);
+                            first_pending = None;
+                        }
+                    }
                     Ok(msg @ (Msg::Frame(_) | Msg::Raw { .. })) => {
                         let appended = match msg {
                             Msg::Frame(frame) => {
-                                buf.clear();
-                                encode_frame(&frame, &mut buf);
-                                wal.append(epoch, &buf)
+                                let r = wal.append_with(epoch, |b| encode_frame(&frame, b));
+                                appended_frames.fetch_sub(1, Ordering::Relaxed);
+                                r
                             }
                             Msg::Raw { epoch, payload } => wal.append(epoch, &payload),
-                            Msg::Truncate(_) => Ok(0),
+                            Msg::Truncate(_) | Msg::Frames(_) => Ok(0),
                         };
-                        if let Err(e) = appended {
-                            // unreachable for frames (sizes are checked before they are queued)
-                            metrics.wal_errors.fetch_add(1, Ordering::Relaxed);
-                            warn!(error = %e, "wal append failed");
-                        }
+                        note_append(appended, &metrics);
                         first_pending.get_or_insert_with(Instant::now);
                         metrics
                             .wal_pending_bytes
@@ -362,7 +463,16 @@ pub fn start(dir: &Path, metrics: Arc<Metrics>, min_next_lsn: u64) -> anyhow::Re
         thread: Some(thread),
         next_lsn: Cell::new(last + 1),
         stop,
+        queued,
     })
+}
+
+/// Count a failed append (unreachable for frames: sizes are checked before they are queued).
+fn note_append(appended: Result<u64, ankaa_wal::WalError>, metrics: &Metrics) {
+    if let Err(e) = appended {
+        metrics.wal_errors.fetch_add(1, Ordering::Relaxed);
+        warn!(error = %e, "wal append failed");
+    }
 }
 
 /// Size of the log on disk and the first LSN of its second-oldest segment (what a checkpoint

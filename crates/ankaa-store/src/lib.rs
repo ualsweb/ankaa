@@ -21,7 +21,7 @@ pub use ankaa_simd::VECTOR_LEN;
 pub use chunk::{BlockStats, Chunk, ChunkId, ChunkState, ZoneMap};
 pub use column::{Column, ColumnStats, Value};
 pub use schema::{ColumnType, Field, Schema, SchemaError};
-pub use table::{Partition, PartitionStats, Table, TableSnapshot};
+pub use table::{Partition, PartitionStats, Table, TableSnapshot, TableWriter};
 pub use tier::{
     ChunkMeta, ChunkRef, DecodeError as TierDecodeError, EncodedChunk, NullableColumn, Tier,
     TierStats,

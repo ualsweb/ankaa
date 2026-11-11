@@ -423,6 +423,71 @@ pub struct Table {
     max_lateness: i64,
 }
 
+/// Write guard over a table's partitions (see [`Table::writer`]). The guard is one
+/// `parking_lot` lock word: taking it is a single compare-and-swap, releasing it a single
+/// store-release, so a message of `n` rows costs two atomic operations instead of `6n`.
+pub struct TableWriter<'a> {
+    parts: parking_lot::RwLockWriteGuard<'a, Vec<Partition>>,
+    lsn: u64,
+    schema: &'a Schema,
+    max_lateness: i64,
+    /// Rows appended since the lock was last offered to readers.
+    held: u32,
+}
+
+impl std::fmt::Debug for TableWriter<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TableWriter")
+            .field("partitions", &self.parts.len())
+            .field("lsn", &self.lsn)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TableWriter<'_> {
+    /// Rows appended before the guard lets waiting readers in (a fair unlock + relock, only
+    /// when someone is waiting): bounds how long a query waits behind a large message.
+    pub const ROWS_PER_HOLD: u32 = 1024;
+
+    /// Watermark of partition `idx` (`None` when it does not exist yet, `i64::MIN` when empty).
+    #[must_use]
+    pub fn partition_watermark(&self, idx: usize) -> Option<i64> {
+        self.parts.get(idx).map(Partition::watermark)
+    }
+
+    /// Append one row to the partition of `key`, creating it (and any below it) when new, and
+    /// say whether it was stored: `false` when recovery skips it (its WAL record is already in
+    /// a segment). Same semantics as [`Table::partition_for`] + [`Table::append_row_stored`].
+    pub fn append_row_stored(&mut self, key: u32, row: &[Value]) -> Result<bool, AppendError> {
+        self.held += 1;
+        if self.held >= Self::ROWS_PER_HOLD {
+            self.held = 0;
+            parking_lot::RwLockWriteGuard::bump(&mut self.parts);
+        }
+        let idx = key as usize;
+        if idx >= self.parts.len() {
+            self.grow(idx);
+        }
+        let p = &mut self.parts[idx];
+        p.set_current_lsn(self.lsn);
+        if p.skipping() {
+            return Ok(false);
+        }
+        let before = p.stats().rows;
+        p.append_row(row)?;
+        Ok(p.stats().rows != before)
+    }
+
+    #[cold]
+    fn grow(&mut self, idx: usize) {
+        while self.parts.len() <= idx {
+            let k = u32::try_from(self.parts.len()).unwrap_or(u32::MAX);
+            self.parts
+                .push(Partition::new(k, self.schema.clone(), self.max_lateness));
+        }
+    }
+}
+
 /// Immutable view for queries.
 #[derive(Debug, Clone)]
 pub struct TableSnapshot {
@@ -561,6 +626,20 @@ impl Table {
             p.append_row(row)?;
             Ok(p.stats().rows != before)
         })
+    }
+
+    /// Exclusive write access to every partition for the length of one ingest unit (a message
+    /// and its rows): one lock round trip instead of one per check and per row. Readers wait
+    /// for at most [`TableWriter::ROWS_PER_HOLD`] rows (see [`TableWriter::append_row_stored`]).
+    #[must_use]
+    pub fn writer(&self) -> TableWriter<'_> {
+        TableWriter {
+            parts: self.partitions.write(),
+            lsn: self.current_lsn.load(std::sync::atomic::Ordering::Relaxed),
+            schema: &self.schema,
+            max_lateness: self.max_lateness,
+            held: 0,
+        }
     }
 
     /// Append rows that all belong to `partition` (caller groups by key).
@@ -756,6 +835,45 @@ mod tests {
             Value::U8(0),
             Value::I64(seq),
         ]
+    }
+
+    /// The write guard creates partitions on demand, stamps the current LSN, skips rows that
+    /// recovery has already persisted, and gives the same table as the per-row calls, also
+    /// across the points where it lets readers in.
+    #[test]
+    #[cfg_attr(miri, ignore = "thousands of appends")]
+    fn writer_matches_per_row_appends() {
+        let per_row = Table::new("trades", Schema::trades(), 1);
+        let guarded = Table::new("trades", Schema::trades(), 1);
+        let rows = i64::from(TableWriter::ROWS_PER_HOLD) * 3 + 5;
+        per_row.set_current_lsn(9);
+        guarded.set_current_lsn(9);
+        let mut w = guarded.writer();
+        assert_eq!(w.partition_watermark(4), None);
+        for i in 0..rows {
+            let key = (i % 5) as u32;
+            let r = row(i, key, i);
+            let part = per_row.partition_for(key);
+            assert_eq!(
+                per_row.append_row_stored(part, &r),
+                w.append_row_stored(key, &r)
+            );
+        }
+        assert_eq!(
+            w.partition_watermark(4),
+            (0..rows).filter(|i| i % 5 == 4).max()
+        );
+        drop(w);
+        assert_eq!(per_row.num_partitions(), guarded.num_partitions());
+        for k in 0..5 {
+            assert_eq!(
+                per_row.partition_watermark(k),
+                guarded.partition_watermark(k)
+            );
+        }
+        assert_eq!(per_row.stats().rows, rows as u64);
+        assert_eq!(guarded.stats().rows, rows as u64);
+        assert_eq!(per_row.max_persisted_lsn(), guarded.max_persisted_lsn());
     }
 
     /// Retention drops whole sealed chunks older than the window, per partition, measured from

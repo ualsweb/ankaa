@@ -235,19 +235,34 @@ impl Wal {
         if payload.len() > MAX_PAYLOAD {
             return Err(WalError::TooLarge(payload.len()));
         }
+        self.buf.reserve(HEADER_LEN + payload.len());
+        self.append_with(epoch, |b| b.extend_from_slice(payload))
+    }
+
+    /// Buffer a record whose payload `write` appends to the log's own buffer: the payload is
+    /// encoded in place, without an intermediate copy. `write` must only append. The checksum
+    /// is one pass over `lsn | epoch | payload`, which lie contiguous after the length and
+    /// checksum words. Returns the LSN; a payload over [`MAX_PAYLOAD`] is taken back out.
+    pub fn append_with(
+        &mut self,
+        epoch: u64,
+        write: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<u64, WalError> {
+        let start = self.buf.len();
         let lsn = self.next_lsn;
-        self.next_lsn += 1;
-        let Ok(len) = u32::try_from(payload.len()) else {
-            return Err(WalError::TooLarge(payload.len()));
-        };
-        let mut hasher = crc32c::crc32c(&lsn.to_le_bytes());
-        hasher = crc32c::crc32c_append(hasher, &epoch.to_le_bytes());
-        hasher = crc32c::crc32c_append(hasher, payload);
-        self.buf.extend_from_slice(&len.to_le_bytes());
-        self.buf.extend_from_slice(&hasher.to_le_bytes());
+        self.buf.extend_from_slice(&[0u8; 8]);
         self.buf.extend_from_slice(&lsn.to_le_bytes());
         self.buf.extend_from_slice(&epoch.to_le_bytes());
-        self.buf.extend_from_slice(payload);
+        write(&mut self.buf);
+        let len = self.buf.len() - start - HEADER_LEN;
+        let Some(len32) = u32::try_from(len).ok().filter(|_| len <= MAX_PAYLOAD) else {
+            self.buf.truncate(start);
+            return Err(WalError::TooLarge(len));
+        };
+        let crc = crc32c::crc32c(&self.buf[start + 8..]);
+        self.buf[start..start + 4].copy_from_slice(&len32.to_le_bytes());
+        self.buf[start + 4..start + 8].copy_from_slice(&crc.to_le_bytes());
+        self.next_lsn += 1;
         Ok(lsn)
     }
 
@@ -546,6 +561,37 @@ fn sync_dir(dir: &std::path::Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A payload written in place is byte for byte the record `append` writes (same length,
+    /// checksum, LSN), and an oversized one is taken back out without using an LSN.
+    #[test]
+    fn append_with_matches_append() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let (mut wa, _) = Wal::open(a.path(), WalConfig::default()).unwrap();
+        let (mut wb, _) = Wal::open(b.path(), WalConfig::default()).unwrap();
+        for (i, p) in [&b""[..], b"x", b"hello wal", &[7u8; 5000][..]]
+            .iter()
+            .enumerate()
+        {
+            let epoch = i as u64 + 3;
+            assert_eq!(
+                wa.append(epoch, p).unwrap(),
+                wb.append_with(epoch, |buf| buf.extend_from_slice(p))
+                    .unwrap()
+            );
+        }
+        assert_eq!(wa.buf, wb.buf);
+        let before = (wb.buf.len(), wb.next_lsn);
+        let too_big = wb.append_with(1, |buf| buf.resize(buf.len() + MAX_PAYLOAD + 1, 0));
+        assert!(matches!(too_big, Err(WalError::TooLarge(n)) if n == MAX_PAYLOAD + 1));
+        assert_eq!((wb.buf.len(), wb.next_lsn), before);
+        wb.commit().unwrap();
+        let (recs, err) = all(b.path());
+        assert!(err.is_none());
+        assert_eq!(recs.len(), 4);
+        assert_eq!(&recs[2].payload[..], b"hello wal");
+    }
 
     fn all(dir: &Path) -> (Vec<Record>, Option<WalError>) {
         let mut v = Vec::new();

@@ -163,7 +163,7 @@ pub fn encode_header(source: &str, out: &mut BytesMut) {
 }
 
 /// Encode one frame.
-pub fn encode_frame(f: &Frame, out: &mut BytesMut) {
+pub fn encode_frame<B: BufMut + std::ops::Deref<Target = [u8]>>(f: &Frame, out: &mut B) {
     let start = out.len();
     out.put_i64_le(f.recv_ns);
     out.put_u8(f.kind as u8);

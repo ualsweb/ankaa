@@ -439,7 +439,11 @@ impl RowMapper {
             self.new_names.resize_with(ncols, Default::default);
         }
         for set in &mut self.new_names {
-            set.clear();
+            // `clear` rewrites the control bytes of every bucket even when the set is empty:
+            // a memset per dictionary column per message, almost always for nothing
+            if !set.is_empty() {
+                set.clear();
+            }
         }
     }
 
