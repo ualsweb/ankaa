@@ -139,9 +139,11 @@ mod tests {
             }
             prop_assert!(c.rms_residual_ns <= noise + 1.0);
             prop_assert!(c.max_residual_ns <= 2.0 * noise + 1.0);
-            // drift recovered within what the window supports: noise/(span) in ppb
+            // drift recovered within what the window supports: noise/(span) in ppb. The truth is
+            // rounded to whole nanoseconds (as real timestamps are), which is ±0.5 ns of noise
+            // even when `noise` is 0: over a short window that alone allows tens of ppb
             let span_ns = (n as f64 - 1.0) * 1e6;
-            let tol_ppb = 1e9 * 6.0 * noise / span_ns + 1.0;
+            let tol_ppb = 1e9 * 6.0 * (noise + 0.5) / span_ns + 1.0;
             prop_assert!((c.drift_ppb() - drift_ppb).abs() <= tol_ppb, "drift {} vs {drift_ppb} (tol {tol_ppb})", c.drift_ppb());
         }
     }
