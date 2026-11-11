@@ -707,6 +707,10 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<Frame>(65_536);
     // frames taken from the channel in one wake-up (reused)
     let mut inbox: Vec<Frame> = Vec::with_capacity(INGEST_BATCH);
+    let coalesce = Duration::from_micros(cfg.storage.ingest_coalesce_us);
+    let mut last_wake = Instant::now()
+        .checked_sub(BUSY_GAP)
+        .unwrap_or_else(Instant::now);
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let streams: Vec<&str> = cfg.feed.streams.iter().map(String::as_str).collect();
     let depth_syms = depth_symbols(&streams);
@@ -894,6 +898,9 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
             }
             n = rx.recv_many(&mut inbox, INGEST_BATCH) => {
                 if n == 0 { warn!("source ended"); break; }
+                let woke = Instant::now();
+                let busy = woke.duration_since(last_wake) < BUSY_GAP;
+                last_wake = woke;
                 let Ok(is_connect) = ingest_frames(&mut ingest, wal.as_ref(), &metrics, &mut inbox) else {
                     exit_err = Some(anyhow::anyhow!(
                         "the WAL did not accept a user-source message within {} s; stopping so that the sources read again from their last saved position on restart",
@@ -924,6 +931,13 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     }
                 } else {
                     ingest.need_snapshot.clear();
+                }
+                // Interrupt moderation (as a NIC's rx-usecs): frames keep coming and the queue
+                // is drained, so wait a little before the next batch. The sources keep queueing
+                // meanwhile without waking this thread; the next `recv_many` finds them ready.
+                // A full batch means a backlog: no wait. A quiet source: no wait either.
+                if busy && n < INGEST_BATCH && !coalesce.is_zero() {
+                    std::thread::sleep(coalesce);
                 }
             }
             _ = snapshot_tick.tick() => {
@@ -1305,6 +1319,9 @@ async fn run_file_source(
 /// update); at a trickle a batch is a single frame and nothing waits to fill one. 1,024 frames
 /// of ~100 bytes stay well inside the L2 cache while they are logged and ingested.
 const INGEST_BATCH: usize = 1024;
+/// Wake-ups closer together than this mean steady traffic: the ingest loop then coalesces
+/// (`storage.ingest_coalesce_us`).
+const BUSY_GAP: Duration = Duration::from_millis(1);
 
 /// Log and ingest the frames in `inbox` (emptied), in order. With a WAL, a frame is ingested
 /// only once the log has taken it (the push waits for the log when it is behind), so tables

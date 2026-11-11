@@ -15,6 +15,12 @@
 //! A failed commit is retried until it succeeds (nothing is received meanwhile, so the queue
 //! pushes back) and the buffer is never discarded.
 //!
+//! **Polling while busy.** While records wait for their commit the owner does not block on the
+//! queue (each frame pushed would then wake it, a futex call and a context switch per batch, an
+//! inter-processor interrupt on a VM): it drains what is queued, then naps up to [`POLL`] and
+//! looks again. Only an idle log (nothing buffered) blocks on the queue, and the first record
+//! wakes it. As NAPI does for network cards: interrupts when quiet, polling under load.
+//!
 //! **Batches.** The ingest loop hands over every frame it found queued in one message
 //! ([`WalHandle::push_batch`]): one channel operation, and at most one thread wake-up, per
 //! batch instead of per frame. The frames are shared (`Arc`), not copied: the ingest loop
@@ -61,6 +67,9 @@ const REPLICATED_PUSH_WAIT: Duration = Duration::from_secs(30);
 /// Frames queued for the writer at most (single frames and batches alike): the bound on the
 /// memory the queue holds, whatever the batch size.
 const MAX_QUEUED_FRAMES: usize = 65_536;
+/// Nap of the owner between looks at the queue while records are buffered (see the module
+/// documentation); far below the commit interval, so it does not delay commits.
+const POLL: Duration = Duration::from_millis(1);
 /// Oldest buffered record → commit.
 const COMMIT_INTERVAL: Duration = Duration::from_millis(10);
 /// Buffered bytes that force a commit even while more records are queued.
@@ -366,15 +375,22 @@ pub fn start(dir: &Path, metrics: Arc<Metrics>, min_next_lsn: u64) -> anyhow::Re
             loop {
                 let next = if wal.pending_bytes() == 0 {
                     rx.recv_timeout(Duration::from_millis(100))
-                } else if wal.pending_bytes() >= soft_bytes {
-                    // enough for a commit: keep batching only while more is already queued
-                    rx.try_recv().map_err(|e| match e {
-                        TryRecvError::Empty => RecvTimeoutError::Timeout,
-                        TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
-                    })
                 } else {
-                    let waited = first_pending.map_or(Duration::ZERO, |t| t.elapsed());
-                    rx.recv_timeout(COMMIT_INTERVAL.saturating_sub(waited))
+                    match rx.try_recv() {
+                        Ok(m) => Ok(m),
+                        Err(TryRecvError::Disconnected) => Err(RecvTimeoutError::Disconnected),
+                        Err(TryRecvError::Empty) => {
+                            // nothing queued: commit when due or when a commit's worth is
+                            // buffered, otherwise nap and look again
+                            let waited = first_pending.map_or(Duration::ZERO, |t| t.elapsed());
+                            if wal.pending_bytes() >= soft_bytes || waited >= COMMIT_INTERVAL {
+                                Err(RecvTimeoutError::Timeout)
+                            } else {
+                                std::thread::sleep(POLL.min(COMMIT_INTERVAL.saturating_sub(waited)));
+                                continue;
+                            }
+                        }
+                    }
                 };
                 match next {
                     Ok(Msg::Truncate(lsn)) => {

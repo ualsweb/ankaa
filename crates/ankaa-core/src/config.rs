@@ -382,6 +382,11 @@ pub struct StorageConfig {
     pub checkpoint_dir: Option<PathBuf>,
     /// Snapshot (query view swap) interval in milliseconds.
     pub snapshot_ms: u64,
+    /// Interrupt moderation of the ingest loop, microseconds: while frames keep arriving (more
+    /// than one wake-up per millisecond) the loop waits this long between batches, so that one
+    /// wake-up takes many frames instead of one each. Rows become queryable at the next
+    /// snapshot anyway, so the wait is not visible to queries. 0 turns it off. At most 10,000.
+    pub ingest_coalesce_us: u64,
     /// Memory budget for warm (encoded, in-memory) chunks in MiB; beyond it the oldest warm
     /// chunks are demoted to cold (segment on disk, decoded on demand). Needs `checkpoint_dir`.
     pub warm_budget_mib: u64,
@@ -495,6 +500,7 @@ impl Default for StorageConfig {
             hot_sealed_chunks: 4,
             checkpoint_dir: None,
             snapshot_ms: 50,
+            ingest_coalesce_us: 200,
             warm_budget_mib: 512,
             checkpoint_interval_s: 60,
             tier_budget_pct: 5,
@@ -628,6 +634,9 @@ impl Config {
         }
         if self.storage.snapshot_ms < 5 {
             return inv("storage.snapshot_ms must be >= 5");
+        }
+        if self.storage.ingest_coalesce_us > 10_000 {
+            return inv("storage.ingest_coalesce_us must be <= 10000 (10 ms)");
         }
         if self.storage.hot_sealed_chunks == 0 {
             return inv("storage.hot_sealed_chunks must be >= 1");
