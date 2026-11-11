@@ -153,7 +153,8 @@
           <tr><td>Run 4, development build</td><td class="num">2.8 h</td><td class="wrap-ok"><b>Failed the memory check</b> at 2 h 47 min: resident memory rose while the in-memory warm tier filled to its budget, by design, and the check counted that as growth. The check now measures memory <i>outside</i> the data tiers. No data problem: no gap, drop or WAL error.</td></tr>
           <tr><td>Run 5, development build</td><td class="num">1.6 h</td><td class="wrap-ok">Clean. Stopped to deploy a newer build.</td></tr>
           <tr><td>Run 6, development build</td><td class="num">0.6 h</td><td class="wrap-ok">Clean. Stopped to deploy the release build.</td></tr>
-          <tr><td>Run 7, release build</td><td class="num">running</td><td class="wrap-ok">Started after a passing <code>kill -9</code> crash test (identical row counts after recovery, serving again in about a second), with a 2-hour retention window that expires and deletes segments on live data.</td></tr>
+          <tr><td>Run 7, release build (v0.1.0)</td><td class="num">3.0 h</td><td class="wrap-ok"><b>Clean.</b> 1,376,627 frames from live Binance ingested into 10,959,440 rows: no feed gap, dropped frame, WAL error or rejected row. Started after a passing <code>kill -9</code> crash test (identical row counts after recovery, serving again in about a second). A 2-hour retention window expired and deleted segments on live data throughout. Memory outside the data tiers: 175 MB after the first hour, 200 MB at the end (+14 %, the check allows 50 %).</td></tr>
+          <tr><td>Run 8, release build (v0.1.0)</td><td class="num">24 h, running</td><td class="wrap-ok">Started 11 Nov 14:34 UTC on the same build. The result, pass or fail, replaces this line.</td></tr>
         </tbody>
       </table>
     </div>

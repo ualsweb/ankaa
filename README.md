@@ -237,7 +237,7 @@ Pre-alpha. The software is implemented and tested end to end; the gates that nee
 | Continuous queries, standby replication | ✅ Implemented and end-to-end tested, including restarts and crashes · event time with the table's lateness; readings beyond it are dropped and counted (no retraction) · replication is asynchronous, failover is manual |
 | SVE2 kernels | ✅ Correct at VL 128/256/512 under emulation and on Neoverse V2 silicon (Google Axion) · the engine chooses per kernel: NEON for most at 128-bit vectors, SVE2 for 64-bit integer min/max, where it is faster ([first light](docs/benchmarks/2026-11-10-axion-first-light.md)) |
 | Performance on Graviton4 / Axion | ⏳ First single-VM measurements, and a preliminary comparison with DuckDB, ClickHouse and QuestDB on one hour of live data on a 4-vCPU Axion VM, are [published with their scripts and raw results](docs/benchmarks/2026-11-10-axion-first-light.md); a full benchmark is not done yet: **no performance claims are made** |
-| Live soaks on Google Axion | ✅ Clean soaks of the engine on live Binance streams with WAL, segments, retention and continuous queries ([measurements](https://ualsweb.github.io/ankaa/benchmarks.html#soak)) · ⏳ a 24-hour soak of the release build is next |
+| Live soaks on Google Axion | ✅ Release build v0.1.0: 3 h clean on live Binance streams (10.96 M rows, 0 gaps, 0 drops, 0 WAL errors) with WAL, segments, retention and continuous queries, after a passing crash test ([measurements](https://ualsweb.github.io/ankaa/benchmarks.html#soak)) · ⏳ 24-hour run in progress |
 | Distributed queries across nodes | ❌ Not planned for v1 (scale up on one Arm server; standby for reads) |
 | Production use | ❌ Not yet. Interfaces may change before 1.0 |
 
