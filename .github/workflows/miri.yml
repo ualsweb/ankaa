@@ -10,10 +10,17 @@ on:
       - ".github/workflows/miri.yml"
 permissions:
   contents: read
+# a newer commit makes an older Miri run pointless: cancel it
+concurrency:
+  group: miri-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   miri:
     name: miri (non-asm unsafe)
     runs-on: ubuntu-24.04-arm
+    # Miri interprets every instruction; bulk tests are skipped under it (cfg_attr(miri, ignore)),
+    # so a run that takes longer than this is a hang, not slowness
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

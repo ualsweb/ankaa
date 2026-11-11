@@ -2,7 +2,7 @@ use ankaa_store::{Chunk, ChunkId, ChunkState, ColumnStats, Schema, Value};
 use proptest::prelude::*;
 
 proptest! {
-    #![proptest_config(ProptestConfig { cases: 256, ..ProptestConfig::default() })]
+    #![proptest_config(ProptestConfig { cases: if cfg!(miri) { 8 } else { 256 }, ..ProptestConfig::default() })]
 
     #[test]
     #[cfg_attr(miri, ignore)]

@@ -748,6 +748,10 @@ mod tests {
     /// the newest row of the table; the ordering watermark survives, so an expired reading that
     /// turns up again is rejected rather than stored.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "bulk appends: no unsafe code beyond the small tests, hours under Miri"
+    )]
     fn retention_drops_old_chunks_and_keeps_the_watermark() {
         let t = Table::new("trades", Schema::trades(), 2);
         // partition 0: 5 chunks of 1,000 rows, 1 ns apart; partition 1: one early chunk only
@@ -789,6 +793,10 @@ mod tests {
     /// snapshots, the pieces are exactly the open rows in order, they stay few, each carries
     /// correct statistics, and the rows copied to build them stay within the logarithmic bound.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "bulk appends: no unsafe code beyond the small tests, hours under Miri"
+    )]
     fn open_view_is_incremental_and_exact() {
         let t = Table::new("trades", Schema::trades(), 1);
         let mut x = 0x9E37_79B9_7F4A_7C15u64;
@@ -891,6 +899,10 @@ mod tests {
     /// rolls and between snapshots; rows beyond it are dropped and counted; every snapshot
     /// shows each accepted row once, every chunk in time order.
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "bulk appends: no unsafe code beyond the small tests, hours under Miri"
+    )]
     fn late_rows_are_inserted_in_time_order() {
         let lateness = 5_000;
         let t = Table::new("telemetry", Schema::trades(), 1).with_max_lateness(lateness);
@@ -931,6 +943,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "bulk appends: no unsafe code beyond the small tests, hours under Miri"
+    )]
     fn rolls_chunks_and_snapshots() {
         let t = Table::new("trades", Schema::trades(), 2);
         let n = CHUNK_ROWS + 10;
