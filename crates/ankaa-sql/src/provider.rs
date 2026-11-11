@@ -92,6 +92,81 @@ struct KeyPred {
     negated: bool,
 }
 
+/// Rows taken from chunk metadata ([`ankaa_store::ChunkMeta::last_row`]), column by column.
+struct MetaRows {
+    cols: Vec<(ankaa_store::ColumnType, ankaa_store::Column, Vec<bool>)>,
+    rows: usize,
+}
+
+impl MetaRows {
+    fn new(fields: &[ankaa_store::Field], projection: &[usize]) -> Self {
+        Self {
+            cols: projection
+                .iter()
+                .filter_map(|&c| fields.get(c))
+                .map(|f| {
+                    (
+                        f.ty,
+                        ankaa_store::Column::with_capacity(f.ty, 0),
+                        Vec::new(),
+                    )
+                })
+                .collect(),
+            rows: 0,
+        }
+    }
+
+    /// Add the last row of the chunk `meta` describes; `false` (nothing added) when the
+    /// metadata does not hold it (a segment written before it was recorded).
+    fn push(&mut self, meta: &ankaa_store::ChunkMeta, projection: &[usize]) -> bool {
+        if meta.last_row.len() != meta.schema.fields().len() || self.cols.len() != projection.len()
+        {
+            return false;
+        }
+        // every value first: a row is added whole or not at all
+        let mut row: Vec<Option<ankaa_store::Value>> = Vec::with_capacity(projection.len());
+        for (&c, (ty, _, _)) in projection.iter().zip(&self.cols) {
+            match meta.last_row.get(c) {
+                Some(None) => row.push(None),
+                Some(Some(bits)) => match ankaa_store::value_of_bits(*ty, *bits) {
+                    Some(v) => row.push(Some(v)),
+                    None => return false,
+                },
+                None => return false,
+            }
+        }
+        for (v, (ty, col, valid)) in row.into_iter().zip(&mut self.cols) {
+            // a NULL keeps a placeholder in the column, as everywhere else
+            let stored = v.or_else(|| ankaa_store::value_of_bits(*ty, 0));
+            if let Some(stored) = stored {
+                col.push(stored);
+            }
+            valid.push(v.is_some());
+        }
+        self.rows += 1;
+        true
+    }
+
+    fn finish(
+        self,
+        schema: &SchemaRef,
+        dicts: &[Option<arrow::array::ArrayRef>],
+    ) -> Result<Option<ChunkColumns>> {
+        if self.rows == 0 {
+            return Ok(None);
+        }
+        let typed = self
+            .cols
+            .into_iter()
+            .map(|(ty, col, valid)| {
+                let valid = valid.contains(&false).then_some(valid);
+                (ty, col, valid)
+            })
+            .collect();
+        ChunkColumns::decoded(typed, 0..self.rows, schema.clone(), dicts).map(Some)
+    }
+}
+
 /// Rows per batch of a [`ChunkTable::latest`] result.
 const LATEST_BATCH_ROWS: usize = 8192;
 
@@ -323,6 +398,7 @@ impl ChunkTable {
             )?]);
         }
         let mut parts: Vec<RecordBatch> = Vec::new();
+        let mut from_meta = MetaRows::new(fields, &projection);
         let mut from = 0;
         while from < wanted.len() {
             let ci = wanted[from].0;
@@ -334,19 +410,22 @@ impl ChunkTable {
             else {
                 continue;
             };
+            // the newest row of a sealed chunk is in its metadata: nothing is decoded
+            if let ChunkRef::Encoded(e) = chunk
+                && rows.len() == 1
+                && first + 1 == e.meta().num_rows
+                && from_meta.push(e.meta(), &projection)
+            {
+                continue;
+            }
             let span = first..last + 1;
             let cols = match chunk {
                 ChunkRef::Hot(c) => {
                     ChunkColumns::hot(c, &projection, span.clone(), out_schema.clone(), &dicts)?
                 }
-                ChunkRef::Encoded(e) => encoded_range(
-                    e.as_ref(),
-                    &projection,
-                    span.clone(),
-                    None,
-                    &out_schema,
-                    &dicts,
-                )?,
+                ChunkRef::Encoded(e) => {
+                    encoded_range(e.as_ref(), &projection, span.clone(), &out_schema, &dicts)?
+                }
             };
             let batch = cols.batch(0, span.len())?;
             parts.push(if rows.len() == span.len() {
@@ -358,6 +437,9 @@ impl ChunkTable {
                     .collect();
                 arrow::compute::take_record_batch(&batch, &pick)?
             });
+        }
+        if let Some(cols) = from_meta.finish(&out_schema, &dicts)? {
+            parts.push(cols.batch(0, cols.num_rows())?);
         }
         // one-row pieces make poor batches for whatever reads the result: put them together
         let mut out = Vec::with_capacity(parts.len() / LATEST_BATCH_ROWS + 1);
@@ -1120,11 +1202,10 @@ fn hot_columns(
 
 /// Columns of one encoded chunk, cut to the time bounds and to `remaining` rows.
 ///
-/// The timestamps of a chunk are sorted, so the bounds are a row range: with bounds, the
-/// timestamp column is decoded first and searched, and the other columns are decoded **for
-/// that range only** ([`ankaa_store::EncodedChunk::decode_rows`]). A query for an hour of one
-/// device out of a chunk that holds three days decodes that hour, not the three days; a `LIMIT`
-/// without bounds decodes the first rows only.
+/// The timestamps of a chunk are sorted, so the bounds are a row range, and the columns are
+/// decoded **for that range only** ([`ankaa_store::EncodedChunk::decode_time_range`]). A query
+/// for an hour of one device out of a chunk that holds three days decodes that hour, not the
+/// three days; a `LIMIT` without bounds decodes the first rows only.
 fn encoded_columns(
     e: &dyn ankaa_store::EncodedChunk,
     projection: &[usize],
@@ -1133,60 +1214,53 @@ fn encoded_columns(
     schema: &SchemaRef,
     dicts: &[Option<arrow::array::ArrayRef>],
 ) -> Result<Option<ChunkColumns>> {
-    use datafusion::error::DataFusionError;
-    let external = |err| DataFusionError::External(Box::new(err));
-    let total = e.meta().num_rows;
-    let bounded = bounds != TimeBounds::default();
-    // the timestamps, decoded once: to find the rows and, when projected, as a column
-    let mut ts: Option<(ankaa_store::Column, Option<Vec<bool>>)> = None;
-    let mut rows = 0..total;
-    if bounded {
-        let col = e.decode_nullable(&[0]).map_err(external)?.pop();
-        let values = col
-            .as_ref()
-            .and_then(|(c, _)| c.as_i64())
-            .ok_or_else(|| DataFusionError::Internal("ts not i64".into()))?;
-        let start = values.partition_point(|&t| t < bounds.lo);
-        rows = start..values.partition_point(|&t| t <= bounds.hi).max(start);
-        ts = col;
-    }
+    let want = distinct(projection);
+    let (rows, cols) = e
+        .decode_time_range(&want, bounds.lo, bounds.hi, remaining)
+        .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)))?;
     if rows.is_empty() {
         return Ok(None);
     }
-    if rows.len() > remaining {
-        rows.end = rows.start + remaining;
-    }
-    encoded_range(e, projection, rows, ts, schema, dicts).map(Some)
+    typed_columns(e, projection, &want, cols, rows.len(), schema, dicts).map(Some)
 }
 
-/// The projected columns of rows `rows` of an encoded chunk. `ts` is the chunk's timestamp
-/// column when the caller has already decoded it whole (it is cut to the range here).
+/// The projected columns of rows `rows` of an encoded chunk.
 fn encoded_range(
     e: &dyn ankaa_store::EncodedChunk,
     projection: &[usize],
     rows: core::ops::Range<usize>,
-    ts: Option<(ankaa_store::Column, Option<Vec<bool>>)>,
+    schema: &SchemaRef,
+    dicts: &[Option<arrow::array::ArrayRef>],
+) -> Result<ChunkColumns> {
+    let want = distinct(projection);
+    let cols = e
+        .decode_rows(&want, rows.clone())
+        .map_err(|err| datafusion::error::DataFusionError::External(Box::new(err)))?;
+    typed_columns(e, projection, &want, cols, rows.len(), schema, dicts)
+}
+
+/// The columns of a projection, each once (a projection may name a column twice).
+fn distinct(projection: &[usize]) -> Vec<usize> {
+    let mut want: Vec<usize> = Vec::with_capacity(projection.len());
+    for &ci in projection {
+        if !want.contains(&ci) {
+            want.push(ci);
+        }
+    }
+    want
+}
+
+/// Decoded columns `cols` (those of `want`, `rows` values each) laid out as `projection`.
+fn typed_columns(
+    e: &dyn ankaa_store::EncodedChunk,
+    projection: &[usize],
+    want: &[usize],
+    cols: Vec<(ankaa_store::Column, Option<Vec<bool>>)>,
+    rows: usize,
     schema: &SchemaRef,
     dicts: &[Option<arrow::array::ArrayRef>],
 ) -> Result<ChunkColumns> {
     use datafusion::error::DataFusionError;
-    let external = |err| DataFusionError::External(Box::new(err));
-    let whole = rows.len() == e.meta().num_rows;
-    // each column decoded once, also when the projection names it twice
-    let mut want: Vec<usize> = Vec::with_capacity(projection.len());
-    for &ci in projection {
-        let have_ts = ci == 0 && ts.is_some();
-        if !have_ts && !want.contains(&ci) {
-            want.push(ci);
-        }
-    }
-    let cols = if want.is_empty() {
-        Vec::new()
-    } else if whole {
-        e.decode_nullable(&want).map_err(external)?
-    } else {
-        e.decode_rows(&want, rows.clone()).map_err(external)?
-    };
     if cols.len() != want.len() {
         return Err(DataFusionError::Internal(format!(
             "segment decoded {} of {} columns",
@@ -1194,23 +1268,9 @@ fn encoded_range(
             want.len()
         )));
     }
-    // the timestamps were decoded whole: cut them to the range like the other columns
-    let ts = ts.map(|(c, valid)| {
-        if whole {
-            (c, valid)
-        } else {
-            let valid = valid.map(|v| {
-                v.get(rows.clone())
-                    .map(<[bool]>::to_vec)
-                    .unwrap_or_default()
-            });
-            (c.copy_range(rows.clone()), valid)
-        }
-    });
     let fields = e.meta().schema.fields();
     let mut decoded: Vec<Option<(ankaa_store::Column, Option<Vec<bool>>)>> =
         cols.into_iter().map(Some).collect();
-    let mut ts = ts;
     let mut typed: Vec<(
         ankaa_store::ColumnType,
         ankaa_store::Column,
@@ -1218,11 +1278,10 @@ fn encoded_range(
     )> = Vec::with_capacity(projection.len());
     for (n, &ci) in projection.iter().enumerate() {
         let again = projection[n + 1..].contains(&ci);
-        let slot = match want.iter().position(|&w| w == ci) {
-            Some(pos) => decoded.get_mut(pos),
-            None if ci == 0 => Some(&mut ts),
-            None => None,
-        };
+        let slot = want
+            .iter()
+            .position(|&w| w == ci)
+            .and_then(|pos| decoded.get_mut(pos));
         let col = match slot {
             // the last use of a column takes it; an earlier one (rare) copies
             Some(slot) if again => slot.clone(),
@@ -1234,16 +1293,15 @@ fn encoded_range(
                 "segment has no column {ci}"
             )));
         };
-        if col.len() != rows.len() {
+        if col.len() != rows {
             return Err(DataFusionError::Internal(format!(
-                "segment column {ci} decoded {} rows for a range of {}",
-                col.len(),
-                rows.len()
+                "segment column {ci} decoded {} rows for a range of {rows}",
+                col.len()
             )));
         }
         typed.push((f.ty, col, valid));
     }
-    ChunkColumns::decoded(typed, 0..rows.len(), schema.clone(), dicts)
+    ChunkColumns::decoded(typed, 0..rows, schema.clone(), dicts)
 }
 
 impl DisplayAs for ChunkScanExec {

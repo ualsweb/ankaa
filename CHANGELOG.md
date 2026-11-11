@@ -99,7 +99,8 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   `DoAction` and `ListActions` now check the token before they answer.
 - `latest(table [, key])`: the newest row of every key value (the last reading of every device). The cost
   follows the number of key values, not the rows of the table: a chunk that holds one key value is judged
-  from its statistics, and only the winning row of each key is decoded.
+  from its statistics, and the newest row of every sealed chunk is kept in its metadata (`last_row`, also in
+  segment files), so on a table partitioned by the key no chunk is decoded at all.
 - Compressed chunks decode row ranges (`EncodedChunk::decode_rows`): a query for an hour of a device no
   longer decodes the days its chunk holds, in the warm tier (constant-time slice of the compressed arrays)
   and in the cold tier (row range through the segment layout). `LIMIT` without a time range decodes the

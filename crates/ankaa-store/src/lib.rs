@@ -24,7 +24,7 @@ pub use schema::{ColumnType, Field, Schema, SchemaError};
 pub use table::{Partition, PartitionStats, Table, TableSnapshot, TableWriter};
 pub use tier::{
     ChunkMeta, ChunkRef, DecodeError as TierDecodeError, EncodedChunk, Evolved, NullableColumn,
-    Tier, TierStats, clamp_rows, schema_evolves,
+    Tier, TierStats, clamp_rows, schema_evolves, time_rows, value_bits, value_of_bits,
 };
 
 /// Maximum rows per chunk: 64 `FastLanes` vectors.

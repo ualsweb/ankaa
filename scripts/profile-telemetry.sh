@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# Function-level profile of the engine on the telemetry (TSBS cpu-only) dataset: where the CPU goes
+# while it loads, compresses, restarts and answers each kind of query.
+#
+#   scripts/profile-telemetry.sh [phase ...]      phases: load tier restart queries functions (default: all)
+#
+# Needs, on an aarch64 Linux host: `perf`, a release build with symbols (`cargo build --release -p
+# ankaad`; the profile keeps debug info), the dataset of bench/telemetry (generate.py) and its
+# Python environment (bench/telemetry/.venv). Writes one text report per profile to $OUT
+# (default target/profile-telemetry/): the hottest symbols with their share of the samples, and the
+# share of every thread. Cloud VMs usually expose no hardware counters, so the samples come from the
+# cpu-clock software event (time, not cycles or cache misses).
+#
+# Settings: DATA (dataset directory), WORK (the server's WAL and segments, wiped by `load`),
+# SECONDS_PER_QUERY (default 8), FREQ (samples per second, default 1999), ANKAAD.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+
+ANKAAD="${ANKAAD:-target/release/ankaad}"
+DATA="${DATA:-bench/telemetry/data/tsbs-cpu-s1000-3d-seed123}"
+WORK="${WORK:-bench/telemetry/work/profile}"
+OUT="${OUT:-target/profile-telemetry}"
+PY="${PY:-bench/telemetry/.venv/bin/python}"
+SECONDS_PER_QUERY="${SECONDS_PER_QUERY:-8}"
+FREQ="${FREQ:-1999}"
+FLIGHT_PORT=50081
+METRICS_PORT=9181
+export ANKAA_TOKEN="${ANKAA_TOKEN:-profile-token}"
+PHASES=("$@"); [ ${#PHASES[@]} -eq 0 ] && PHASES=(load tier restart queries functions)
+
+mkdir -p "$OUT" "$WORK"
+[ -x "$ANKAAD" ] || { echo "no $ANKAAD: cargo build --release -p ankaad" >&2; exit 1; }
+[ -f "$DATA/manifest.json" ] || { echo "no dataset in $DATA: bench/telemetry/generate.py" >&2; exit 1; }
+ROWS=$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1]))['rows'])" "$DATA/manifest.json")
+
+metric() { curl -s -H "Authorization: Bearer $ANKAA_TOKEN" "http://127.0.0.1:$METRICS_PORT/metrics" | awk -v m="$1" '$1==m {print int($2)}'; }
+
+# hottest symbols of a profile, then the share of every thread
+report() { # <perf.data> <title>
+  local data="$1" title="$2" txt="$OUT/$(basename "${1%.data}").txt"
+  {
+    echo "== $title"
+    echo "-- symbols (self time)"
+    perf report -i "$data" --stdio --no-children --sort symbol 2>/dev/null \
+      | grep -E '^ +[0-9]' | head -40 | sed 's/\[\.\] //; s/\[k\] /kernel: /; s/  */ /g' | cut -c1-190
+    echo "-- threads"
+    perf report -i "$data" --stdio --no-children --sort comm 2>/dev/null | grep -E '^ +[0-9]' | head -12 | sed 's/  */ /g'
+  } > "$txt"
+  sed -n '1,26p' "$txt"; echo
+}
+
+config() {
+  "$PY" - "$DATA" "$WORK" "$FLIGHT_PORT" "$METRICS_PORT" <<'PYEOF' > "$WORK/ankaad.toml"
+import json, sys
+from pathlib import Path
+sys.path.insert(0, "bench/compare")
+from harness.engines import AnkaaServeEngine
+data, work, flight, metrics = Path(sys.argv[1]), Path(sys.argv[2]).resolve(), int(sys.argv[3]), int(sys.argv[4])
+e = AnkaaServeEngine(work, flight_port=flight, metrics_port=metrics, token="unused")
+print(e.config_text(data, json.loads((data / "manifest.json").read_text())))
+PYEOF
+}
+
+start() { # [perf record prefix...]
+  "$@" "$ANKAAD" serve --config "$WORK/ankaad.toml" > "$WORK/ankaad.log" 2>&1 &
+  SERVER=$!
+}
+wait_rows() { until [ "$(metric ankaa_user_rows_total)" = "$ROWS" ] 2>/dev/null; do sleep 0.2; kill -0 "$SERVER" 2>/dev/null || { tail -5 "$WORK/ankaad.log"; exit 1; }; done; }
+wait_ready() { until curl -s -o /dev/null -H "Authorization: Bearer $ANKAA_TOKEN" "http://127.0.0.1:$METRICS_PORT/metrics"; do sleep 0.05; kill -0 "$SERVER" 2>/dev/null || { tail -5 "$WORK/ankaad.log"; exit 1; }; done; }
+pid_of_server() { pgrep -n -x ankaad; }
+stop() { kill -TERM "$(pid_of_server)" 2>/dev/null; wait "$SERVER" 2>/dev/null; }
+
+has() { local p; for p in "${PHASES[@]}"; do [ "$p" = "$1" ] && return 0; done; return 1; }
+
+if has load; then
+  rm -rf "$WORK/wal" "$WORK/segments"; config
+  t0=$(date +%s.%N)
+  start perf record -q -e cpu-clock -F "$FREQ" -o "$OUT/load.data" --
+  wait_rows
+  t1=$(date +%s.%N)
+  echo "load: $ROWS rows in $(echo "$t1 - $t0" | bc) s"
+  if has tier; then
+    # the same server, right after the load: sealing, compression and segment writes
+    perf record -q -e cpu-clock -F "$FREQ" -p "$(pid_of_server)" -o "$OUT/tier.data" -- sleep 45
+  fi
+  stop
+  report "$OUT/load.data" "load of $ROWS CSV rows (whole process, until the server stopped)"
+  has tier && report "$OUT/tier.data" "45 s after the load: sealing, compression, segments"
+fi
+
+if has restart; then
+  [ -f "$WORK/ankaad.toml" ] || config
+  t0=$(date +%s.%N)
+  start perf record -q -e cpu-clock -F "$FREQ" -o "$OUT/restart.data" --
+  wait_ready; wait_rows 2>/dev/null
+  t1=$(date +%s.%N)
+  echo "restart: serving $ROWS rows again after $(echo "$t1 - $t0" | bc) s"
+  stop
+  report "$OUT/restart.data" "restart: recovery from segments and the log"
+fi
+
+if has queries || has functions; then
+  [ -f "$WORK/ankaad.toml" ] || config
+  start; wait_ready; wait_rows 2>/dev/null
+  # let compression finish so that queries read the tiers a settled server has
+  sleep "${SETTLE:-20}"
+  one() { # <name> <loop_query args...>
+    local name="$1"; shift
+    "$PY" bench/telemetry/loop_query.py "$@" --seconds 2 --flight "grpc://127.0.0.1:$FLIGHT_PORT" --token "$ANKAA_TOKEN" > /dev/null
+    perf record -q -e cpu-clock -F "$FREQ" -p "$(pid_of_server)" -o "$OUT/q-$name.data" -- \
+      "$PY" bench/telemetry/loop_query.py "$@" --seconds "$SECONDS_PER_QUERY" --flight "grpc://127.0.0.1:$FLIGHT_PORT" --token "$ANKAA_TOKEN" \
+      > "$OUT/q-$name.client" 2>&1
+    report "$OUT/q-$name.data" "$name: $(cat "$OUT/q-$name.client")"
+  }
+  if has queries; then
+    for q in $("$PY" bench/telemetry/loop_query.py --list); do one "$q" --query "$q"; done
+  fi
+  if has functions; then
+    one gapfill --sql "SELECT hostname, bucket, value, filled FROM gapfill('cpu', 'usage_user', 60000000000, 'hostname', 'avg', 'linear', 1451692800000000000, 1451696400000000000)"
+    one percentiles --sql "SELECT hostname, count, p50, p99 FROM percentiles('cpu', 'usage_user', '0.5,0.99', 'hostname')"
+    one count-all --sql "SELECT count(*) FROM cpu"
+    one group-by-tag --sql "SELECT region, datacenter, count(*), avg(usage_user) FROM cpu GROUP BY region, datacenter"
+    one filter-tag --sql "SELECT count(*), max(usage_system) FROM cpu WHERE region = 'eu-west-1' AND usage_user > 50"
+    one like-tag --sql "SELECT count(*) FROM cpu WHERE hostname LIKE 'host_1%'"
+    one order-limit --sql "SELECT ts, hostname, usage_user FROM cpu WHERE hostname = 'host_7' ORDER BY ts DESC LIMIT 100"
+  fi
+  stop
+fi
+echo "reports in $OUT/"

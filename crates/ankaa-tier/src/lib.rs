@@ -353,11 +353,27 @@ impl Encoder {
         projection: &[usize],
         rows: Option<core::ops::Range<usize>>,
     ) -> Result<Vec<NullableColumn>, TierError> {
+        let file = self.open_segment(cold)?;
+        self.scan_segment(&file, cold, projection, rows)
+    }
+
+    /// Read a segment file and parse its footer.
+    fn open_segment(&self, cold: &ColdChunk) -> Result<vortex::file::VortexFile, TierError> {
         let bytes = std::fs::read(&cold.path).map_err(io_err(&cold.path))?;
-        let file = self
+        Ok(self
             .session
             .open_options()
-            .open_buffer(ByteBuffer::from(bytes))?;
+            .open_buffer(ByteBuffer::from(bytes))?)
+    }
+
+    /// Decode `projection` (all rows, or the rows `rows`) of an opened segment.
+    fn scan_segment(
+        &self,
+        file: &vortex::file::VortexFile,
+        cold: &ColdChunk,
+        projection: &[usize],
+        rows: Option<core::ops::Range<usize>>,
+    ) -> Result<Vec<NullableColumn>, TierError> {
         let fields = cold.meta.schema.fields();
         let names: Vec<String> = projection.iter().map(|&i| fields[i].name.clone()).collect();
         let expr = select(names.iter().map(String::as_str).collect::<Vec<_>>(), root())
@@ -532,6 +548,49 @@ impl EncodedChunk for ColdChunk {
                 id: self.meta.id,
                 msg: e.to_string(),
             })
+    }
+    /// The segment file is read and its footer parsed once for both steps (finding the rows in
+    /// the timestamps, decoding the projection for them): opening costs more than either.
+    fn decode_time_range(
+        &self,
+        projection: &[usize],
+        lo: i64,
+        hi: i64,
+        limit: usize,
+    ) -> Result<(core::ops::Range<usize>, Vec<NullableColumn>), DecodeError> {
+        let err = |e: TierError| DecodeError {
+            tier: Tier::Cold,
+            id: self.meta.id,
+            msg: e.to_string(),
+        };
+        let total = self.meta.num_rows;
+        let inside = lo <= self.meta.ts_min && self.meta.ts_max <= hi;
+        if inside && projection.is_empty() {
+            return Ok((0..total.min(limit), Vec::new()));
+        }
+        let file = self.enc.open_segment(self).map_err(err)?;
+        let rows = if inside {
+            0..total.min(limit)
+        } else {
+            let ts = self
+                .enc
+                .scan_segment(&file, self, &[0], None)
+                .map_err(err)?;
+            let ts = ts
+                .first()
+                .and_then(|(c, _)| c.as_i64())
+                .ok_or_else(|| err(TierError::Vortex("column 0 is not the timestamp".into())))?;
+            ankaa_store::time_rows(ts, lo, hi, limit)
+        };
+        if rows.is_empty() || projection.is_empty() {
+            return Ok((rows, Vec::new()));
+        }
+        let part = (rows.len() < total).then(|| rows.clone());
+        let cols = self
+            .enc
+            .scan_segment(&file, self, projection, part)
+            .map_err(err)?;
+        Ok((rows, cols))
     }
 }
 
@@ -751,6 +810,7 @@ mod tests {
     /// in the warm and the cold tier and through the schema-evolution adapter: at block edges
     /// (1,024 rows), for one row, for the last row, for an empty range and beyond the end.
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn a_row_range_decodes_like_the_rows_of_the_whole() {
         let enc = Arc::new(Encoder::new());
         let dir = tempfile::tempdir().unwrap();
@@ -805,6 +865,57 @@ mod tests {
                         let got = valid.clone().unwrap_or_else(|| vec![true; rows.len()]);
                         assert_eq!(got, want, "{what}");
                     }
+                }
+                // by time: the rows a filter over the whole decode keeps, cut to the limit
+                let ts = whole[0].0.as_i64().unwrap().to_vec();
+                let (first, last) = (ts[0], ts[ts.len() - 1]);
+                for (lo, hi, limit) in [
+                    (i64::MIN, i64::MAX, usize::MAX),
+                    (first, last, usize::MAX),
+                    (first, last, 10),
+                    (ts[1_000], ts[1_359], usize::MAX),
+                    (ts[1_000] + 1, ts[1_359] - 1, usize::MAX),
+                    (ts[4_000], i64::MAX, 7),
+                    (i64::MIN, ts[3], usize::MAX),
+                    (last, last, usize::MAX),
+                    (last + 1, i64::MAX, usize::MAX),
+                    (i64::MIN, first - 1, usize::MAX),
+                    (ts[200], ts[100], usize::MAX),
+                ] {
+                    let what = format!("{table} {tier} ts in [{lo}, {hi}] limit {limit}");
+                    let want: Vec<usize> = (0..ts.len())
+                        .filter(|&i| lo <= ts[i] && ts[i] <= hi)
+                        .take(limit)
+                        .collect();
+                    let (rows, cols) = e.decode_time_range(&[2, 0], lo, hi, limit).unwrap();
+                    assert_eq!(rows.len(), want.len(), "{what}");
+                    if let (Some(&a), Some(&b)) = (want.first(), want.last()) {
+                        assert_eq!(rows, a..b + 1, "{what}");
+                        assert!(
+                            same(&cols[0].0, &whole[2].0.copy_range(rows.clone())),
+                            "{what}"
+                        );
+                        assert!(
+                            same(&cols[1].0, &whole[0].0.copy_range(rows.clone())),
+                            "{what}"
+                        );
+                    } else {
+                        assert!(cols.is_empty(), "{what}");
+                    }
+                    // no column asked for: the rows are still found
+                    let (rows, cols) = e.decode_time_range(&[], lo, hi, limit).unwrap();
+                    assert_eq!((rows.len(), cols.len()), (want.len(), 0), "{what}");
+                }
+                // the newest row is in the metadata, as the chunk holds it
+                let meta = e.meta();
+                assert_eq!(meta.last_row.len(), projection.len(), "{table} {tier}");
+                for (i, bits) in meta.last_row.iter().enumerate() {
+                    let stored = chunk.value(i, 4_999).and_then(ankaa_store::value_bits);
+                    assert_eq!(
+                        *bits,
+                        if i < all.len() { stored } else { None },
+                        "{table} {tier} column {i}"
+                    );
                 }
                 // a projection in another order, a column twice
                 let part = e.decode_rows(&[2, 0, 2], 100..200).unwrap();

@@ -60,6 +60,38 @@ pub struct ChunkMeta {
     /// order (see `ZoneMap::tie_order`). Absent in older segments (no order is promised).
     #[serde(default)]
     pub tie_order: Option<(i64, i64)>,
+    /// The last row of the chunk, one entry per column: the bits of the value ([`value_bits`]),
+    /// `None` for `NULL`. The rows of a chunk are in time order, so this is its newest row:
+    /// "the last reading of every device" is answered from here without decoding a chunk.
+    /// Empty in segments written before this field existed (the row is decoded instead).
+    #[serde(default)]
+    pub last_row: Vec<Option<u64>>,
+}
+
+/// A value as 64 bits (`None` for `NULL`): two's complement for integers, IEEE 754 for floats.
+#[must_use]
+pub fn value_bits(v: crate::Value) -> Option<u64> {
+    match v {
+        crate::Value::I64(x) => Some(u64::from_ne_bytes(x.to_ne_bytes())),
+        crate::Value::U32(x) => Some(u64::from(x)),
+        crate::Value::U8(x) => Some(u64::from(x)),
+        crate::Value::F64(x) => Some(x.to_bits()),
+        crate::Value::Null => None,
+    }
+}
+
+/// The value of type `ty` that [`value_bits`] turned into `bits` (`None`: the bits do not fit
+/// the type).
+#[must_use]
+pub fn value_of_bits(ty: ColumnType, bits: u64) -> Option<crate::Value> {
+    Some(match ty {
+        ColumnType::TimestampNs | ColumnType::FixedPoint { .. } | ColumnType::Int64 => {
+            crate::Value::I64(i64::from_ne_bytes(bits.to_ne_bytes()))
+        }
+        ColumnType::DictU32 => crate::Value::U32(u32::try_from(bits).ok()?),
+        ColumnType::U8 => crate::Value::U8(u8::try_from(bits).ok()?),
+        ColumnType::Float64 => crate::Value::F64(f64::from_bits(bits)),
+    })
 }
 
 impl ChunkMeta {
@@ -106,6 +138,14 @@ impl ChunkMeta {
                 })
                 .unwrap_or_default(),
             tie_order: chunk.zone_map().and_then(|z| z.tie_order),
+            last_row: chunk
+                .num_rows()
+                .checked_sub(1)
+                .map_or_else(Vec::new, |last| {
+                    (0..chunk.schema().fields().len())
+                        .map(|i| chunk.value(i, last).and_then(value_bits))
+                        .collect()
+                }),
         }
     }
 }
@@ -149,6 +189,43 @@ pub trait EncodedChunk: Send + Sync + Debug {
     /// the rows of that hour, not the chunk. The default decodes everything and cuts; an
     /// encoding that can address rows (bit-packed blocks, frame of reference, ALP) overrides it
     /// and decodes only the blocks the range touches.
+    /// The rows with `lo <= timestamp <= hi` (at most `limit` of them): their range in the
+    /// chunk and the columns `projection` for that range ([`Self::decode_rows`]). The
+    /// timestamps (column 0) are sorted, so the rows are found by binary search; a chunk that
+    /// lies inside the bounds is not searched at all. Implementations that pay per call (a
+    /// segment file to open) override this to pay once.
+    fn decode_time_range(
+        &self,
+        projection: &[usize],
+        lo: i64,
+        hi: i64,
+        limit: usize,
+    ) -> Result<(core::ops::Range<usize>, Vec<NullableColumn>), DecodeError> {
+        let meta = self.meta();
+        let rows = if lo <= meta.ts_min && meta.ts_max <= hi {
+            0..meta.num_rows.min(limit)
+        } else {
+            let ts = self.decode(&[0])?;
+            let ts = ts
+                .first()
+                .and_then(Column::as_i64)
+                .ok_or_else(|| DecodeError {
+                    tier: self.tier(),
+                    id: meta.id,
+                    msg: "column 0 is not the timestamp".into(),
+                })?;
+            time_rows(ts, lo, hi, limit)
+        };
+        if rows.is_empty() {
+            return Ok((rows, Vec::new()));
+        }
+        let cols = if rows.len() == meta.num_rows {
+            self.decode_nullable(projection)?
+        } else {
+            self.decode_rows(projection, rows.clone())?
+        };
+        Ok((rows, cols))
+    }
     fn decode_rows(
         &self,
         projection: &[usize],
@@ -169,6 +246,15 @@ pub trait EncodedChunk: Send + Sync + Debug {
             })
             .collect())
     }
+}
+
+/// The rows of a chunk with `lo <= ts <= hi`, at most `limit` of them, given its sorted
+/// timestamps.
+#[must_use]
+pub fn time_rows(ts: &[i64], lo: i64, hi: i64, limit: usize) -> core::ops::Range<usize> {
+    let start = ts.partition_point(|&t| t < lo);
+    let end = ts.partition_point(|&t| t <= hi).max(start);
+    start..end.min(start.saturating_add(limit))
 }
 
 /// `rows` cut to `0..len` (an empty range when it starts beyond the end).
@@ -242,6 +328,10 @@ impl Evolved {
         let mut meta = inner.meta().clone();
         meta.schema = schema.clone();
         meta.tie_order = None;
+        if !meta.last_row.is_empty() {
+            // the columns added since hold NULL in every stored row
+            meta.last_row.resize(schema.fields().len(), None);
+        }
         Ok(Arc::new(Self {
             inner,
             meta,
@@ -354,6 +444,29 @@ impl EncodedChunk for Evolved {
                 (zeroed(ty, n), Some(vec![false; n]))
             }),
         )
+    }
+
+    fn decode_time_range(
+        &self,
+        projection: &[usize],
+        lo: i64,
+        hi: i64,
+        limit: usize,
+    ) -> Result<(core::ops::Range<usize>, Vec<NullableColumn>), DecodeError> {
+        let inner: Vec<usize> = projection
+            .iter()
+            .copied()
+            .filter(|&i| i < self.stored)
+            .collect();
+        // (with nothing stored in the projection the inner chunk still finds the rows)
+        let (rows, stored) = self.inner.decode_time_range(&inner, lo, hi, limit)?;
+        if rows.is_empty() {
+            return Ok((rows, Vec::new()));
+        }
+        let cols = self.assemble_rows(projection, rows.len(), stored.into_iter(), |ty, n| {
+            (zeroed(ty, n), Some(vec![false; n]))
+        });
+        Ok((rows, cols))
     }
 }
 
@@ -701,6 +814,7 @@ mod tests {
             u32_ranges: vec![(1, 0, 0)],
             i64_stats: vec![(0, 0, 4, 10)],
             tie_order: Some((0, 4)),
+            last_row: vec![Some(4), Some(0)],
         };
         let cols = vec![
             Column::I64((0..5).collect()),
