@@ -4,7 +4,7 @@
 #   scripts/e2e-profile.sh <scenario> [--transport mqtt|file] [--format json|json-array]
 #                          [--batch B] [--messages N] [--devices D] [--tls] [--publishers P]
 #
-# Needs: target/release/ankaad, bench/target/release/loadgen, mosquitto (for mqtt), perf.
+# Needs: target/release/ankaad (or $ANKAAD), bench/target/release/loadgen, mosquitto (for mqtt), perf.
 # Writes target/e2e/<scenario>/: summary.txt, perf-stat.txt, perf-report.txt, ankaad.log.
 # Measures the server only: CPU time of ankaad per reading (utime+stime from /proc), wall time
 # from the first to the last stored reading, peak resident memory (VmHWM), hardware counters
@@ -28,7 +28,7 @@ done
 root="$(cd "$(dirname "$0")/.." && pwd)"
 out="$root/target/e2e/$scenario"; work="$(mktemp -d)"
 mkdir -p "$out"
-ankaad="$root/target/release/ankaad"; loadgen="$root/bench/target/release/loadgen"
+ankaad="${ANKAAD:-$root/target/release/ankaad}"; loadgen="$root/bench/target/release/loadgen"
 token="e2e-profile-token-0123456789"
 per_msg=1; [ "$format" = json-array ] && per_msg="$batch"
 expected=$((messages * per_msg))
