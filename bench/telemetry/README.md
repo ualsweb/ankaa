@@ -205,9 +205,9 @@ with `date_bin`). ANKAA and DuckDB use standard SQL (`date_bin`, `date_trunc`).
   original lines with the `i` suffix removed.
 - **ANKAA runs the same statements.** A `dict` column is a dictionary-encoded string in SQL (RFC-0002), so the
   ANKAA queries filter, group and return host names like every other engine; nothing is resolved by the client.
-  The only shape of its own is `lastpoint`: `max(ts)` per host joined back (measured faster on ankaad than
-  `DISTINCT ON` and `row_number()`); TSBS points are unique per (host, ts), and DuckDB's `DISTINCT ON` answer would
-  expose any duplicate.
+  The only shape of its own is `lastpoint`: `latest('cpu', 'hostname')`, ANKAA's function for the newest row
+  per key (QuestDB's dialect uses its `LATEST ON` in the same place). TSBS points are unique per (host, ts), so it
+  must agree with DuckDB's `DISTINCT ON` answer row for row.
 
 ### Comparison rules
 

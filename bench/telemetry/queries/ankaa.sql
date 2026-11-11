@@ -4,9 +4,8 @@
 -- SQL (RFC-0002): filters, GROUP BY and results use the names, the engine works on the ids underneath. So
 -- these are the same statements the other engines run, nothing resolved by the client.
 -- Buckets: date_bin(INTERVAL ..., ts) with DataFusion's default origin (Unix epoch).
--- lastpoint: max(ts) per host joined back to the table. TSBS points are unique per (host, ts); with duplicates
--- this shape would return every tied row (the diff against DuckDB's DISTINCT ON would then flag it).
--- Measured on the smoke dataset this beat DISTINCT ON (~3x) and row_number() (~4x) on ankaad.
+-- lastpoint: latest('cpu', 'hostname'), ANKAA's function for the newest row per key (as QuestDB uses LATEST ON
+-- and TSBS's TimescaleDB query a DISTINCT ON over an index). With equal timestamps it returns the row stored last.
 -- {START}/{END} render as RFC 3339 string literals (DataFusion coerces them to Timestamp(ns, UTC)).
 
 -- @query single-groupby-1-1-1
@@ -125,7 +124,7 @@ ORDER BY 1 DESC
 LIMIT 5
 
 -- @query lastpoint
-SELECT c.ts, c.hostname, c.region, c.datacenter, c.rack, c.os, c.arch, c.team, c.service, c.service_version, c.service_environment, c.usage_user, c.usage_system, c.usage_idle, c.usage_nice, c.usage_iowait, c.usage_irq, c.usage_softirq, c.usage_steal, c.usage_guest, c.usage_guest_nice
-FROM cpu c
-JOIN (SELECT hostname, max(ts) AS last_ts FROM cpu GROUP BY hostname) m
-  ON c.hostname = m.hostname AND c.ts = m.last_ts
+SELECT ts, hostname, region, datacenter, rack, os, arch, team, service, service_version, service_environment,
+       usage_user, usage_system, usage_idle, usage_nice, usage_iowait, usage_irq, usage_softirq, usage_steal,
+       usage_guest, usage_guest_nice
+FROM latest('cpu', 'hostname')

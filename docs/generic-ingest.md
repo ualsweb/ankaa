@@ -450,6 +450,16 @@ the empty buckets filled (`null`, `locf` or `linear`), ready for a chart or a jo
 SELECT * FROM gapfill('telemetry', 'temp', 60000000000, 'rack', 'avg', 'linear');
 ```
 
+The last reading of every device, the query behind a status page, is `latest`:
+
+```sql
+SELECT * FROM latest('telemetry', 'rack');                    -- one row per rack: its newest reading
+SELECT rack, ts, temp FROM latest('telemetry', 'rack') WHERE temp > 80e8;
+```
+
+On a table partitioned by that column nothing is scanned: the newest row of each partition is read
+directly, whatever the size of the table.
+
 ## Changing a table
 
 A table may gain columns without losing what it holds:

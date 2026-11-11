@@ -310,6 +310,8 @@ The project is maintained by an independent engineer with a background in teleco
 | `ohlcv(table, width_ns [, key])` | Open, high, low, close, volume, notional and count per time bucket |
 | `rolling(table, window_ns, step_ns [, key])` | Bars over a trailing window at every step (rolling high/low/volume/VWAP), in time independent of the window length |
 | `percentiles(table, column, 'q1,q2,…' [, key])` | Streaming quantiles (UDDSketch, 1 % relative error) |
+| `gapfill(table, column, width_ns [, key [, agg [, method [, start_ns, end_ns]]]])` | One value per bucket and key, empty buckets filled (`null`, `locf`, `linear`) |
+| `latest(table [, key])` | The newest row of every key value (the last reading of every device); the cost follows the number of keys, not the rows |
 | `vwap(price, size)` | Aggregate: volume-weighted average price with exact integer sums |
 
 **Inputs:** MQTT topic filters (JSON, CSV or Sparkplug B), Kafka topics (plaintext or TLS, SASL `PLAIN`/`SCRAM`) and NATS subjects (JSON or CSV); live Binance JSON and SBE streams; `.ankc` captures (`ankaa-capture` records them); Databento `.dbn`/`.dbn.zst`; `.csv` and `.parquet` trade files; NDJSON/CSV files; user-defined binary feeds through the framing helper.

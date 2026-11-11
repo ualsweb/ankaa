@@ -263,6 +263,22 @@ FROM gapfill('power', 'kw', 60000000000, 'machine', 'avg', 'linear', 17626464000
 ORDER BY machine, bucket;
 ```
 
+**`latest(table [, key])`**
+
+The newest row of every value of the `dict` column `key` (default `symbol`), with all the columns of the table: the
+row with the greatest timestamp, the last stored one among equal timestamps. Rows come in no particular order.
+
+The cost follows the number of key values, not the number of rows. The rows of a chunk are in time order, so a chunk
+that holds one key value (every chunk of a table partitioned by `key`) is judged from its statistics alone: its last
+row is its newest. Only the chunk holding each key's winner is touched, and of it only that row is decoded
+(compressed chunks decode a row range without decoding the rest, see "Row ranges of compressed chunks"). A chunk
+that mixes key values has its key and timestamp columns read. Only the columns the query uses are decoded.
+
+```sql
+SELECT machine, ts, kw FROM latest('power', 'machine') ORDER BY machine;   -- the last reading of every machine
+SELECT count(*) FROM latest('power', 'machine') WHERE ts < now() - interval '5 minutes';   -- machines gone quiet
+```
+
 **`rolling(table, window_ns, step_ns [, key])`**
 
 For every `key` (default `symbol`) and every step end `e` on the `step_ns` grid, the bar of the trailing window
@@ -325,6 +341,13 @@ become one row per symbol (answered from statistics) before the join. The rewrit
 holds (a key with two names, two keys with one name); `EXPLAIN` shows `__ankaa_partial_` columns when it applies. The
 join itself is rarely needed: `symbol` and every `dict` column already read as their names (see "Dictionary columns
 in SQL" below).
+
+**Row ranges of compressed chunks.** The rows of a chunk are sorted by time, so a time predicate selects a row
+range. For a warm or cold chunk the scan decodes the timestamp column, finds the range, and decodes the other
+columns for that range only (`EncodedChunk::decode_rows`): a slice of a compressed array is taken in constant time
+and decoding it touches the bit-packed blocks it covers; a cold segment is asked for the row range through its
+layout. One hour of a device out of a chunk that holds three days costs that hour. `LIMIT` without a time predicate
+decodes the first rows only.
 
 **Merging sorted partitions.** `ORDER BY` on one or two integer or timestamp columns over partitions that are already
 in that order (`ORDER BY ts, seq`) is merged by `OrderedMergeExec`, which compares the keys as numbers and copies rows
