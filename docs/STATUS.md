@@ -1,8 +1,10 @@
 # STATUS (technical handoff)
 
-**Updated:** 2026-11-11 · **Phase:** 1 complete in software, Phases 2–4 scaffolded; launch-readiness pass done; general telemetry base done (nullable columns, bounded lateness, retention, MQTT, 100k-device scale test) · **Open gates need hardware or time:** Graviton4 numbers (N-01…N-13), 24 h soak of the release build, `data=writeback` power-loss variant, bare-metal timestamps (N-14), live SBE verification (API key).
+**Updated:** 2026-11-11 · **Phase:** 1 complete in software, Phases 2–4 scaffolded; launch-readiness pass done; general telemetry base done (nullable columns, bounded lateness, retention, MQTT, 100k-device scale test); telemetry pack done (MQTT TLS, batches per message, Sparkplug B, adding columns, gap filling) · **Open gates need hardware or time:** Graviton4 numbers (N-01…N-13), 24 h soak of the release build, `data=writeback` power-loss variant, bare-metal timestamps (N-14), live SBE verification (API key).
 
-**Next tasks (in order):** public repository push and Pages site (`site/`), 24 h soak of the release build on Axion (`scripts/gcp/ankaa-gcp.sh soak 24`), first Graviton4 hour (`scripts/first-light.sh`, `bench/compare/`).
+**Next tasks (in order):** TSBS-shaped telemetry comparison with InfluxDB 3 Core, TimescaleDB and QuestDB on Axion (`bench/telemetry/`), sharded ingest for many-core Arm parts (one writer per partition group), close the 24 h soak note (`scripts/gcp/ankaa-gcp.sh fetch`), first Graviton4 hour (`scripts/first-light.sh`, `bench/compare/`).
+
+**Telemetry pack (2026-11-11).** `rows` + single-pass JSON scanner (`ankaa-ingest/src/json_scan.rs`, differential against `serde_json`); Sparkplug B (`ankaa-ingest/src/sparkplug.rs`: in-place protobuf walk, `Definitions` per edge node, `sp-defs` WAL control frames bound truncation in `serve.rs::truncation_point`, rebirth requests in `sources/mqtt.rs`; checked against `prost`, fuzz target `sparkplug`, e2e against Mosquitto in `tests/brokers.rs`); schema evolution (`ankaa_store::{schema_evolves, Evolved}`, used by `tiering.rs::restore`); `gapfill()` (`ankaa-ts/src/gapfill.rs`, `ankaa-sql/src/functions.rs`, differential against DataFusion in `ankaa-sql/tests/gapfill.rs`). Engine changes from the Axion end-to-end profiles: batched WAL hand-off (`wal_writer.rs::push_batch`), `Table::writer` (one lock per message), interrupt moderation (`storage.ingest_coalesce_us`, WAL polling while busy), foldhash dictionaries. Measurements: `docs/benchmarks/2026-11-11-axion-e2e-ingest.md`. GCE exposes no PMU counters to guests: profiles are `cpu-clock` samples only.
 
 **MQTT over TLS (2026-11-11).** `mqtts://` in `ankaa-feeds/src/sources/mqtt.rs`: `tls_config()` builds a rustls `ClientConfig` (aws-lc-rs provider, safe default versions) from public roots or `tls_ca` only, optional client certificate; `serve` calls it at start (fail fast). Tests: `tls_files_are_checked` (rcgen), config rules, `brokers.rs::mqtt_tls_sources_verify_the_broker_and_present_a_client_certificate` against Mosquitto TLS + mTLS (`scripts/mqtt-tls-broker.sh`, also in CI).
 
@@ -89,7 +91,7 @@
 - Replay inputs are operator-supplied and partly trusted: WAL segments are read whole into memory at recovery (bounded by the 256 MiB segment size), CSV and Parquet files are read as they are.
 - Not yet fuzzed: CSV/Parquet replay sources, segment metadata, the `/metrics` request parser; `capture_decode`/`wal_replay` are CRC-gated (structure-aware variants planned).
 - `asof_join`/`ohlcv`/`percentiles` table functions collect both inputs in memory (bounded by the query memory pool, not streaming yet); Flight is plain Flight (SQL in descriptor/ticket), not the Flight SQL extension, so ADBC drivers need that first.
-- The generic mapper parses JSON into a tree per message (about 2 M messages/s per core on a laptop, development signal); CSV is about 5× faster.
+- MQTT ingest costs about 10 µs of server CPU per message on Axion, three quarters of it in the MQTT client (rumqttc writes every acknowledgement on its own); the engine's share is about 2.5 µs. Batching readings per message (`rows`, Sparkplug) brings it to about 1.1–1.3 µs per reading.
 - `ankaa-wire` has no AF_XDP path and no bare-metal numbers.
 - Segments carry no per-file checksum beyond the Vortex layout (metadata row count is checked).
 

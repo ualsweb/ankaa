@@ -22,6 +22,34 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   public roots or only a private CA (`tls_ca`), and client certificates (`tls_cert`, `tls_key`); files
   checked at start. Tested against Mosquitto with TLS and mutual TLS in CI
   (`scripts/mqtt-tls-broker.sh`).
+- Several readings per message: `rows = "<array path>"` stores one row per element (`$msg.<path>` reads
+  the message around it); a bad element refuses only its row; at most 65,536 rows per message, new
+  dictionary values of one message counted together against `max_dict_entries`.
+- JSON is read by a single-pass, path-directed scanner instead of a document tree: mapped values are
+  recorded as byte ranges, everything else skipped (vectorised quote search, bracket counting), nothing
+  allocated per message. Checked against `serde_json` by a differential property test. Mapping cost
+  per message 489 → 212 ns (laptop, criterion).
+- Sparkplug B sources (`format = "sparkplug"`): one row per metric of every BIRTH and DATA message,
+  `$metric`, `$value`, `$string`, `$timestamp`, `$datatype`, `$historical`, `$seq`, `$group`, `$node`,
+  `$device`, `$type` selectors; datatypes, transient flags and aliases from the BIRTHs (DATA messages
+  without a datatype are read with them), kept in the write-ahead log so restarts, crashes and standbys
+  resolve aliases without a new BIRTH; opt-in rebirth requests (`sparkplug_rebirth`). Decoder checked
+  against a reference protobuf codec and fuzzed (`sparkplug`). End to end on Google Axion: 505 k rows/s,
+  1.1 µs of server CPU per row over MQTT.
+- Tables can gain nullable columns at the end, and a column can become nullable, without losing their
+  history: segments written before are read with the added columns `NULL`, nothing is rewritten. Other
+  column changes still stop the start with the files and the reason.
+- `gapfill(table, column, width_ns [, key [, agg [, method [, start_ns, end_ns]]]])`: one row per bucket
+  and key with empty buckets filled (`null`, `locf`, `linear`), seven aggregates; verified against
+  DataFusion's own grouping.
+- Ingest engine, from end-to-end profiles on Google Axion (`scripts/e2e-profile.sh`,
+  `docs/benchmarks/2026-11-11-axion-e2e-ingest.md`): the ingest loop hands frames to the log thread in
+  batches; one table lock per message instead of three per row; counters published once per batch;
+  frames encoded straight into the log buffer; interrupt moderation of the ingest loop
+  (`storage.ingest_coalesce_us`, default 200 µs, invisible to queries) and of the log thread (polls while
+  busy, sleeps when idle); dictionaries hashed with foldhash. File ingest 0.68 → 3.2 M rows/s
+  (3,350 → 850 ns CPU per row); MQTT 24.6 → 9.9 µs CPU per message.
+- `loadgen --connections`, `--format sparkplug` and `e2e-profile.sh --publishers`, `$ANKAAD` for A/B runs.
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on
   `ghcr.io` built from the release binaries), release binaries for Linux arm64/x86-64 and macOS arm64
   (`.github/workflows/release.yml`), and `examples/factory/`: one `docker compose up` for an MQTT plant,
