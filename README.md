@@ -1,6 +1,6 @@
 # ANKAA
 
-### Real-time time-series engine for Arm servers. Stream in, query in milliseconds.
+### Real-time time-series engine for ARM servers. Stream in, query in milliseconds.
 
 **ANKAA ingests live streams (MQTT, Kafka, NATS, exchange feeds, files), makes every reading queryable with SQL within milliseconds, keeps live aggregates up to date as data arrives, compresses history to disk, and serves it all over Arrow Flight, the Postgres protocol and Python. One Rust binary, tuned for Arm cloud CPUs such as AWS Graviton, Google Axion and Azure Cobalt.**
 
