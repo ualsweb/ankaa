@@ -52,6 +52,7 @@ Three update patterns exist, and they matter when you read a graph:
 | `ankaa_frames_ignored_total` | counter | frames | Frames the decoder recognised but produced nothing from (subscription acks, unknown stream types). Not an error. |
 | `ankaa_events_total` | counter | events | Decoded items handed to the appenders (`trades + deltas + snapshots` per batch), incremented once per exchange message by the batch size. Includes events whose rows were later dropped. |
 | `ankaa_dropped_rows_total` | counter | rows | Rows an appender refused: timestamp below the partition watermark (out of order) or a type/arity mismatch. Incremented per batch by the number of rows rejected across all three tables. Expected 0 on an in-order feed; see `docs/temporal-architecture.md`. |
+| `ankaa_late_rows_total` | counter | rows | Rows accepted although older than the newest row of their partition, within the table's `max_lateness_ms`, and inserted at their place in time. Expected to grow with gateways that buffer; it is not an error. Rows older than the window are in `ankaa_dropped_rows_total`. |
 | `ankaa_trades_total` | counter | trades | Trades decoded (decoder statistic, copied on the snapshot tick). |
 | `ankaa_book_deltas_total` | counter | deltas | Book delta levels decoded (decoder statistic, copied on the snapshot tick). One depth message with 10 levels adds 10. |
 

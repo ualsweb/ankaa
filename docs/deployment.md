@@ -112,6 +112,19 @@ The schema is `crates/ankaa-core/src/config.rs`. All fields, with defaults:
 |---|---|---|---|
 | `memlock_mib` | `0` (skip) | — | Locked memory the engine intends to use, in MiB. At start the soft `RLIMIT_MEMLOCK` must be at least this, otherwise `serve` refuses to start. **Note**: today nothing is actually `mlock`ed; this is the fail-fast gate for the arena work that follows. |
 | `memory_budget_mib` | `0` (skip) | — | Resident memory budget in MiB. `serve` refuses to start when it exceeds physical memory. No limit is enforced at run time yet. |
+| `query_memory_mib` | `1024` | — | Memory pool shared by running queries (DataFusion), in MiB. A query that would exceed it fails with a resource error instead of taking the server down with it; ingest is not affected. Table functions that materialise their input (`percentiles` over a whole large table) are the usual reason to raise it. At least 64. |
+
+### `[replication]`
+
+Full guide: [`replication.md`](replication.md).
+
+| Key | Default | CLI | Meaning |
+|---|---|---|---|
+| `standby_of` | unset | — | Run as a read-only standby of this primary (its Flight address): the primary's log is streamed, applied and written to this node's own log. |
+| `primary_tls_ca`, `primary_tls_domain` | unset | — | CA certificate (PEM) of a primary that uses TLS, and the server name to expect when it differs from the host in `standby_of`. |
+| `serve_wal` | `false` | — | Serve this node's log to standbys (Flight ticket `__wal__:<lsn>`; needs `storage.wal_dir`). Off by default: the stream carries every ingested message verbatim. |
+| `token_env` | unset | — | Environment variable holding a token of its own for the log stream. Unset: the query token is accepted, which lets every SQL client read the raw log. |
+| `max_standbys` | `4` | — | Log streams served at once; further ones are refused. |
 
 ### Validation rules (`Config::validate`)
 
