@@ -229,7 +229,11 @@ pub struct Chunk {
     rows: usize,
     watermark: i64,
     state: ChunkState,
-    zone_map: Option<ZoneMap>,
+    /// The statistics of a sealed chunk, computed when first asked for. Whoever needs them pays:
+    /// the encode thread that describes the chunk, or a query that prunes on it. The thread that
+    /// seals a chunk or copies its newest rows for queries (the ingest loop, every snapshot) only
+    /// marks it sealed.
+    zone_map: std::sync::OnceLock<ZoneMap>,
     /// WAL LSN range of the frames that produced this chunk (`0` = unknown / no WAL).
     first_lsn: u64,
     last_lsn: u64,
@@ -257,7 +261,7 @@ impl Chunk {
             rows: 0,
             watermark: i64::MIN,
             state: ChunkState::Open,
-            zone_map: None,
+            zone_map: std::sync::OnceLock::new(),
             first_lsn: 0,
             last_lsn: 0,
             last_lsn_rows: 0,
@@ -333,7 +337,6 @@ impl Chunk {
             return Err("the rows are not in time order".into());
         }
         let watermark = ts.last().copied().unwrap_or(i64::MIN);
-        let zone_map = Some(ZoneMap::of_valid(&columns, &validity));
         Ok(Self {
             id,
             schema,
@@ -342,7 +345,7 @@ impl Chunk {
             rows,
             watermark,
             state: ChunkState::Sealed,
-            zone_map,
+            zone_map: std::sync::OnceLock::new(),
             first_lsn: lsn.0,
             last_lsn: lsn.1,
             last_lsn_rows: lsn.2,
@@ -445,7 +448,10 @@ impl Chunk {
     /// Zone map (only after sealing).
     #[must_use]
     pub fn zone_map(&self) -> Option<&ZoneMap> {
-        self.zone_map.as_ref()
+        (self.state == ChunkState::Sealed).then(|| {
+            self.zone_map
+                .get_or_init(|| ZoneMap::of_valid(&self.columns, &self.validity))
+        })
     }
 
     /// Append one row. Values must match the schema; timestamps must be `>= watermark`.
@@ -590,8 +596,17 @@ impl Chunk {
         self.columns.get(i).and_then(|c| c.get(row))
     }
 
-    /// Seal: no further appends; compute and freeze the zone map. Idempotent.
+    /// Seal: no further appends. Idempotent. Returns the zone map (computing it now if nobody
+    /// asked for it yet); a caller that does not need it uses [`Self::mark_sealed`].
     pub fn seal(&mut self) -> &ZoneMap {
+        self.mark_sealed();
+        self.zone_map
+            .get_or_init(|| ZoneMap::of_valid(&self.columns, &self.validity))
+    }
+
+    /// Seal without computing the statistics: they are computed by the first reader that asks
+    /// ([`Self::zone_map`]), off the thread that seals.
+    pub fn mark_sealed(&mut self) {
         if self.state == ChunkState::Open {
             if self.rows < CHUNK_ROWS {
                 // sealed early (shutdown, forced checkpoint): give the unused capacity back
@@ -602,10 +617,8 @@ impl Chunk {
             for valid in self.validity.iter_mut().flatten() {
                 valid.shrink_to_fit();
             }
-            self.zone_map = Some(ZoneMap::of_valid(&self.columns, &self.validity));
             self.state = ChunkState::Sealed;
         }
-        self.zone_map.as_ref().expect("sealed chunk has a zone map")
     }
 
     /// A sealed copy of rows `rows` of this chunk, with a zone map of its own: one piece of
@@ -633,7 +646,6 @@ impl Chunk {
                     .filter(|v| v.contains(&false))
             })
             .collect();
-        let zone_map = Some(ZoneMap::of_valid(&columns, &validity));
         Self {
             id: self.id,
             schema: self.schema.clone(),
@@ -642,7 +654,7 @@ impl Chunk {
             rows: rows.len(),
             watermark,
             state: ChunkState::Sealed,
-            zone_map,
+            zone_map: std::sync::OnceLock::new(),
             first_lsn: 0,
             last_lsn: 0,
             last_lsn_rows: 0,

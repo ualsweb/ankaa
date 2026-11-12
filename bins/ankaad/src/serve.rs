@@ -482,12 +482,14 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
         need_snapshot: Vec::new(),
         // kept next to the WAL when there is one (positions follow WAL durability), else
         // next to the segments
+        // (saved by a thread of their own: a save is two fsyncs, the committer the ingest loop)
         states: SourceStates::load(
             cfg.storage
                 .wal_dir
                 .as_deref()
                 .or(cfg.storage.checkpoint_dir.as_deref()),
-        )?,
+        )?
+        .with_background_saves()?,
         lsn: 0,
         recovering: false,
         positions_frozen: false,
@@ -1159,6 +1161,7 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     exit_err = Some(e);
                     break;
                 }
+                let tick_started = Instant::now();
                 // dictionaries first: a segment must never reference an id that is not persisted
                 let mut dicts_durable = true;
                 if ingest.dec.symbols().len() != symbols_saved {
@@ -1330,6 +1333,19 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     metrics.map_jobs.store(p.in_flight() as u64, Ordering::Relaxed);
                     metrics.map_jobs_total.store(p.jobs_total(), Ordering::Relaxed);
                 }
+                // The tick runs in the ingest loop: while it runs nothing is ingested. Its work
+                // grows with what arrived since the last one (rows copied for queries, chunks
+                // to hand to the encode threads), so under load it is spaced out: the next one
+                // comes no sooner than TICK_SPACING times what this one took, which keeps the
+                // loop at ingest for at least that share of the time. An idle or lightly
+                // loaded server ticks every `snapshot_ms` as configured.
+                let took = tick_started.elapsed();
+                let took_ns = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
+                metrics.last_tick_ns.store(took_ns, Ordering::Relaxed);
+                metrics.tick_ns_total.fetch_add(took_ns, Ordering::Relaxed);
+                snapshot_tick.reset_after(
+                    Duration::from_millis(cfg.storage.snapshot_ms).max(took * TICK_SPACING),
+                );
             }
             _ = log_tick.tick() => {
                 let s = ingest.dec.stats();
@@ -1600,6 +1616,10 @@ const BUSY_GAP: Duration = Duration::from_millis(1);
 /// Runs shorter than this are ingested in the loop itself when no job is out: at a trickle a job
 /// would only add two thread wake-ups per message.
 const MIN_PARALLEL_RUN: usize = 8;
+
+/// The snapshot tick may take at most one part in this many of the ingest loop's time: the next
+/// tick waits at least this many times the duration of the last one.
+const TICK_SPACING: u32 = 8;
 
 /// Log and ingest the frames in `inbox` (emptied), in order. With a WAL, a frame is ingested
 /// only once the log has taken it (the push waits for the log when it is behind), so tables

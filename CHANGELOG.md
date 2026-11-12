@@ -138,6 +138,13 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
 - Metrics for the threads added lately: `ankaa_ingest_workers`, `ankaa_ingest_map_jobs`,
   `ankaa_ingest_map_jobs_total` (mapping workers), `ankaa_tier_encode_jobs` and `ankaa_tier_errors_total`
   (encode threads; failed encodes and segment writes were only in the log).
+- Ingest no longer pauses for the snapshot tick. Measured with 1,000 partitions under load, a tick took
+  15 ms of the ingest loop every 50 ms: two `fsync`s to save source positions and the copy of new rows for
+  queries. Positions are now written by a thread of their own, a table's view is built on several threads,
+  the statistics of a chunk are computed by whoever first needs them (the encode thread or a query) instead
+  of at every seal and snapshot, and under load the next tick waits eight times what the last one took.
+  The tick is 3.5 ms; a load of 21-column rows went from 1.7 to 2.2 M rows/s on a laptop (development
+  signal). New metrics `ankaa_last_tick_ns`, `ankaa_tick_ns_total`.
 - Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
   could hand the last messages to the next start again.
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on

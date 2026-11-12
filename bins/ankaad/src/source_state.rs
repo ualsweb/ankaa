@@ -43,6 +43,127 @@ pub struct SourceStates {
     /// Positions waiting for their frames to become durable: `(lsn, id, state)`.
     pending: VecDeque<(u64, u16, String)>,
     dirty: bool,
+    /// Writes the file off the caller's thread ([`Self::with_background_saves`]).
+    saver: Option<Saver>,
+}
+
+/// A thread that writes the positions file, so that the two `fsync`s of a save (milliseconds
+/// each) are not paid by the ingest loop at every snapshot tick. It always writes the latest
+/// document it was given: one that arrives while another is being written waits, and replaces
+/// any that was still waiting. Positions are only ever handed over once their frames are
+/// durable, so the file may lag by one write and is never ahead.
+struct Saver {
+    shared: std::sync::Arc<(std::sync::Mutex<Slot>, std::sync::Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct Slot {
+    next: Option<Vec<u8>>,
+    writing: bool,
+    failed: bool,
+    stop: bool,
+}
+
+fn lock(m: &std::sync::Mutex<Slot>) -> std::sync::MutexGuard<'_, Slot> {
+    // every statement under the lock leaves the slot consistent
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Write `bytes` as `path`, atomically and durably (temporary file, `fsync`, rename, `fsync`
+/// of the directory).
+fn write_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let Some(dir) = path.parent() else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(dir)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::File::open(&tmp)?.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(dir)?.sync_all()
+}
+
+impl std::fmt::Debug for Saver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Saver")
+    }
+}
+
+impl Saver {
+    fn start(path: PathBuf) -> std::io::Result<Self> {
+        let shared = std::sync::Arc::new((
+            std::sync::Mutex::new(Slot::default()),
+            std::sync::Condvar::new(),
+        ));
+        let theirs = shared.clone();
+        let thread = std::thread::Builder::new()
+            .name("ankaa-positions".into())
+            .spawn(move || {
+                let (slot, wake) = &*theirs;
+                let mut s = lock(slot);
+                loop {
+                    if let Some(bytes) = s.next.take() {
+                        s.writing = true;
+                        drop(s);
+                        let result = write_file(&path, &bytes);
+                        s = lock(slot);
+                        s.writing = false;
+                        if let Err(e) = result {
+                            s.failed = true;
+                            warn!(error = %e, "source positions could not be saved; retrying");
+                        }
+                        wake.notify_all();
+                    } else if s.stop {
+                        return;
+                    } else {
+                        s = wake
+                            .wait(s)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                }
+            })?;
+        Ok(Self {
+            shared,
+            thread: Some(thread),
+        })
+    }
+
+    /// Hand over a document to write (replacing one that is still waiting).
+    fn submit(&self, bytes: Vec<u8>) {
+        let (slot, wake) = &*self.shared;
+        lock(slot).next = Some(bytes);
+        wake.notify_all();
+    }
+
+    /// Whether a write failed since the last call (the caller hands the document over again).
+    fn take_failed(&self) -> bool {
+        std::mem::take(&mut lock(&self.shared.0).failed)
+    }
+
+    /// Drop what is waiting and wait for a write in progress: after this the caller may write
+    /// the file itself.
+    fn quiesce(&self) {
+        let (slot, wake) = &*self.shared;
+        let mut s = lock(slot);
+        s.next = None;
+        while s.writing {
+            s = wake
+                .wait(s)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+}
+
+impl Drop for Saver {
+    fn drop(&mut self) {
+        let (slot, wake) = &*self.shared;
+        lock(slot).stop = true;
+        wake.notify_all();
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
 }
 
 impl SourceStates {
@@ -63,6 +184,7 @@ impl SourceStates {
             doc,
             pending: VecDeque::new(),
             dirty: false,
+            saver: None,
         })
     }
 
@@ -196,34 +318,94 @@ impl SourceStates {
             }
         }
         self.pending = keep;
+        if self.saver.as_ref().is_some_and(Saver::take_failed) {
+            self.dirty = true;
+        }
         if self.dirty {
-            match self.save() {
-                Ok(()) => self.dirty = false,
-                Err(e) => warn!(error = %e, "source positions could not be saved; retrying"),
+            if let (Some(saver), false) = (&self.saver, everything) {
+                // off this thread; a failure comes back as `take_failed`
+                match serde_json::to_vec_pretty(&self.doc) {
+                    Ok(bytes) => {
+                        saver.submit(bytes);
+                        self.dirty = false;
+                    }
+                    Err(e) => warn!(error = %e, "source positions could not be encoded"),
+                }
+            } else {
+                match self.save() {
+                    Ok(()) => self.dirty = false,
+                    Err(e) => warn!(error = %e, "source positions could not be saved; retrying"),
+                }
             }
         }
         applied
     }
 
+    /// Save positions on a thread of their own from now on (a save is two `fsync`s; the caller
+    /// is the ingest loop). Without a file there is nothing to do.
+    pub fn with_background_saves(mut self) -> std::io::Result<Self> {
+        if let Some(path) = &self.path {
+            self.saver = Some(Saver::start(path.clone())?);
+        }
+        Ok(self)
+    }
+
+    /// Write the file now, on this thread (the saver thread, if any, is made to stand by first:
+    /// two writers must never share the temporary file, and an older document must not land
+    /// after this one).
     fn save(&self) -> std::io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let Some(dir) = path.parent() else {
-            return Ok(());
-        };
-        std::fs::create_dir_all(dir)?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(&self.doc)?)?;
-        std::fs::File::open(&tmp)?.sync_all()?;
-        std::fs::rename(&tmp, path)?;
-        std::fs::File::open(dir)?.sync_all()
+        if let Some(saver) = &self.saver {
+            saver.quiesce();
+        }
+        write_file(path, &serde_json::to_vec_pretty(&self.doc)?)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With background saves a commit does not write the file itself; the file gets the latest
+    /// positions soon after, a commit of everything (shutdown) writes at once, and what a
+    /// restart reads is never ahead of what was committed.
+    #[test]
+    fn background_saves_write_the_latest_positions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = SourceStates::load(Some(dir.path()))
+            .unwrap()
+            .with_background_saves()
+            .unwrap();
+        let id = s.id_for("a").unwrap();
+        for lsn in 1..=200u64 {
+            s.note(id, &format!("0={lsn}"), lsn);
+            s.commit(lsn, false);
+        }
+        let read = || {
+            SourceStates::load(Some(dir.path()))
+                .unwrap()
+                .position(id)
+                .map(str::to_owned)
+        };
+        let t0 = std::time::Instant::now();
+        while read().as_deref() != Some("0=200") {
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(10),
+                "{:?}",
+                read()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // shutdown: written by the time the call returns, and nothing older lands after it
+        s.note(id, "0=201", 201);
+        s.note(id, "0=202", 0);
+        s.commit(201, true);
+        assert_eq!(read().as_deref(), Some("0=202"));
+        drop(s);
+        assert_eq!(read().as_deref(), Some("0=202"));
+    }
 
     #[test]
     fn ids_are_stable_and_positions_wait_for_durability() {

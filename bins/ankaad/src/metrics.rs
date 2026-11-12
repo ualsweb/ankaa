@@ -180,6 +180,10 @@ pub struct Metrics {
     pub replication_last_receive_ms: AtomicU64,
     /// Frames too large for the WAL (dropped, not ingested).
     pub wal_oversized: AtomicU64,
+    /// Time the last snapshot tick took in the ingest loop, and the sum over all ticks, ns.
+    pub last_tick_ns: AtomicU64,
+    /// See [`Self::last_tick_ns`].
+    pub tick_ns_total: AtomicU64,
     /// Mapping workers, runs of frames out on them, and runs handed out since the start.
     pub ingest_workers: AtomicU64,
     /// See [`Self::ingest_workers`].
@@ -402,6 +406,18 @@ impl Metrics {
             "Size of the write-ahead log on disk (refreshed every 5 s)",
             "gauge",
             g(&self.wal_bytes),
+        );
+        m(
+            "ankaa_last_tick_ns",
+            "Time the last snapshot tick took in the ingest loop (publishing rows to queries, tiering, checkpoints)",
+            "gauge",
+            g(&self.last_tick_ns),
+        );
+        m(
+            "ankaa_tick_ns_total",
+            "Time spent in snapshot ticks; divide by ankaa_snapshots_total for the mean, by time for the share of the ingest loop",
+            "counter",
+            g(&self.tick_ns_total),
         );
         m(
             "ankaa_ingest_workers",

@@ -382,7 +382,8 @@ impl Partition {
         );
         self.next_id += 1;
         self.open_since = None;
-        done.seal();
+        // (its statistics are computed by whoever first needs them: the encode thread or a query)
+        done.mark_sealed();
         self.open.set_watermark(done.watermark());
         self.sealed.push(ChunkRef::Hot(Arc::new(done)));
         self.stats.sealed_chunks += 1;
@@ -572,6 +573,38 @@ pub struct TableSnapshot {
     /// Minimum watermark across non-empty partitions (`i64::MIN` when the table is empty):
     /// queries that need read-committed-across-partitions semantics read up to this.
     pub min_watermark: i64,
+}
+
+/// Fewest partitions for which a snapshot is built on several threads (starting them costs
+/// more than the views of a few partitions).
+const PARALLEL_SNAPSHOT_PARTITIONS: usize = 256;
+
+/// Threads a snapshot of `partitions` partitions is built on: one per 128 partitions, at most
+/// 8 and at most the cores of the machine less one for whoever else is running.
+fn snapshot_threads(partitions: usize) -> usize {
+    if partitions < PARALLEL_SNAPSHOT_PARTITIONS {
+        return 1;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    (partitions / 128)
+        .min(8)
+        .min(cores.saturating_sub(1))
+        .max(1)
+}
+
+/// The chunks queries see of `parts`, in order, and the smallest watermark of the partitions
+/// that hold rows (`i64::MAX` when none does).
+fn snapshot_of(parts: &[Partition]) -> (Vec<ChunkRef>, i64) {
+    let mut chunks = Vec::new();
+    let mut min_wm = i64::MAX;
+    for p in parts {
+        let wm = p.watermark();
+        if wm != i64::MIN {
+            min_wm = min_wm.min(wm);
+        }
+        chunks.extend(p.snapshot_chunks());
+    }
+    (chunks, min_wm)
 }
 
 impl Table {
@@ -865,22 +898,39 @@ impl Table {
     #[must_use]
     pub fn snapshot(&self) -> TableSnapshot {
         let parts = self.partitions.read();
-        let mut chunks = Vec::new();
-        let mut min_wm = i64::MAX;
-        let mut any = false;
-        for p in parts.iter() {
-            let wm = p.watermark();
-            if wm != i64::MIN {
-                any = true;
+        // The view of a partition that received rows copies those rows (see `OpenView`). With
+        // many partitions that is most of what a snapshot costs, and the caller is the ingest
+        // loop: the partitions are split among a few threads, each building the views of its
+        // share, and the lists are put together in partition order.
+        let threads = snapshot_threads(parts.len());
+        let (chunks, min_wm) = if threads <= 1 {
+            snapshot_of(&parts)
+        } else {
+            let per = parts.len().div_ceil(threads);
+            let pieces: Vec<(Vec<ChunkRef>, i64)> = std::thread::scope(|scope| {
+                let handles: Vec<_> = parts
+                    .chunks(per)
+                    .map(|share| scope.spawn(move || snapshot_of(share)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap_or_else(|e| std::panic::resume_unwind(e)))
+                    .collect()
+            });
+            let mut chunks = Vec::with_capacity(pieces.iter().map(|(c, _)| c.len()).sum());
+            let mut min_wm = i64::MAX;
+            for (c, wm) in pieces {
+                chunks.extend(c);
                 min_wm = min_wm.min(wm);
             }
-            chunks.extend(p.snapshot_chunks());
-        }
+            (chunks, min_wm)
+        };
         TableSnapshot {
             name: self.name.clone(),
             schema: self.schema.clone(),
             chunks,
-            min_watermark: if any { min_wm } else { i64::MIN },
+            // (`i64::MAX`: no partition holds a row)
+            min_watermark: if min_wm == i64::MAX { i64::MIN } else { min_wm },
         }
     }
 
