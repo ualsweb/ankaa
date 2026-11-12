@@ -2,6 +2,13 @@
 
 All notable changes are recorded here. The project is pre-alpha: interfaces may change between releases.
 
+## Unreleased
+
+- Fixed: a `.dbn` file whose header declares more metadata than the file holds is refused when it is opened
+  (`dbn: the header declares … bytes of metadata`). Before, the reader reserved the declared length first, so
+  an 11-byte damaged file made `ankaad replay` ask for 4 GiB. Found by the nightly `dbn_replay` fuzz run;
+  a compressed file is held to 1 GiB of metadata. The `fuzz-smoke` workflow can now be started by hand.
+
 ## 0.2.0 — 2026-11-12
 
 The telemetry release: more ways in (MQTT over TLS, Sparkplug B, line protocol, several readings per

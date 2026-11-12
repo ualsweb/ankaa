@@ -71,11 +71,63 @@ pub enum DbnError {
     /// Timestamp outside the representable range.
     #[error("timestamp {0} out of range")]
     Timestamp(u64),
+    /// The header declares more metadata than the file can hold.
+    #[error(
+        "dbn: the header declares {declared} bytes of metadata, more than the {limit} this file can hold"
+    )]
+    Metadata {
+        /// Metadata length read from the header.
+        declared: u64,
+        /// The most this file could carry.
+        limit: u64,
+    },
+}
+
+/// Largest metadata section accepted from a compressed file. A plain file is bounded by its own
+/// size; of a compressed one only the compressed size is known.
+const MAX_METADATA_BYTES: u64 = 1 << 30;
+
+/// Refuses a file whose header declares more metadata than the file can hold. The `dbn` decoder
+/// reserves the declared length before it reads the section, so eleven bytes of a damaged or
+/// hostile file would otherwise ask for 4 GiB.
+fn check_prelude(path: &Path) -> Result<(), DbnError> {
+    use std::io::Read as _;
+    let io = |e: std::io::Error| DbnError::Dbn(dbn::Error::io(e, "reading the DBN header"));
+    let mut reader = dbn::decode::DynReader::from_file(path)?;
+    // "DBN", the version, the metadata length (little endian)
+    let mut prelude = [0u8; 8];
+    let mut got = 0;
+    while got < prelude.len() {
+        match reader.read(&mut prelude[got..]) {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(io(e)),
+        }
+    }
+    if got < prelude.len() || &prelude[..3] != b"DBN" {
+        // not a DBN stream (or a legacy one): the decoder says what is wrong with it
+        return Ok(());
+    }
+    let declared = u64::from(u32::from_le_bytes([
+        prelude[4], prelude[5], prelude[6], prelude[7],
+    ]));
+    let limit = if reader.is_compressed() {
+        MAX_METADATA_BYTES
+    } else {
+        let len = std::fs::metadata(path).map_err(io)?.len();
+        len.saturating_sub(prelude.len() as u64)
+    };
+    if declared > limit {
+        return Err(DbnError::Metadata { declared, limit });
+    }
+    Ok(())
 }
 
 impl DbnReplay {
     /// Open a `.dbn` or `.dbn.zst` file (compression is inferred).
     pub fn open(path: &Path) -> Result<Self, DbnError> {
+        check_prelude(path)?;
         let dec = DynDecoder::from_file(path, VersionUpgradePolicy::UpgradeToV3)?;
         let dataset = dec.metadata().dataset.clone();
         Ok(Self {
@@ -328,6 +380,46 @@ mod tests {
             }],
         };
         enc.encode_record(&m).unwrap();
+    }
+
+    /// The input the fuzzer found: a header that declares 4 GiB of metadata in an 11-byte file.
+    #[test]
+    fn a_header_that_declares_more_metadata_than_the_file_holds_is_refused() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.dbn");
+        std::fs::write(&path, [68, 66, 78, 1, 181, 47, 40, 253, 114, 70, 10]).unwrap();
+        match DbnReplay::open(&path) {
+            Err(DbnError::Metadata { declared, limit }) => {
+                assert_eq!(declared, 0xFD28_2FB5);
+                assert_eq!(limit, 3);
+            }
+            other => panic!("expected the header to be refused, got {other:?}"),
+        }
+
+        // the same header inside a compressed file: only the cap applies
+        let zst = dir.path().join("bad.dbn.zst");
+        let mut w = dbn::encode::DynWriter::new(
+            std::fs::File::create(&zst).unwrap(),
+            dbn::Compression::Zstd,
+        )
+        .unwrap();
+        w.write_all(&[68, 66, 78, 1, 0xFF, 0xFF, 0xFF, 0xFF, 0, 0, 0])
+            .unwrap();
+        w.flush().unwrap();
+        drop(w);
+        assert!(matches!(
+            DbnReplay::open(&zst),
+            Err(DbnError::Metadata {
+                declared: 0xFFFF_FFFF,
+                limit: MAX_METADATA_BYTES
+            })
+        ));
+
+        // a short or foreign file still gets the decoder's own error
+        let short = dir.path().join("short.dbn");
+        std::fs::write(&short, b"DBN\x01").unwrap();
+        assert!(matches!(DbnReplay::open(&short), Err(DbnError::Dbn(_))));
     }
 
     #[test]

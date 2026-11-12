@@ -9,6 +9,7 @@ on:
       - "fuzz/**"
   schedule:
     - cron: "17 2 * * *"
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
