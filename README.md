@@ -118,7 +118,7 @@ What it shows and how to point it at your own broker: [`examples/factory`](examp
 ![Grafana dashboard of the factory demo: readings stored, missing values, power per machine, live 1-minute bars and temperature quantiles, all read from ANKAA over the Postgres protocol](docs/assets/factory-dashboard.png)
 
 <details>
-<summary>The same data from a terminal (55-second recording)</summary>
+<summary>The same data from a terminal (60-second recording)</summary>
 
 ![Terminal recording: topic segments mapped to columns, rows growing live, NULL readings counted, live bars, late gateway readings accepted](docs/assets/factory-demo.gif)
 
