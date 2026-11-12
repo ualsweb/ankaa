@@ -74,7 +74,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "serde",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-feeds"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-core",
  "ankaa-ingest",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-flight"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-core",
  "ankaa-sql",
@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-ingest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-store",
  "foldhash 0.2.0",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-pg"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-core",
  "ankaa-sql",
@@ -171,7 +171,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-ring"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crossbeam-utils",
  "loom",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-simd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "proptest",
@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-sql"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-feeds",
  "ankaa-ingest",
@@ -209,7 +209,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-simd",
  "parking_lot",
@@ -220,7 +220,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-tier"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-store",
  "arrow",
@@ -234,11 +234,11 @@ dependencies = [
 
 [[package]]
 name = "ankaa-time"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "ankaa-ts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "proptest",
  "thiserror 2.0.21",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-wal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32c",
  "proptest",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-wire"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "proptest",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "ankaad"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-core",
  "ankaa-feeds",

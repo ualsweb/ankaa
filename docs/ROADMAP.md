@@ -41,7 +41,7 @@ Profiling passes are recorded under `docs/benchmarks/`. Pass 1 (2026-11-09): dec
 |---|---|
 | SVE2 for all kernels (10 kernels, VL 128/256/512, branchless gate) | done |
 | ALP/FastLanes warm/cold tier (Vortex) | done |
-| Reproducible benchmark harness vs QuestDB, ClickHouse, DuckDB (`bench/compare`, method doc) | harness done; **numbers: open, Graviton4** |
+| Reproducible benchmark harness vs QuestDB, ClickHouse, DuckDB (`bench/compare`, method doc) | harness done; first numbers on a 4-vCPU Axion VM published (`docs/benchmarks/2026-11-10-axion-first-light.md`); **Graviton4 and larger machines: open** |
 | Public launch (repo push, write-ups, Arm Learning Path) | open; steps in `docs/launch-checklist.md` |
 
 ## Phase 3 — Partners and showcase
@@ -72,7 +72,15 @@ Profiling passes are recorded under `docs/benchmarks/`. Pass 1 (2026-11-09): dec
 | Ingest engine: batched hand-off to the write-ahead log, one table lock per message, interrupt moderation of the ingest loop and the log thread (profiled end to end on Google Axion) | done (2026-11-11) |
 | Adding nullable columns to a table (and making a column nullable) without losing its history: old segments read as the new schema, nothing rewritten | done (2026-11-11) |
 | Gap filling and interpolation in SQL: `gapfill()` with `null`, `locf` and `linear` fills, seven aggregates, optional range; verified against DataFusion's own grouping | done (2026-11-11) |
-| Next for telemetry: downsampled continuous-query outputs that outlive raw retention; a TSBS-shaped comparison with InfluxDB 3, TimescaleDB and QuestDB | planned |
+| TSBS-shaped comparison with InfluxDB 3 Core, TimescaleDB and QuestDB (`bench/telemetry`), every answer verified against DuckDB; function-level profile (`scripts/profile-telemetry.sh`) | done on a 4-vCPU Axion VM (2026-11-11, `docs/benchmarks/2026-11-11-axion-telemetry-comparison.md`); larger machines, 100k series and concurrent load: open |
+| `dict` columns as names in SQL (RFC-0002), `latest()`, predicates on names answered over the dictionary | done (2026-11-11) |
+| Flight SQL (ADBC, JDBC), Kafka over TLS with SASL | done (2026-11-11) |
+| Storage from the profile: compaction of small chunks, row-range decoding of compressed chunks, segment cache, newest row per chunk in metadata | done (2026-11-11) |
+| Parallel ingest (RFC-0001): mapping workers (stage 1) and writers per partition group (stage 2); the snapshot tick off the critical path | done (2026-11-12); **scaling curve on a 48 to 72-core Arm machine: open**; shared dictionary interning and one log per group: later |
+| Next for ingest: columnar append of mapped runs, parallel sources (MQTT shared subscriptions, Kafka partitions, chunked files), memory returned after a load | planned |
+| Next for queries: cheaper planning of small queries (physical-plan reuse), streaming `percentiles`, dictionary batches over Flight for clients that ask | planned |
+| Next for telemetry: downsampled continuous-query outputs that outlive raw retention | planned |
+| Access control: users and roles, TLS on the PostgreSQL listener and `/metrics` | planned |
 | Continuous queries: incremental OHLCV, quantiles, rolling windows, ASOF as `cq_*` tables (`docs/continuous-queries.md`) | done; event time with the table's lateness window; no retraction of closed results (rows later than that are counted) |
 | Replication: WAL shipping over Flight to a read-only standby, manual promotion (`docs/replication.md`) | done; asynchronous, no election, no split-brain protection |
 | Distributed queries across nodes | design note only: scale up on one Arm socket first |

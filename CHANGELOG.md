@@ -1,23 +1,27 @@
 # Changelog
 
-All notable changes are recorded here. The project is pre-alpha; there are no releases yet.
+All notable changes are recorded here. The project is pre-alpha: interfaces may change between releases.
 
-## 0.1.0 — first public release
-- A general telemetry base, not only a market-data engine:
-  - **Missing values.** Columns may be declared `nullable`; a missing JSON field, a JSON `null` or an empty CSV
-    field is stored as SQL `NULL` (a validity bitmap next to the column) and kept through the WAL, the warm and cold
-    tiers and recovery. Aggregates, statistics shortcuts, table functions and continuous queries skip it.
-  - **Late data.** `max_lateness_ms` per table inserts readings that arrive out of order at their place in time
-    instead of dropping them; continuous queries run in event time with the same window and rebuild to identical
-    results after a crash.
-  - **Retention.** `retention = "90d"` per table (`storage.market_retention` for the market tables), measured from
-    the newest reading; whole chunks are dropped from every tier and their segment files deleted once no query holds
-    them. New metrics `ankaa_retention_*`.
-  - **MQTT source** (`kind = "mqtt"`): QoS 1 with a persistent session, acknowledged after hand-off to the engine,
-    `$topic` / `$topic.N` selectors to take plant, line or machine from the topic. Tested against Mosquitto in CI.
-  - **Many devices.** The schema is shared rather than copied per partition and chunk; a scale test with 100,000
-    devices in one table is in `crates/ankaa-store/tests/scale.rs`.
-- Project website under `site/`, published by GitHub Pages (`.github/workflows/pages.yml`).
+## 0.2.0 — 2026-11-12
+
+The telemetry release: more ways in (MQTT over TLS, Sparkplug B, line protocol, several readings per
+message, Kafka with TLS and SASL), names instead of ids in SQL, Flight SQL, ingest on several cores, and
+the storage and query changes that came out of profiling the TSBS workload against other engines
+(`docs/benchmarks/2026-11-11-axion-telemetry-comparison.md`).
+
+**Upgrading from 0.1.0.** The segment and log formats did not change (the new chunk metadata is optional). One change breaks
+queries: `dict` columns are text in SQL (first entry below).
+
+- **Breaking: `dict` columns (and `symbol`) are text in SQL** (RFC-0002,
+  `docs/rfc/0002-dictionary-columns-as-names.md`). `WHERE machine = 'press03'`, `GROUP BY line` and results
+  with names, without joining `dictionaries` or `symbols`. Clients receive ordinary strings (`Utf8` over Flight
+  and Flight SQL, `text` over the Postgres protocol); inside the engine the column is `Dictionary(UInt32, Utf8)`. The engine still works on the ids: `=`, `<>`, `IN`, `NOT IN` against string
+  literals are translated to ids and decided per chunk from its id range, grouping hashes ids, and every batch
+  references one shared array of names per dictionary. Table functions and continuous-query tables return
+  their key as names. A query that joined `dictionaries`/`symbols` on the id now stops with a cast
+  error: drop the join, or set `server.dict_columns = "ids"` (`ankaad serve --dict-ids`) to keep numeric
+  columns. `ankaad replay` and the Python capture session still show ids. Storage, log and segment formats are
+  unchanged.
 - MQTT over TLS: `mqtts://` sources with TLS 1.3/1.2 (rustls, aws-lc-rs), the broker checked against the
   public roots or only a private CA (`tls_ca`), and client certificates (`tls_cert`, `tls_key`); files
   checked at start. Tested against Mosquitto with TLS and mutual TLS in CI
@@ -85,16 +89,6 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   and write their segments; the tick hands over every chunk that is due and swaps in the finished ones.
   Before, tiering had 5 % of one core (about 60 MB/s of rows), far below what ingest produces under load.
   A segment finished for a chunk that retention dropped meanwhile is deleted, never attached.
-- **Breaking: `dict` columns (and `symbol`) are text in SQL** (RFC-0002,
-  `docs/rfc/0002-dictionary-columns-as-names.md`). `WHERE machine = 'press03'`, `GROUP BY line` and results
-  with names, without joining `dictionaries` or `symbols`. Clients receive ordinary strings (`Utf8` over Flight
-  and Flight SQL, `text` over the Postgres protocol); inside the engine the column is `Dictionary(UInt32, Utf8)`. The engine still works on the ids: `=`, `<>`, `IN`, `NOT IN` against string
-  literals are translated to ids and decided per chunk from its id range, grouping hashes ids, and every batch
-  references one shared array of names per dictionary. Table functions and continuous-query tables return
-  their key as names. A query that joined `dictionaries`/`symbols` on the id now stops with a cast
-  error: drop the join, or set `server.dict_columns = "ids"` (`ankaad serve --dict-ids`) to keep numeric
-  columns. `ankaad replay` and the Python capture session still show ids. Storage, log and segment formats are
-  unchanged.
 - Flight SQL on the Flight port, read-only, so ADBC drivers and the Flight SQL JDBC driver can connect. The
   existing service recognises Flight SQL commands (a protobuf `Any` in the descriptor, ticket or action body)
   and answers them; plain Flight (`ankaad query`, the Python package) is unchanged. Supported: statements,
@@ -154,6 +148,23 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   (`ankaa_ingest_wait_frames_ns_total`, `…_workers_…`, `…_coalesce_…`).
 - Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
   could hand the last messages to the next start again.
+
+## 0.1.0 — first public release
+- A general telemetry base, not only a market-data engine:
+  - **Missing values.** Columns may be declared `nullable`; a missing JSON field, a JSON `null` or an empty CSV
+    field is stored as SQL `NULL` (a validity bitmap next to the column) and kept through the WAL, the warm and cold
+    tiers and recovery. Aggregates, statistics shortcuts, table functions and continuous queries skip it.
+  - **Late data.** `max_lateness_ms` per table inserts readings that arrive out of order at their place in time
+    instead of dropping them; continuous queries run in event time with the same window and rebuild to identical
+    results after a crash.
+  - **Retention.** `retention = "90d"` per table (`storage.market_retention` for the market tables), measured from
+    the newest reading; whole chunks are dropped from every tier and their segment files deleted once no query holds
+    them. New metrics `ankaa_retention_*`.
+  - **MQTT source** (`kind = "mqtt"`): QoS 1 with a persistent session, acknowledged after hand-off to the engine,
+    `$topic` / `$topic.N` selectors to take plant, line or machine from the topic. Tested against Mosquitto in CI.
+  - **Many devices.** The schema is shared rather than copied per partition and chunk; a scale test with 100,000
+    devices in one table is in `crates/ankaa-store/tests/scale.rs`.
+- Project website under `site/`, published by GitHub Pages (`.github/workflows/pages.yml`).
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on
   `ghcr.io` built from the release binaries), release binaries for Linux arm64/x86-64 and macOS arm64
   (`.github/workflows/release.yml`), and `examples/factory/`: one `docker compose up` for an MQTT plant,

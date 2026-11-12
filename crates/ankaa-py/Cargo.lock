@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
  "serde",
@@ -52,7 +52,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-feeds"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-core",
  "ankaa-ingest",
@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-flight"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-core",
  "ankaa-sql",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-ingest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-store",
  "foldhash 0.2.0",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-core",
  "ankaa-feeds",
@@ -118,14 +118,14 @@ dependencies = [
 
 [[package]]
 name = "ankaa-simd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "ankaa-sql"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-simd",
  "ankaa-store",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ankaa-simd",
  "parking_lot",
@@ -152,14 +152,14 @@ dependencies = [
 
 [[package]]
 name = "ankaa-ts"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "ankaa-wal"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "crc32c",
  "thiserror",
