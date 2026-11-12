@@ -60,6 +60,8 @@ pub struct MapPool {
     next_seq: u64,
     apply_seq: u64,
     waiting: BTreeMap<u64, Done>,
+    /// Time the ingest loop was blocked in [`Self::next`] for a result it needed, ns.
+    waited_ns: u64,
 }
 
 impl MapPool {
@@ -91,6 +93,7 @@ impl MapPool {
             next_seq: 0,
             apply_seq: 0,
             waiting: BTreeMap::new(),
+            waited_ns: 0,
         })
     }
 
@@ -146,13 +149,24 @@ impl MapPool {
             if let Some(d) = self.pop_ready() {
                 return Ok(Some(d));
             }
-            match self.done_rx.recv().await {
+            let blocked = std::time::Instant::now();
+            let got = self.done_rx.recv().await;
+            self.waited_ns = self
+                .waited_ns
+                .saturating_add(u64::try_from(blocked.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            match got {
                 Some(d) => {
                     self.waiting.insert(d.seq, d);
                 }
                 None => anyhow::bail!("a mapping worker stopped"),
             }
         }
+    }
+
+    /// Time the ingest loop has been blocked waiting for a mapped run it needed next (the
+    /// queues were full, or a tick had to see everything applied), ns.
+    pub fn waited_ns(&self) -> u64 {
+        self.waited_ns
     }
 
     /// Wait for any result to arrive (for a `select!` branch; take it with [`Self::try_next`]).

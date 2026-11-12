@@ -1491,6 +1491,47 @@ impl Mapped {
         Ok(Parsed { ts, key })
     }
 
+    /// True when a row that is not refused holds a dictionary value that has no id yet (after
+    /// [`Self::resolve`]: a value its dictionary has never seen). Such a message has to be
+    /// taken row by row with [`Self::finish_row`], which gives the ids in order; one without
+    /// can be read by several threads at once ([`Self::row`]). A refused row (malformed, or
+    /// its value did not fit a full dictionary) is never stored, so what it left pending does
+    /// not count.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        let ncols = self.schema.fields().len();
+        // the usual answer in one pass over the flags: nothing is pending anywhere
+        if self
+            .pending_set
+            .get(..self.n_rows * ncols)
+            .is_some_and(|p| !p.contains(&true))
+        {
+            return false;
+        }
+        (0..self.n_rows).any(|r| {
+            self.row_err.get(r).is_none_or(Option::is_none)
+                && self
+                    .pending_set
+                    .get(r * ncols..(r + 1) * ncols)
+                    .is_none_or(|p| p.contains(&true))
+        })
+    }
+
+    /// Partition key and values of row `r` of a message without pending values
+    /// ([`Self::has_pending`] is false). Nothing is changed: threads may read rows of one
+    /// message at the same time.
+    #[must_use]
+    pub fn row(&self, r: usize) -> (u32, &[Value]) {
+        let ncols = self.schema.fields().len();
+        let base = r * ncols;
+        let row = self.rows.get(base..base + ncols).unwrap_or(&[]);
+        let key = match self.partition_col.and_then(|i| row.get(i)) {
+            Some(Value::U32(k)) => *k,
+            _ => 0,
+        };
+        (key, row)
+    }
+
     /// Take row `r`: add its new dictionary values and return its partition key and values.
     /// Call it only once the row is going to be stored.
     pub fn finish_row(&mut self, r: usize, dicts: &mut [Option<SymbolDict>]) -> (u32, &[Value]) {

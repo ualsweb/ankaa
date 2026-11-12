@@ -64,6 +64,8 @@ struct Ingest {
     need_snapshot: Vec<SymbolId>,
     /// Source ids and read positions.
     states: SourceStates,
+    /// Writer threads (RFC-0001 stage 2), when `storage.ingest_writers` asks for them.
+    writers: Option<crate::write_pool::WritePool>,
     /// LSN of the frame being handled (0 = not in the WAL).
     lsn: u64,
     /// True while the WAL is being replayed at start.
@@ -109,6 +111,9 @@ impl Ingest {
     /// [`Self::handle_frame_lsn`] without publishing the counters: for frames handled in a
     /// batch, which calls [`Self::flush_tally`] once at its end.
     fn handle_frame_lsn_batched(&mut self, frame: &Frame, lsn: u64) {
+        // a frame handled here must find everything before it in the tables: the writer
+        // threads finish what they hold (nothing, almost always: one check)
+        self.finish_writes(None, true);
         self.tables.set_lsn(lsn);
         self.lsn = lsn;
         self.handle_frame(frame);
@@ -137,6 +142,30 @@ impl Ingest {
             mapped,
             ..
         } = job;
+        // a run large enough to be worth it goes to the writer threads when it can
+        let mapped = match self.writers.as_mut() {
+            Some(w) if frames.len() >= MIN_WRITER_RUN => {
+                match self
+                    .tables
+                    .submit_run(w, worker, &frames, first_lsn, step, mapped)
+                {
+                    Ok(()) => {
+                        // the run is on its way: the log position is its last record
+                        let last = first_lsn + step * (frames.len() as u64).saturating_sub(1);
+                        self.tables.set_lsn(last);
+                        self.lsn = last;
+                        // (what is already stored is counted without waiting)
+                        self.finish_writes(Some(pool), false);
+                        return;
+                    }
+                    Err(mapped) => mapped,
+                }
+            }
+            _ => mapped,
+        };
+        // row by row from here: the writers finish what they hold first, so that every
+        // partition gets its rows in log order
+        self.finish_writes(Some(pool), true);
         let mut lsn = first_lsn;
         for (frame, m) in frames.iter().zip(mapped) {
             match (m, ankaa_feeds::capture::split_user_payload(&frame.payload)) {
@@ -161,6 +190,34 @@ impl Ingest {
                 _ => self.handle_frame_lsn_batched(frame, lsn),
             }
             lsn += step;
+        }
+        self.flush_tally();
+    }
+
+    /// Count the runs the writer threads have stored and give their buffers back to the mapping
+    /// workers; with `wait`, every run handed to them so far (the tables then hold everything
+    /// that was dispatched).
+    fn finish_writes(&mut self, pool: Option<&crate::map_pool::MapPool>, wait: bool) {
+        let Some(w) = self.writers.as_mut() else {
+            return;
+        };
+        if w.outstanding() == 0 {
+            return;
+        }
+        let finished = match w.collect(wait) {
+            Ok(f) => f,
+            // a writer thread is gone: rows of a logged run may be missing from the tables
+            Err(e) => panic!("ingest writers failed: {e}"),
+        };
+        for (run, tallies) in finished {
+            let worker = run.worker;
+            for (source_id, out, m) in self.tables.account_run(run, tallies) {
+                self.tally.frames += 1;
+                self.note_user(source_id, out);
+                if let Some(pool) = pool {
+                    pool.recycle(worker, source_id, m);
+                }
+            }
         }
         self.flush_tally();
     }
@@ -490,6 +547,7 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 .or(cfg.storage.checkpoint_dir.as_deref()),
         )?
         .with_background_saves()?,
+        writers: None,
         lsn: 0,
         recovering: false,
         positions_frozen: false,
@@ -893,6 +951,15 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     } else {
         None
     };
+    // writer threads (RFC-0001 stage 2): they take runs the mapping workers produced
+    let writers = cfg.storage.ingest_writers.unwrap_or_else(|| {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        if cores >= 8 { (cores / 4).min(8) } else { 0 }
+    });
+    if pool.is_some() && writers >= 2 {
+        ingest.writers = Some(crate::write_pool::WritePool::start(writers)?);
+        info!(writers, "ingest writers started");
+    }
     let coalesce = Duration::from_micros(cfg.storage.ingest_coalesce_us);
     let mut last_wake = Instant::now()
         .checked_sub(BUSY_GAP)
@@ -1003,6 +1070,9 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
     let mut snapshot_backoff: std::collections::HashMap<String, tokio::time::Instant> =
         std::collections::HashMap::new();
 
+    // when the ingest loop last finished something: the time from there to the next frames is
+    // time it waited for the sources
+    let mut loop_free = Instant::now();
     let mut snapshot_tick = tokio::time::interval(Duration::from_millis(cfg.storage.snapshot_ms));
     let mut log_tick = tokio::time::interval(Duration::from_secs(10));
     let deadline = opts.duration.map(|d| tokio::time::Instant::now() + d);
@@ -1102,10 +1172,15 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                         ingest.apply_mapped_job(p, done);
                     }
                 }
+                loop_free = Instant::now();
             }
             n = rx.recv_many(&mut inbox, INGEST_BATCH) => {
                 if n == 0 { warn!("source ended"); break; }
                 let woke = Instant::now();
+                metrics.wait_frames_ns.fetch_add(
+                    u64::try_from(woke.duration_since(loop_free).as_nanos()).unwrap_or(u64::MAX),
+                    Ordering::Relaxed,
+                );
                 let busy = woke.duration_since(last_wake) < BUSY_GAP;
                 last_wake = woke;
                 let is_connect = match ingest_frames(&mut ingest, wal.as_ref(), &metrics, &mut inbox, &mut pool).await {
@@ -1152,7 +1227,12 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 // A full batch means a backlog: no wait. A quiet source: no wait either.
                 if busy && n < INGEST_BATCH && !coalesce.is_zero() {
                     std::thread::sleep(coalesce);
+                    metrics.wait_coalesce_ns.fetch_add(
+                        u64::try_from(coalesce.as_nanos()).unwrap_or(u64::MAX),
+                        Ordering::Relaxed,
+                    );
                 }
+                loop_free = Instant::now();
             }
             _ = snapshot_tick.tick() => {
                 // everything logged so far is applied before positions, definitions and
@@ -1332,6 +1412,11 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                     metrics.ingest_workers.store(p.workers() as u64, Ordering::Relaxed);
                     metrics.map_jobs.store(p.in_flight() as u64, Ordering::Relaxed);
                     metrics.map_jobs_total.store(p.jobs_total(), Ordering::Relaxed);
+                    metrics.wait_workers_ns.store(p.waited_ns(), Ordering::Relaxed);
+                    metrics.ingest_writers.store(
+                        ingest.writers.as_ref().map_or(0, |w| w.writers() as u64),
+                        Ordering::Relaxed,
+                    );
                 }
                 // The tick runs in the ingest loop: while it runs nothing is ingested. Its work
                 // grows with what arrived since the last one (rows copied for queries, chunks
@@ -1346,6 +1431,7 @@ pub async fn serve(opts: ServeOpts) -> anyhow::Result<()> {
                 snapshot_tick.reset_after(
                     Duration::from_millis(cfg.storage.snapshot_ms).max(took * TICK_SPACING),
                 );
+                loop_free = Instant::now();
             }
             _ = log_tick.tick() => {
                 let s = ingest.dec.stats();
@@ -1617,6 +1703,10 @@ const BUSY_GAP: Duration = Duration::from_millis(1);
 /// would only add two thread wake-ups per message.
 const MIN_PARALLEL_RUN: usize = 8;
 
+/// Fewest frames in a mapped run for the writer threads to take it: handing a run over and
+/// waiting for it costs two thread wake-ups per writer.
+const MIN_WRITER_RUN: usize = 128;
+
 /// The snapshot tick may take at most one part in this many of the ingest loop's time: the next
 /// tick waits at least this many times the duration of the last one.
 const TICK_SPACING: u32 = 8;
@@ -1733,6 +1823,8 @@ async fn drain_pool(ingest: &mut Ingest, pool: &mut Option<MapPool>) -> anyhow::
         while let Some(done) = p.next().await? {
             ingest.apply_mapped_job(p, done);
         }
+        // and what the writer threads still hold
+        ingest.finish_writes(Some(p), true);
     }
     Ok(())
 }
@@ -1850,6 +1942,7 @@ mod tests {
             metrics: Arc::new(Metrics::default()),
             need_snapshot: Vec::new(),
             states: SourceStates::load(None).unwrap(),
+            writers: None,
             lsn: 0,
             recovering: false,
             positions_frozen: false,
@@ -2014,6 +2107,179 @@ mod tests {
         let names = |t: &Tables| t.user[0].dicts[1].as_ref().unwrap().names().to_vec();
         assert_eq!(names(&direct), ["a", "b", "c"]);
         assert_eq!(names(&pooled), names(&direct));
+    }
+
+    /// The writer threads store exactly what the ingest loop stores row by row: the same rows
+    /// in every partition in the same order, the same dictionaries and the same counts, for a
+    /// stream with rows out of order (stale and late), rows from the future, malformed rows,
+    /// devices seen for the first time in the middle of a run and a dictionary that fills up.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn writer_threads_store_what_one_thread_stores() {
+        use ankaa_ingest::generic::LineProtocol;
+        use ankaa_store::{ChunkRef, ColumnType, Field, Schema};
+        let tables = || {
+            let mut t = Tables::new(false);
+            let schema = Schema::new(vec![
+                Field::new("ts", ColumnType::TimestampNs),
+                Field::new("host", ColumnType::DictU32),
+                Field::new("site", ColumnType::DictU32),
+                Field::nullable("usage", ColumnType::Float64),
+            ])
+            .unwrap();
+            // rows may be up to 50 ns late
+            let table = t.add_user_table("cpu", schema.clone(), Some("host"), 50);
+            let mapper = RowMapper::new(
+                schema,
+                &std::collections::HashMap::new(),
+                false,
+                TsUnit::Nanos,
+                false,
+                Some("host"),
+            )
+            .unwrap()
+            .with_max_dict_entries(20)
+            .with_line_protocol(Some(&LineProtocol::default()))
+            .unwrap();
+            t.add_source(0, "telegraf", table, mapper, false);
+            t
+        };
+        let recv = 1_762_700_000_000_000_000i64;
+        // a deterministic stream: 3,000 messages of 1 to 4 rows
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut msgs: Vec<Vec<u8>> = Vec::new();
+        for i in 0..3_000u64 {
+            let mut msg = String::new();
+            for _ in 0..=next() % 4 {
+                // six more hosts every 600 messages, in the end more than the dictionary takes
+                let host = next() % (4 + (i / 600) * 6);
+                let ts = match next() % 40 {
+                    0 => recv + 90_000_000_000_000 + 5, // more than a day ahead
+                    1 => recv - 1_000_000,              // stale
+                    2 => recv + i64::try_from(i).unwrap() * 100 - 30, // late, within the window
+                    _ => recv + i64::try_from(i).unwrap() * 100,
+                };
+                let line = match next() % 25 {
+                    0 => format!("cpu,host=h{host},site=s{} usage=oops {ts}\n", host % 3),
+                    1 => format!("cpu,site=s1 usage=1 {ts}\n"), // no host
+                    _ => format!(
+                        "cpu,host=h{host},site=s{} usage={} {ts}\n",
+                        host % 3,
+                        next() % 100
+                    ),
+                };
+                msg.push_str(&line);
+            }
+            msgs.push(msg.into_bytes());
+        }
+        let frames: Vec<Frame> = msgs
+            .iter()
+            .map(|m| Frame {
+                recv_ns: recv,
+                kind: FrameKind::User,
+                payload: ankaa_feeds::capture::user_payload(0, m),
+            })
+            .collect();
+        let dump = |t: &Tables| -> Vec<String> {
+            let mut out = Vec::new();
+            for c in &t.user[0].table.snapshot().chunks {
+                let ChunkRef::Hot(h) = c else { unreachable!() };
+                for row in 0..h.num_rows() {
+                    let cells: Vec<_> = (0..4).map(|i| h.value(i, row)).collect();
+                    out.push(format!("{cells:?}"));
+                }
+            }
+            out
+        };
+        let names = |t: &Tables, c: usize| t.user[0].dicts[c].as_ref().unwrap().names().to_vec();
+
+        // one thread, message by message
+        let mut direct = tables();
+        let mut want = (0usize, 0usize);
+        for (i, f) in frames.iter().enumerate() {
+            direct.set_lsn(i as u64 + 1);
+            let a = direct.ingest_user(0, &msgs[i], f.recv_ns);
+            want = (want.0 + a.rows, want.1 + a.rejected);
+        }
+        assert!(want.0 > 3_000 && want.1 > 300, "{want:?}");
+
+        for (writers, run_len) in [(2usize, 256usize), (3, 500), (7, 128)] {
+            let mut pooled = tables();
+            let mut pool = crate::write_pool::WritePool::start(writers).unwrap();
+            let mut workers = pooled.worker_mappers();
+            let (worker, _) = workers[0].as_mut().unwrap();
+            let (mut got, mut by_writers) = ((0usize, 0usize), 0usize);
+            for (j, run) in frames.chunks(run_len).enumerate() {
+                let first_lsn = (j * run_len) as u64 + 1;
+                // mapped without the dictionaries, as a worker does (it learns ids from the
+                // results that come back)
+                let mapped: Vec<_> = run
+                    .iter()
+                    .map(|f| {
+                        let (_, msg) =
+                            ankaa_feeds::capture::split_user_payload(&f.payload).unwrap();
+                        Some(worker.parse(msg, f.recv_ns, false, &[]).map(|_| {
+                            let mut m = worker.empty_mapped();
+                            worker.swap_mapped(&mut m);
+                            m
+                        }))
+                    })
+                    .collect();
+                let account = |pooled: &mut Tables,
+                               pool: &mut crate::write_pool::WritePool,
+                               worker: &mut RowMapper,
+                               got: &mut (usize, usize)| {
+                    for (run, tallies) in pool.collect(true).unwrap() {
+                        for (_, out, m) in pooled.account_run(run, tallies) {
+                            *got = (got.0 + out.rows, got.1 + out.rejected);
+                            worker.learn(&m);
+                        }
+                    }
+                };
+                match pooled.submit_run(&mut pool, 0, run, first_lsn, 1, mapped) {
+                    Ok(()) => {
+                        by_writers += 1;
+                        // every third run is left with the writers while the next is handed over
+                        if j % 3 == 0 {
+                            account(&mut pooled, &mut pool, worker, &mut got);
+                        }
+                    }
+                    Err(mapped) => {
+                        account(&mut pooled, &mut pool, worker, &mut got);
+                        for (k, (f, m)) in run.iter().zip(mapped).enumerate() {
+                            pooled.set_lsn(first_lsn + k as u64);
+                            let mut m = m.unwrap().unwrap();
+                            let out = pooled.apply_mapped(0, f.recv_ns, Ok(&mut m));
+                            got = (got.0 + out.rows, got.1 + out.rejected);
+                            worker.learn(&m);
+                        }
+                    }
+                }
+            }
+            for (run, tallies) in pool.collect(true).unwrap() {
+                for (_, out, _) in pooled.account_run(run, tallies) {
+                    got = (got.0 + out.rows, got.1 + out.rejected);
+                }
+            }
+            let what = format!("{writers} writers, runs of {run_len}");
+            assert!(by_writers > 0, "{what}: no run went to the writers");
+            assert_eq!(got, want, "{what}");
+            assert_eq!(names(&pooled, 1), names(&direct, 1), "{what}");
+            assert_eq!(names(&pooled, 2), names(&direct, 2), "{what}");
+            assert_eq!(dump(&pooled), dump(&direct), "{what}");
+            let (a, b) = (pooled.user[0].table.stats(), direct.user[0].table.stats());
+            assert_eq!(
+                (a.rows, a.late_rows, a.dropped_out_of_order),
+                (b.rows, b.late_rows, b.dropped_out_of_order),
+                "{what}"
+            );
+        }
     }
 
     /// Book rows can only be regenerated by replaying from the connection they belong to, so

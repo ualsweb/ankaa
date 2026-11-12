@@ -601,6 +601,11 @@ pub struct StorageConfig {
     pub compact_small_chunks: bool,
     /// Minimum seconds between WAL truncations after a checkpoint.
     pub checkpoint_interval_s: u64,
+    /// Threads that append the rows of mapped messages to their partitions in parallel
+    /// (RFC-0001 stage 2); each owns the partitions whose key is its number modulo this.
+    /// Unset: a quarter of the cores, at most 8, and none below 8 cores; 0 or 1: the ingest
+    /// loop appends. Needs `ingest_workers` > 0. At most 64.
+    pub ingest_writers: Option<usize>,
     /// Threads that encode sealed chunks (Vortex) and write their segments, off the ingest loop.
     /// Unset: a quarter of the cores, 1 to 16; 0: encode in the snapshot tick within
     /// `tier_budget_pct`. At most 256.
@@ -733,6 +738,7 @@ impl Default for StorageConfig {
             snapshot_ms: 50,
             ingest_coalesce_us: 200,
             ingest_workers: None,
+            ingest_writers: None,
             tier_workers: None,
             warm_budget_mib: 512,
             segment_cache_mib: 256,
@@ -880,6 +886,9 @@ impl Config {
         }
         if self.storage.snapshot_ms < 5 {
             return inv("storage.snapshot_ms must be >= 5");
+        }
+        if self.storage.ingest_writers.is_some_and(|n| n > 64) {
+            return inv("storage.ingest_writers must be <= 64");
         }
         if self.storage.ingest_workers.is_some_and(|n| n > 256) {
             return inv("storage.ingest_workers must be <= 256");

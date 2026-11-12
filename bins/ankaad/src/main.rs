@@ -18,6 +18,7 @@ mod sources;
 mod tables;
 mod tiering;
 mod wal_writer;
+mod write_pool;
 
 use std::path::PathBuf;
 use std::time::Instant;

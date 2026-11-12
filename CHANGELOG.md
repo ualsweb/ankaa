@@ -145,6 +145,13 @@ All notable changes are recorded here. The project is pre-alpha; there are no re
   of at every seal and snapshot, and under load the next tick waits eight times what the last one took.
   The tick is 3.5 ms; a load of 21-column rows went from 1.7 to 2.2 M rows/s on a laptop (development
   signal). New metrics `ankaa_last_tick_ns`, `ankaa_tick_ns_total`.
+- Parallel ingest, stage 2 (RFC-0001): `storage.ingest_writers` threads append the rows of mapped runs to
+  their partitions, each owning the partitions `key mod N`, while the ingest loop only gives dictionary ids
+  and splits the rows. Runs are handed over without waiting (waiting after each one was measured and was a
+  loss); the loop waits for the writers before a tick and before anything it applies row by row. A property
+  test checks that 2, 3 and 7 writers store exactly what one thread stores. Partitions of a table are behind
+  locks of their own (`Table::append_shared`). New metrics say where the ingest loop waits
+  (`ankaa_ingest_wait_frames_ns_total`, `…_workers_…`, `…_coalesce_…`).
 - Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
   could hand the last messages to the next start again.
 - Ways to run it without a Rust toolchain: a container image (`Dockerfile`, multi-arch release image on

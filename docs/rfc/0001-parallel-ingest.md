@@ -1,6 +1,6 @@
 # RFC-0001: Parallel ingest for many-core Arm servers
 
-- **Status:** Accepted (stage 1 implemented 2026-11-11; stage 2 planned)
+- **Status:** Accepted (stage 1 implemented 2026-11-11, stage 2 2026-11-12)
 - **Date:** 2026-11-11
 - **Affects:** `ankaa-ingest` (`generic`), `bins/ankaad` (`serve`, `tables`), config `[storage] ingest_workers`; PRD F-04 (partition-owned appenders), N-01/N-02 (ingest throughput)
 
@@ -12,7 +12,7 @@ and then decodes, maps and appends them, one after the other. One core bounds th
 in the Arm AGI CPU, 2 MB of L2 per core but about 6 GB/s of memory bandwidth per core), so the engine
 has to use them without giving up any of its guarantees. Stage 1 moves the expensive part, mapping
 messages to rows, onto a pool of workers while one applier applies the results in log order. Stage 2
-splits the applier into writers that each own a group of partitions.
+splits the appends among writers that each own a group of partitions.
 
 ## Motivation
 
@@ -77,14 +77,44 @@ sources ──frames──▶ sequencer (ingest loop) ──batch──▶ WAL t
 - **`storage.ingest_workers`**: 0 keeps the sequential engine; the default is the number of cores
   minus two (the ingest loop and the log thread), at most 32.
 
-## Design — stage 2 (planned): writers per partition group
+## Design — stage 2 (implemented 2026-11-12): writers per partition group
 
-The applier becomes S writers, each owning the partitions whose key falls in its group (key mod S), with
-its own chunk lists and no partition lock. The reorder buffer stays in front of them, so each writer
-still sees its rows in LSN order (invariant 2). Open points: dictionary interning shared by the writers
-(new values are rare: a mutex on the slow path, per-writer caches of known ids, since ids never change);
-continuous queries keyed by the partition column shard with the writers, others take the merged order;
-the WAL becomes one log per group when one log thread is the limit (about 1 GB/s of records).
+```
+workers ──mapped run──▶ ingest loop: resolve ids, split rows by partition key
+                             │ run (shared, read-only) + one row list per writer
+                             ▼
+                 writers 1..S (writer = key mod S): stale check, append
+                             │ what each message came to
+                             ▼
+                 ingest loop: counters, buffers back to the workers
+```
+
+- **What stays in the loop** is what depends on the order of rows of different partitions: giving
+  dictionary ids. A mapped run goes to the writers only when every value of every row that is not
+  refused has its id already (`Mapped::has_pending`); since the workers learn ids, that is every run
+  of a stream whose devices are known. A run with a value never seen, a table with continuous
+  queries, a Sparkplug source and recovery take the stage 1 path, row by row.
+- **What a writer does** depends on one partition only: the stale check against the partition's
+  watermark and the append (`Table::append_shared`: the list of partitions is read, the partition
+  locked). All rows of a partition go to one writer, and a writer takes its runs in the order they
+  were handed over: every partition gets its rows in LSN order (invariant 2).
+- **Pipelined, not joined.** The loop hands a run over and goes on. Waiting for the writers after
+  every run was measured first and was a loss: two thread wake-ups per writer cost more than the
+  appends of a 1,024-row run (2 to 4 writers halved the rate). The loop waits for the writers only
+  where everything must be applied: before a run that goes row by row, before a snapshot tick, at
+  shutdown. Ticks, tiering and checkpoints therefore still see tables at a message boundary.
+- **Partitions behind their own locks.** `Table` keeps `RwLock<Vec<Mutex<Partition>>>`: whoever
+  needs the table to itself (one message row by row, a tiering step, growth of the list) holds the
+  outer lock for writing and pays nothing for the inner ones; writers hold it for reading.
+- **`storage.ingest_writers`**: unset = a quarter of the cores, at most 8, none below 8 cores; 0 or
+  1 = the loop appends.
+- Around it, from the same profile: the snapshot tick no longer stalls the loop (source positions
+  saved by a thread of their own, table views built on several threads, zone maps computed by their
+  first reader, ticks spaced by their own duration under load), and the loop reports where it waits
+  (`ankaa_ingest_wait_*_ns_total`).
+
+Not done: dictionary interning shared by the writers (new values still send a run through the
+loop), continuous queries sharded with the writers, one log per group.
 
 ## Alternatives considered
 

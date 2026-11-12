@@ -180,10 +180,19 @@ pub struct Metrics {
     pub replication_last_receive_ms: AtomicU64,
     /// Frames too large for the WAL (dropped, not ingested).
     pub wal_oversized: AtomicU64,
+    /// Time the ingest loop spent waiting, ns: for frames from the sources (nothing to do),
+    /// blocked on the mapping workers, and in the coalescing pause.
+    pub wait_frames_ns: AtomicU64,
+    /// See [`Self::wait_frames_ns`].
+    pub wait_workers_ns: AtomicU64,
+    /// See [`Self::wait_frames_ns`].
+    pub wait_coalesce_ns: AtomicU64,
     /// Time the last snapshot tick took in the ingest loop, and the sum over all ticks, ns.
     pub last_tick_ns: AtomicU64,
     /// See [`Self::last_tick_ns`].
     pub tick_ns_total: AtomicU64,
+    /// Writer threads (0: the ingest loop appends).
+    pub ingest_writers: AtomicU64,
     /// Mapping workers, runs of frames out on them, and runs handed out since the start.
     pub ingest_workers: AtomicU64,
     /// See [`Self::ingest_workers`].
@@ -420,10 +429,34 @@ impl Metrics {
             g(&self.tick_ns_total),
         );
         m(
+            "ankaa_ingest_wait_frames_ns_total",
+            "Time the ingest loop waited for frames from the sources (it had nothing to do)",
+            "counter",
+            g(&self.wait_frames_ns),
+        );
+        m(
+            "ankaa_ingest_wait_workers_ns_total",
+            "Time the ingest loop was blocked on the mapping workers (queues full, or before a tick)",
+            "counter",
+            g(&self.wait_workers_ns),
+        );
+        m(
+            "ankaa_ingest_wait_coalesce_ns_total",
+            "Time the ingest loop paused to let frames accumulate (storage.ingest_coalesce_us)",
+            "counter",
+            g(&self.wait_coalesce_ns),
+        );
+        m(
             "ankaa_ingest_workers",
             "Threads mapping messages to rows (storage.ingest_workers; 0: the ingest loop maps)",
             "gauge",
             g(&self.ingest_workers),
+        );
+        m(
+            "ankaa_ingest_writers",
+            "Threads appending mapped rows to their partitions (storage.ingest_writers; 0: the ingest loop appends)",
+            "gauge",
+            g(&self.ingest_writers),
         );
         m(
             "ankaa_ingest_map_jobs",

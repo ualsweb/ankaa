@@ -487,7 +487,12 @@ impl Partition {
 pub struct Table {
     name: String,
     schema: Schema,
-    partitions: RwLock<Vec<Partition>>,
+    /// Every partition behind a lock of its own. The table's lock guards the list: held for
+    /// writing by everything that needs the partitions to itself (one message's rows, a tiering
+    /// step, growth of the list), where the inner locks cost nothing (`get_mut`); held for
+    /// reading by readers and by writers that append to different partitions at the same time
+    /// ([`Table::append_shared`]).
+    partitions: RwLock<Vec<Slot>>,
     /// WAL LSN of the record being ingested (0 = none). Kept on the table and handed to a
     /// partition when it is touched, so setting it costs the same with one partition or a
     /// million, and a partition created by the record itself is stamped too.
@@ -500,7 +505,7 @@ pub struct Table {
 /// `parking_lot` lock word: taking it is a single compare-and-swap, releasing it a single
 /// store-release, so a message of `n` rows costs two atomic operations instead of `6n`.
 pub struct TableWriter<'a> {
-    parts: parking_lot::RwLockWriteGuard<'a, Vec<Partition>>,
+    parts: parking_lot::RwLockWriteGuard<'a, Vec<Slot>>,
     lsn: u64,
     schema: &'a Schema,
     max_lateness: i64,
@@ -525,7 +530,7 @@ impl TableWriter<'_> {
     /// Watermark of partition `idx` (`None` when it does not exist yet, `i64::MIN` when empty).
     #[must_use]
     pub fn partition_watermark(&self, idx: usize) -> Option<i64> {
-        self.parts.get(idx).map(Partition::watermark)
+        self.parts.get(idx).map(|p| p.lock().watermark())
     }
 
     /// Append one row to the partition of `key`, creating it (and any below it) when new, and
@@ -541,7 +546,7 @@ impl TableWriter<'_> {
         if idx >= self.parts.len() {
             self.grow(idx);
         }
-        let p = &mut self.parts[idx];
+        let p = self.parts[idx].get_mut();
         p.set_current_lsn(self.lsn);
         if p.skipping() {
             return Ok(false);
@@ -555,8 +560,11 @@ impl TableWriter<'_> {
     fn grow(&mut self, idx: usize) {
         while self.parts.len() <= idx {
             let k = u32::try_from(self.parts.len()).unwrap_or(u32::MAX);
-            self.parts
-                .push(Partition::new(k, self.schema.clone(), self.max_lateness));
+            self.parts.push(Slot::new(Partition::new(
+                k,
+                self.schema.clone(),
+                self.max_lateness,
+            )));
         }
     }
 }
@@ -574,6 +582,9 @@ pub struct TableSnapshot {
     /// queries that need read-committed-across-partitions semantics read up to this.
     pub min_watermark: i64,
 }
+
+/// A partition behind its own lock (see `Table::partitions`).
+type Slot = parking_lot::Mutex<Partition>;
 
 /// Fewest partitions for which a snapshot is built on several threads (starting them costs
 /// more than the views of a few partitions).
@@ -594,10 +605,11 @@ fn snapshot_threads(partitions: usize) -> usize {
 
 /// The chunks queries see of `parts`, in order, and the smallest watermark of the partitions
 /// that hold rows (`i64::MAX` when none does).
-fn snapshot_of(parts: &[Partition]) -> (Vec<ChunkRef>, i64) {
+fn snapshot_of(parts: &[Slot]) -> (Vec<ChunkRef>, i64) {
     let mut chunks = Vec::new();
     let mut min_wm = i64::MAX;
     for p in parts {
+        let p = p.lock();
         let wm = p.watermark();
         if wm != i64::MIN {
             min_wm = min_wm.min(wm);
@@ -612,7 +624,7 @@ impl Table {
     #[must_use]
     pub fn new(name: impl Into<String>, schema: Schema, partitions: usize) -> Self {
         let parts = (0..partitions.max(1))
-            .map(|k| Partition::new(k as u32, schema.clone(), 0))
+            .map(|k| Slot::new(Partition::new(k as u32, schema.clone(), 0)))
             .collect();
         Self {
             name: name.into(),
@@ -630,7 +642,7 @@ impl Table {
     pub fn with_max_lateness(mut self, ns: i64) -> Self {
         self.max_lateness = ns.max(0);
         for p in self.partitions.get_mut() {
-            p.max_lateness = self.max_lateness;
+            p.get_mut().max_lateness = self.max_lateness;
         }
         self
     }
@@ -659,7 +671,7 @@ impl Table {
         self.partitions
             .read()
             .iter()
-            .map(Partition::watermark)
+            .map(|p| p.lock().watermark())
             .max()
             .unwrap_or(i64::MIN)
     }
@@ -699,7 +711,11 @@ impl Table {
         let mut parts = self.partitions.write();
         while parts.len() <= idx {
             let k = u32::try_from(parts.len()).unwrap_or(u32::MAX);
-            parts.push(Partition::new(k, self.schema.clone(), self.max_lateness));
+            parts.push(Slot::new(Partition::new(
+                k,
+                self.schema.clone(),
+                self.max_lateness,
+            )));
         }
         idx
     }
@@ -707,14 +723,17 @@ impl Table {
     /// Watermark of partition `idx` (`None` when it does not exist yet, `i64::MIN` when empty).
     #[must_use]
     pub fn partition_watermark(&self, idx: usize) -> Option<i64> {
-        self.partitions.read().get(idx).map(Partition::watermark)
+        self.partitions
+            .read()
+            .get(idx)
+            .map(|p| p.lock().watermark())
     }
 
     /// Run `f` with exclusive access to one partition (the writer's hot path).
     pub fn with_partition<R>(&self, idx: usize, f: impl FnOnce(&mut Partition) -> R) -> R {
         let lsn = self.current_lsn.load(std::sync::atomic::Ordering::Relaxed);
         let mut parts = self.partitions.write();
-        let p = &mut parts[idx];
+        let p = parts[idx].get_mut();
         p.set_current_lsn(lsn);
         f(p)
     }
@@ -837,10 +856,46 @@ impl Table {
             .store(lsn, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Append one row to the partition of `key` while other threads append to other partitions
+    /// of this table: the list is only read, the partition is locked for the append. `lsn` is
+    /// the WAL record the row came from (0: none). A row older than the partition's watermark
+    /// by more than `stale_after` ns (`None`: no such check, as during recovery) is refused
+    /// with `Ok(None)` and nothing changes; otherwise `Ok(Some(stored))`, where `stored` is
+    /// `false` when recovery skips the row because a segment already holds it.
+    ///
+    /// The partition must exist ([`Self::partition_for`], which needs the list to itself).
+    /// Rows of one partition must come from one thread at a time, in their order: the lock
+    /// makes concurrent calls safe, not ordered.
+    pub fn append_shared(
+        &self,
+        key: u32,
+        lsn: u64,
+        row: &[Value],
+        stale_after: Option<i64>,
+    ) -> Result<Option<bool>, AppendError> {
+        let parts = self.partitions.read();
+        let Some(slot) = parts.get(key as usize) else {
+            return Err(AppendError::Type(0));
+        };
+        let mut p = slot.lock();
+        if let (Some(lateness), Some(Value::I64(ts))) = (stale_after, row.first())
+            && *ts < p.watermark().saturating_sub(lateness)
+        {
+            return Ok(None);
+        }
+        p.set_current_lsn(lsn);
+        if p.skipping() {
+            return Ok(Some(false));
+        }
+        let before = p.stats().rows;
+        p.append_row(row)?;
+        Ok(Some(p.stats().rows != before))
+    }
+
     /// Run `f` on every partition (tiering, checkpointing).
     pub fn for_each_partition(&self, mut f: impl FnMut(&mut Partition)) {
         for p in self.partitions.write().iter_mut() {
-            f(p);
+            f(p.get_mut());
         }
     }
 
@@ -849,7 +904,7 @@ impl Table {
     pub fn tier_stats(&self) -> TierStats {
         let mut t = TierStats::default();
         for p in self.partitions.read().iter() {
-            t.merge(&p.tier_stats());
+            t.merge(&p.lock().tier_stats());
         }
         t
     }
@@ -860,7 +915,7 @@ impl Table {
         self.partitions
             .read()
             .iter()
-            .map(Partition::persisted_through_lsn)
+            .map(|p| p.lock().persisted_through_lsn())
             .max()
             .unwrap_or(0)
     }
@@ -871,7 +926,7 @@ impl Table {
         self.partitions
             .read()
             .iter()
-            .map(Partition::checkpoint_lsn)
+            .map(|p| p.lock().checkpoint_lsn())
             .min()
             .unwrap_or(u64::MAX)
     }
@@ -879,7 +934,7 @@ impl Table {
     /// Seal every partition's open chunk (shutdown / time boundary).
     pub fn seal_all(&self) {
         for p in self.partitions.write().iter_mut() {
-            p.seal_open();
+            p.get_mut().seal_open();
         }
     }
 
@@ -889,9 +944,9 @@ impl Table {
     #[must_use]
     pub fn version(&self) -> u64 {
         let parts = self.partitions.read();
-        parts
-            .iter()
-            .fold(parts.len() as u64, |v, p| v.wrapping_add(p.version()))
+        parts.iter().fold(parts.len() as u64, |v, p| {
+            v.wrapping_add(p.lock().version())
+        })
     }
 
     /// Consistent snapshot for queries.
@@ -941,7 +996,7 @@ impl Table {
             .read()
             .iter()
             .fold(PartitionStats::default(), |a, p| {
-                let s = p.stats();
+                let s = p.lock().stats();
                 PartitionStats {
                     rows: a.rows + s.rows,
                     dropped_out_of_order: a.dropped_out_of_order + s.dropped_out_of_order,

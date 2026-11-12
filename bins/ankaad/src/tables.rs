@@ -16,8 +16,8 @@ pub struct UserTable {
     pub name: String,
     /// Column that chooses the partition, if any.
     pub partition_by: Option<String>,
-    /// Store.
-    pub table: Table,
+    /// Store (shared with the writer threads, which append to it during a run).
+    pub table: std::sync::Arc<Table>,
     /// One dictionary per `dict` column (shared by every source feeding the table).
     pub dicts: Vec<Option<ankaa_ingest::SymbolDict>>,
 }
@@ -39,7 +39,7 @@ pub struct SourceBinding {
 }
 
 /// Why a user row older than its partition's newest row is refused.
-const STALE: &str = "row rejected by the table (older than the newest row of its partition)";
+pub const STALE: &str = "row rejected by the table (older than the newest row of its partition)";
 
 /// A user row may be stamped this far ahead of its receive time; beyond it the row is rejected.
 /// One far-future timestamp would otherwise raise the partition watermark and make every later
@@ -163,7 +163,9 @@ impl Tables {
             name: name.to_owned(),
             partition_by: partition_by.map(str::to_owned),
             dicts: RowMapper::dictionaries_for(&schema),
-            table: Table::new(name, schema, 1).with_max_lateness(max_lateness_ns),
+            table: std::sync::Arc::new(
+                Table::new(name, schema, 1).with_max_lateness(max_lateness_ns),
+            ),
         });
         self.user.len() - 1
     }
@@ -382,6 +384,153 @@ impl Tables {
         out
     }
 
+    /// Apply a whole run of mapped messages with the writer threads, when the run allows it:
+    /// every frame is a mapped message of a table without continuous queries, none of its rows
+    /// holds a dictionary value without an id, and this is not recovery. Then nothing in the
+    /// run depends on the order of rows of different partitions, and the writers store exactly
+    /// what [`Self::apply_mapped`] would, message by message.
+    ///
+    /// The run is handed to the writers and this returns at once; [`Self::account_run`] does
+    /// the bookkeeping when the writers are done with it. `Err`: the run, untouched, to be
+    /// applied one message at a time (after the writers have finished what they hold).
+    #[allow(clippy::type_complexity)]
+    pub fn submit_run(
+        &mut self,
+        writers: &mut crate::write_pool::WritePool,
+        worker: usize,
+        frames: &[ankaa_feeds::capture::Frame],
+        first_lsn: u64,
+        step: u64,
+        mut mapped: Vec<Option<Result<Mapped, MapError>>>,
+    ) -> Result<(), Vec<Option<Result<Mapped, MapError>>>> {
+        use crate::write_pool::{FrameWork, Run};
+        if self.replaying || frames.len() != mapped.len() {
+            return Err(mapped);
+        }
+        // 1. every message resolved against the dictionaries as they are; any value still
+        // without an id sends the run the ordinary way (which gives ids in log order)
+        let mut source_of: Vec<u16> = Vec::with_capacity(frames.len());
+        let mut tables: Vec<(usize, std::sync::Arc<Table>, i64)> = Vec::new();
+        let mut table_of: Vec<usize> = Vec::with_capacity(frames.len());
+        for (frame, m) in frames.iter().zip(mapped.iter_mut()) {
+            let (Some(Ok(m)), Some((source_id, _))) =
+                (m, ankaa_feeds::capture::split_user_payload(&frame.payload))
+            else {
+                return Err(mapped);
+            };
+            let Some(src) = self
+                .sources
+                .get(usize::from(source_id))
+                .and_then(Option::as_ref)
+            else {
+                return Err(mapped);
+            };
+            let t = &self.user[src.table];
+            if self.continuous.listens(&t.name) {
+                return Err(mapped);
+            }
+            m.resolve(&t.dicts, src.mapper.max_dict_entries());
+            if m.has_pending() {
+                return Err(mapped);
+            }
+            let at = tables
+                .iter()
+                .position(|(i, _, _)| *i == src.table)
+                .unwrap_or_else(|| {
+                    tables.push((src.table, t.table.clone(), t.table.max_lateness()));
+                    tables.len() - 1
+                });
+            source_of.push(source_id);
+            table_of.push(at);
+        }
+        // 2. rows to their writers; partitions that do not exist yet are created here (the
+        // list of partitions is only read while the writers run)
+        let mut run = Run {
+            tables: tables
+                .iter()
+                .map(|(_, t, late)| (t.clone(), *late))
+                .collect(),
+            frames: Vec::with_capacity(frames.len()),
+            sources: source_of,
+            worker,
+        };
+        // partitions each table of the run is known to have
+        let mut known: Vec<usize> = run.tables.iter().map(|(t, _)| t.num_partitions()).collect();
+        let mut lsn = first_lsn;
+        for (f, (frame, m)) in frames.iter().zip(mapped.drain(..)).enumerate() {
+            let Some(Ok(m)) = m else {
+                unreachable!("checked above")
+            };
+            let table = &run.tables[table_of[f]].0;
+            let f32 = u32::try_from(f).unwrap_or(u32::MAX);
+            for r in 0..m.n_rows() {
+                let r32 = u32::try_from(r).unwrap_or(u32::MAX);
+                let key = if m.parsed(r).is_ok() {
+                    let (key, _) = m.row(r);
+                    // (the list is looked at only for a key beyond the partitions known)
+                    if key as usize >= known[table_of[f]] {
+                        known[table_of[f]] = table.partition_for(key) + 1;
+                    }
+                    key
+                } else {
+                    0 // a refused row: any writer counts it
+                };
+                writers.list_for(key).push((f32, r32));
+            }
+            run.frames.push(FrameWork {
+                table: table_of[f],
+                recv_ns: frame.recv_ns,
+                lsn,
+                mapped: m,
+            });
+            lsn += step;
+        }
+        // 3. to the writers; the bookkeeping follows when they are done (`account_run`)
+        if let Err(e) = writers.submit(run) {
+            // a writer thread is gone: nothing sensible is left to do with the run
+            panic!("ingest writers failed: {e}");
+        }
+        Ok(())
+    }
+
+    /// The bookkeeping of a run the writers have stored: what every message came to, in log
+    /// order, with its source and its used buffer.
+    pub fn account_run(
+        &mut self,
+        run: crate::write_pool::Run,
+        tallies: Vec<crate::write_pool::FrameTally>,
+    ) -> Vec<(u16, UserIngest, Mapped)> {
+        let mut done: Vec<UserIngest> = (0..run.frames.len())
+            .map(|_| UserIngest::default())
+            .collect();
+        let mut first_row: Vec<u32> = vec![u32::MAX; run.frames.len()];
+        for t in tallies {
+            let f = t.frame as usize;
+            let Some(out) = done.get_mut(f) else { continue };
+            out.rows += t.rows as usize;
+            out.rejected += t.rejected as usize;
+            if let Some((row, e)) = t.first
+                && row < first_row[f]
+            {
+                first_row[f] = row;
+                out.error = Some(e);
+            }
+        }
+        let mut result = Vec::with_capacity(run.frames.len());
+        for ((fw, out), source_id) in run.frames.into_iter().zip(done).zip(run.sources) {
+            if let Some(src) = self
+                .sources
+                .get_mut(usize::from(source_id))
+                .and_then(Option::as_mut)
+            {
+                src.mapped += out.rows as u64;
+                src.rejected += out.rejected as u64;
+            }
+            result.push((source_id, out, fw.mapped));
+        }
+        result
+    }
+
     /// Books (read-only view for metrics/tests).
     pub fn books(&self) -> &HashMap<u32, L2Book> {
         &self.books
@@ -431,7 +580,7 @@ impl Tables {
             ("book_deltas", &self.deltas),
             ("quotes", &self.quotes),
         ];
-        v.extend(self.user.iter().map(|u| (u.name.as_str(), &u.table)));
+        v.extend(self.user.iter().map(|u| (u.name.as_str(), &*u.table)));
         v
     }
 

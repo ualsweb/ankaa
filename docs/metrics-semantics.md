@@ -142,6 +142,10 @@ All WAL metrics are 0 when `storage.wal_dir` is unset.
 | `ankaa_wal_bytes` | gauge | bytes | Size of the WAL segments on disk, refreshed every 5 s. Above `storage.wal_budget_mib` the partitions holding the oldest unpersisted rows are sealed and persisted so the log can be truncated. With order-book synchronisation on, the log is kept back to the last feed (re)connection (see `docs/deployment.md`, disk layout). |
 | `ankaa_last_tick_ns` | gauge | ns | Time the last snapshot tick took in the ingest loop: publishing new rows to queries, handing chunks to the encode threads, checkpoints. Nothing is ingested while it runs. |
 | `ankaa_tick_ns_total` | counter | ns | Sum of the above. `rate(ankaa_tick_ns_total) / 1e9` is the share of the ingest loop spent in ticks (kept at or below one part in nine by spacing ticks out under load); divided by `ankaa_snapshots_total` it is the mean tick. |
+| `ankaa_ingest_wait_frames_ns_total` | counter | ns | Time the ingest loop had nothing to do and waited for frames. Its rate near 1e9 per second: the sources, not the engine, set the pace. |
+| `ankaa_ingest_wait_workers_ns_total` | counter | ns | Time the ingest loop was blocked on the mapping workers (their queues were full, or a tick needed everything applied). A high rate: more `ingest_workers`. |
+| `ankaa_ingest_wait_coalesce_ns_total` | counter | ns | Time spent in the coalescing pause (`storage.ingest_coalesce_us`). |
+| `ankaa_ingest_writers` | gauge | threads | Threads appending mapped rows (`storage.ingest_writers`); 0 when the ingest loop appends. |
 | `ankaa_ingest_workers` | gauge | threads | Threads mapping messages to rows (`storage.ingest_workers`); 0 when the ingest loop maps itself. |
 | `ankaa_ingest_map_jobs` | gauge | jobs | Runs of logged frames out on the mapping workers and not yet applied (at most two per worker). At its maximum all the time: mapping is the bottleneck, more workers help; near zero under load: the ingest loop or the sources are. |
 | `ankaa_ingest_map_jobs_total` | counter | jobs | Runs handed to the mapping workers. |

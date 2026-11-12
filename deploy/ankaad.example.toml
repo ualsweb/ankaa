@@ -86,6 +86,11 @@ ingest_coalesce_us = 200
 # same result as one thread). Unset = cores - 2, at most 32; 0 = map in the ingest loop.
 # ingest_workers = 8
 
+# Threads that append mapped rows to their partitions in parallel (each owns the partitions
+# `key mod N`). Default: a quarter of the cores, at most 8, none below 8 cores. 0 or 1: the ingest
+# loop appends.
+# ingest_writers = 4
+
 [server]
 # Arrow Flight (gRPC) bind address. Binding beyond loopback REQUIRES a bearer token.
 flight_addr = "127.0.0.1:50051"
