@@ -129,12 +129,40 @@ loop), continuous queries sharded with the writers, one log per group.
 
 ## Verification
 
-- Property test: random message streams (JSON, `rows` batches and line protocol, good and bad rows,
-  new and known dictionary values, a small dictionary cap) mapped by the pooled path with 1, 2 and 7 workers give the same tables,
-  dictionaries and counters as the sequential path.
-- End-to-end tests run with workers on: restarts, crash and lost WAL (`tests/e2e.rs`), real brokers.
-- Measured on Axion: rows/s and CPU per row for 0, 1, 2 workers on 4 vCPU, and the scaling curve on a
-  larger Axion instance (`c4a-standard-48`/`-72`).
+- Property test (stage 1): random message streams (JSON, `rows`, CSV and line protocol, good and bad
+  rows, new and known dictionary values, a small dictionary cap) mapped by the pooled path with 1 to 7
+  workers give the same tables, dictionaries and counters as the sequential path.
+- Stage 2: `writer_threads_store_what_one_thread_stores` (2, 3 and 7 writers, runs of 128 to 500
+  messages, some left with the writers while the next is handed over): the same rows in the same order
+  in every partition, the same dictionaries and counters, for a stream with stale, late, future and
+  malformed rows, devices that appear in the middle of runs and a dictionary that fills up.
+- End-to-end tests run with workers and writers on: restarts, crash and lost WAL (`tests/e2e.rs`),
+  real brokers.
+
+## Measured
+
+On Axion, 4 vCPU (`c4a-standard-4`, TSBS-shaped rows of 21 columns, 1,000 hosts, CSV file source):
+1.11 M rows/s before the tick changes, 1.25 M after (two mapping workers; writers are off below 8
+cores). With snapshots every second instead of every 50 ms the same build reached 1.56 M, which is what
+a tick still costs there.
+
+Development signal only (a 14-core laptop, 5 M rows of the same shape, best of three runs):
+
+| mapping workers | writers | rows/s |
+|---:|---:|---:|
+| 0 | 0 | 1.48 M |
+| 1 | 0 | 2.11 M |
+| 4 | 0 | 2.45 M |
+| 8 | 0 | 1.84 M |
+| 8 | 2 | 2.80 M to 3.10 M |
+| 8 | 4 | 2.57 M |
+
+Before this work the same load ran at 1.69 M with the default settings. More mapping workers without
+writers make it worse (eight workers produce runs faster than one thread appends them); two writers
+take the appends off the loop. What bounds it after that is the loop's own share (ids, splitting,
+the log hand-off) and the one source task: `ankaa_ingest_wait_frames_ns_total` stays near zero, so the
+loop, not the source, is still the busiest thread. **No many-core Arm run exists yet**: the scaling
+curve on a 48 to 72 vCPU machine is still to be measured.
 
 ## Rollout / de-scope impact
 

@@ -178,6 +178,14 @@ and `append_row` (2.4 %), one value at a time through an enum for 21 columns. Ap
 column by column, and one writer per group of partitions (RFC-0001 stage 2), is the next step for ingest;
 `RowMapper::parse` (8.7 %) already runs on the workers.
 
+### After this note: ingest (12 November)
+
+Following the load profile above: the snapshot tick no longer stalls the ingest loop (it took 15 ms of
+every 50 with 1,000 partitions) and writer threads append mapped runs in parallel (RFC-0001 stage 2).
+On the same VM the load went from 1.11 M to 1.25 M rows/s with the tick changes; the writers are for
+machines with 8 cores or more and have only been measured on a laptop so far (2.4 M to 3.1 M rows/s
+there, development signal). The comparison tables above are not re-run with these changes.
+
 ## Reproduce
 
 ```sh
