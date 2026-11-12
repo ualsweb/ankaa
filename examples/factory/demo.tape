@@ -14,7 +14,7 @@ Set Theme "Dracula"
 Set TypingSpeed 22ms
 
 Hide
-Type "cd examples/factory && export PGPASSWORD=demo-token-not-secret LC_ALL=C PS1='$ ' PSQLRC=/dev/null && alias q='psql -h 127.0.0.1 -p 55432 -U ankaa -d ankaa -P footer=off -c'" Enter
+Type "set +m; cd examples/factory && export PGPASSWORD=demo-token-not-secret LC_ALL=C PS1='$ ' PSQLRC=/dev/null && alias q='psql -h 127.0.0.1 -p 55432 -U ankaa -d ankaa -P footer=off -c'" Enter
 Type "clear" Enter
 Show
 
@@ -33,6 +33,10 @@ Sleep 5s
 
 Type "# live 1-minute bars per machine, maintained as readings arrive (a continuous query)" Enter
 Type `q "SELECT machine, open / 1e8 AS open_kw, high / 1e8 AS high_kw, close / 1e8 AS close_kw, count FROM cq_power_1m_live WHERE ts = (SELECT max(ts) FROM cq_power_1m_live) ORDER BY high_kw DESC LIMIT 4"` Enter
+Sleep 5s
+
+Type "# the last reading of every machine, without scanning the table" Enter
+Type `q "SELECT machine, line, ts, round(kw / 1e8, 2) AS kw, temp_c FROM latest('telemetry', 'machine') ORDER BY machine LIMIT 5"` Enter
 Sleep 5s
 
 Type "# line 4's gateway goes offline and sends late: readings are placed in time, nothing is lost" Enter

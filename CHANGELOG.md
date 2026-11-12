@@ -146,6 +146,11 @@ queries: `dict` columns are text in SQL (first entry below).
   test checks that 2, 3 and 7 writers store exactly what one thread stores. Partitions of a table are behind
   locks of their own (`Table::append_shared`). New metrics say where the ingest loop waits
   (`ankaa_ingest_wait_frames_ns_total`, `…_workers_…`, `…_coalesce_…`).
+- Fixed: `GROUP BY <time bucket>, key … ORDER BY <time bucket>` could return rows out of order when the scan
+  had several time-ordered partitions (a table partitioned by device). The planner drops the sort there
+  because the standard aggregate keeps time order; the dense aggregation that replaces it did not. It now
+  sorts its groups when the plan above relies on the order. Found by the factory demo's dashboard; the
+  differential tests compared results without regard to row order, and one that checks order is added.
 - Fixed: an MQTT source now flushes its acknowledgements when the server stops; before, the broker
   could hand the last messages to the next start again.
 

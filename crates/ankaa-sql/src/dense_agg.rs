@@ -938,7 +938,7 @@ fn rewrite(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
         EmissionType::Final,
         Boundedness::Bounded,
     ));
-    Some(Arc::new(DenseAggExec {
+    let dense: Arc<dyn ExecutionPlan> = Arc::new(DenseAggExec {
         input: source,
         keys,
         groups,
@@ -946,7 +946,20 @@ fn rewrite(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan>> {
         direct,
         schema,
         props,
-    }))
+    });
+    // The aggregate being replaced may have promised an order: over a scan whose partitions
+    // are in time order, an aggregate grouped by a time bucket emits its groups in that order,
+    // and the planner then drops the sort an `ORDER BY` on the bucket would need (it merges
+    // the partitions instead). Groups here come out in the order their keys were first seen
+    // across chunks read side by side, which is no order at all. The nodes above keep relying
+    // on the promise, so it is kept: the groups (few rows) are sorted.
+    Some(match top.properties().output_ordering() {
+        Some(ordering) => Arc::new(datafusion::physical_plan::sorts::sort::SortExec::new(
+            ordering.clone(),
+            dense,
+        )),
+        None => dense,
+    })
 }
 
 /// The dense form of one group expression: a dictionary-id or byte column of a chunk scan, or

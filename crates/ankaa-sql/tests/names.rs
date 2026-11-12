@@ -291,6 +291,56 @@ async fn table_functions_return_names() {
     assert_eq!(keys, want);
 }
 
+/// `ORDER BY` on a time bucket is honoured when the table's chunks give scan partitions that
+/// are each in time order (a chunk per host): the planner then expects the aggregate to keep
+/// that order and drops its sort, so the dense aggregation has to deliver it. (The comparisons
+/// above ignore row order; this one is about nothing else.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+async fn order_by_a_time_bucket_is_kept_by_the_dense_aggregation() {
+    use arrow::array::AsArray;
+    use arrow::datatypes::TimestampNanosecondType;
+    for (mixed, one_chunk) in [(false, false), (true, false), (true, true)] {
+        let (ankaa, _) = contexts(mixed, one_chunk);
+        for (sql, descending) in [
+            (
+                "SELECT date_bin(INTERVAL '20 milliseconds', ts) AS b, host, count(*), avg(load) \
+                 FROM cpu GROUP BY 1, 2 ORDER BY 1",
+                false,
+            ),
+            (
+                "SELECT date_bin(INTERVAL '20 milliseconds', ts) AS b, host, max(n) \
+                 FROM cpu WHERE region = 'eu-west' GROUP BY 1, 2 ORDER BY 1 DESC",
+                true,
+            ),
+            (
+                "SELECT date_bin(INTERVAL '50 milliseconds', ts) AS b, count(*) \
+                 FROM cpu GROUP BY 1 ORDER BY 1",
+                false,
+            ),
+        ] {
+            let batches = ankaa.sql(sql).await.unwrap().collect().await.unwrap();
+            let mut buckets: Vec<i64> = Vec::new();
+            for b in &batches {
+                buckets.extend(
+                    b.column(0)
+                        .as_primitive::<TimestampNanosecondType>()
+                        .values()
+                        .iter(),
+                );
+            }
+            assert!(buckets.len() > 5, "{sql}");
+            let in_order = buckets.windows(2).all(|w| {
+                if descending {
+                    w[0] >= w[1]
+                } else {
+                    w[0] <= w[1]
+                }
+            });
+            assert!(in_order, "{sql}\n(mixed: {mixed}, one chunk: {one_chunk})");
+        }
+    }
+}
+
 /// A query written for numeric ids (the surface before RFC-0002) is refused with an error that
 /// names the problem; it never returns the answer to a different question.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
