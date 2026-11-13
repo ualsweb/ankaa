@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use ankaa_ingest::{BookSnapshot, EventBatch, Side, SymbolDict, Trade};
-use dbn::decode::{DbnMetadata, DecodeRecordRef, DynDecoder};
+use dbn::decode::{DbnMetadata, DecodeRecordRef, DynDecoder, DynReader};
 use dbn::{Mbp1Msg, Mbp10Msg, PitSymbolMap, TradeMsg, UNDEF_PRICE, VersionUpgradePolicy, rtype};
 
 /// DBN prices are fixed point with 9 decimals; ANKAA stores 8.
@@ -44,9 +44,144 @@ pub struct DbnStats {
     pub unmapped: u64,
 }
 
+/// The decompressed stream of a file, checked record by record on its way into `dbn`.
+type GuardedStream =
+    std::io::BufReader<FrameGuard<DynReader<'static, std::io::BufReader<std::fs::File>>>>;
+
+/// The decoder of one file: a DBN stream behind [`FrameGuard`], or anything else (the legacy
+/// DBZ format) through `dbn`'s own detection.
+enum Source {
+    Dbn(Box<dbn::decode::dbn::Decoder<GuardedStream>>),
+    Other(Box<DynDecoder<'static, std::io::BufReader<std::fs::File>>>),
+}
+
+impl Source {
+    fn metadata(&self) -> &dbn::Metadata {
+        match self {
+            Self::Dbn(d) => d.metadata(),
+            Self::Other(d) => d.metadata(),
+        }
+    }
+
+    fn decode_record_ref(&mut self) -> dbn::Result<Option<dbn::RecordRef<'_>>> {
+        match self {
+            Self::Dbn(d) => d.decode_record_ref(),
+            Self::Other(d) => d.decode_record_ref(),
+        }
+    }
+}
+
+/// Checks the framing of a DBN stream as it is read: every record must be a whole number of
+/// 8-byte words long.
+///
+/// `dbn` (0.73) checks a record's declared length against the header size but not its
+/// alignment. A damaged length that is odd in its 4-byte units places the next record 4 bytes off
+/// the 8-byte alignment `dbn` reads records with: a debug-assertion panic in `dbn`, and a
+/// misaligned read in a release build. Every DBN record type is a multiple of 8 bytes, so such a
+/// length is never valid; the guard ends the stream with an error at the first one. Found by the
+/// nightly `dbn_replay` fuzz run.
+pub(crate) struct FrameGuard<R> {
+    inner: R,
+    state: Frame,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Frame {
+    /// Collecting the 8-byte prelude: "DBN", the version, the metadata length.
+    Prelude { buf: [u8; 8], got: usize },
+    /// Skipping `left` more bytes (metadata, or the rest of a record).
+    Skip { left: u64, version: u8 },
+    /// At a record boundary: the next byte is a record's length in 4-byte units.
+    Boundary { version: u8 },
+    /// Not a stream this guard understands (another format, a newer version): passed through
+    /// unchecked; `dbn` refuses what it cannot decode.
+    Pass,
+}
+
+impl<R> FrameGuard<R> {
+    pub(crate) fn new(inner: R) -> Self {
+        Self {
+            inner,
+            state: Frame::Prelude {
+                buf: [0; 8],
+                got: 0,
+            },
+        }
+    }
+
+    /// Advances the framing over `bytes`, the next bytes of the stream.
+    fn scan(&mut self, mut bytes: &[u8]) -> std::io::Result<()> {
+        while !bytes.is_empty() {
+            match &mut self.state {
+                Frame::Pass => return Ok(()),
+                Frame::Prelude { buf, got } => {
+                    let n = (buf.len() - *got).min(bytes.len());
+                    buf[*got..*got + n].copy_from_slice(&bytes[..n]);
+                    *got += n;
+                    bytes = &bytes[n..];
+                    if *got == buf.len() {
+                        let version = buf[3];
+                        self.state = if &buf[..3] == b"DBN" && (1..=3).contains(&version) {
+                            let meta = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+                            Frame::Skip {
+                                left: u64::from(meta),
+                                version,
+                            }
+                        } else {
+                            Frame::Pass
+                        };
+                    }
+                }
+                Frame::Skip { left, version } => {
+                    let n = usize::try_from(*left)
+                        .unwrap_or(usize::MAX)
+                        .min(bytes.len());
+                    *left -= n as u64;
+                    bytes = &bytes[n..];
+                    if *left == 0 {
+                        self.state = Frame::Boundary { version: *version };
+                    }
+                }
+                Frame::Boundary { version } => {
+                    // DBN 1–3: the first header byte is the record length in 4-byte units
+                    let units = bytes[0];
+                    if !units.is_multiple_of(2) {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "record of {} bytes, not a multiple of 8: damaged DBN data",
+                                usize::from(units) * 4
+                            ),
+                        ));
+                    }
+                    // a length shorter than the header is left to `dbn`, which refuses it; the
+                    // guard stops checking there
+                    if units == 0 {
+                        self.state = Frame::Pass;
+                        return Ok(());
+                    }
+                    self.state = Frame::Skip {
+                        left: u64::from(units) * 4,
+                        version: *version,
+                    };
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<R: std::io::Read> std::io::Read for FrameGuard<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.scan(&buf[..n])?;
+        Ok(n)
+    }
+}
+
 /// Streaming reader over one DBN file.
 pub struct DbnReplay {
-    dec: DynDecoder<'static, std::io::BufReader<std::fs::File>>,
+    dec: Source,
     /// Per-day instrument → symbol maps (DBN symbology is date-ranged).
     maps: HashMap<i32, PitSymbolMap>,
     stats: DbnStats,
@@ -89,8 +224,9 @@ const MAX_METADATA_BYTES: u64 = 1 << 30;
 
 /// Refuses a file whose header declares more metadata than the file can hold. The `dbn` decoder
 /// reserves the declared length before it reads the section, so eleven bytes of a damaged or
-/// hostile file would otherwise ask for 4 GiB.
-fn check_prelude(path: &Path) -> Result<(), DbnError> {
+/// hostile file would otherwise ask for 4 GiB. Returns whether the file is a DBN stream (as
+/// opposed to the legacy DBZ format or something else, which `dbn` itself sorts out).
+fn check_prelude(path: &Path) -> Result<bool, DbnError> {
     use std::io::Read as _;
     let io = |e: std::io::Error| DbnError::Dbn(dbn::Error::io(e, "reading the DBN header"));
     let mut reader = dbn::decode::DynReader::from_file(path)?;
@@ -107,7 +243,7 @@ fn check_prelude(path: &Path) -> Result<(), DbnError> {
     }
     if got < prelude.len() || &prelude[..3] != b"DBN" {
         // not a DBN stream (or a legacy one): the decoder says what is wrong with it
-        return Ok(());
+        return Ok(false);
     }
     let declared = u64::from(u32::from_le_bytes([
         prelude[4], prelude[5], prelude[6], prelude[7],
@@ -121,14 +257,22 @@ fn check_prelude(path: &Path) -> Result<(), DbnError> {
     if declared > limit {
         return Err(DbnError::Metadata { declared, limit });
     }
-    Ok(())
+    Ok(true)
 }
 
 impl DbnReplay {
     /// Open a `.dbn` or `.dbn.zst` file (compression is inferred).
     pub fn open(path: &Path) -> Result<Self, DbnError> {
-        check_prelude(path)?;
-        let dec = DynDecoder::from_file(path, VersionUpgradePolicy::UpgradeToV3)?;
+        let is_dbn = check_prelude(path)?;
+        let policy = VersionUpgradePolicy::UpgradeToV3;
+        let dec = if is_dbn {
+            let guarded = std::io::BufReader::new(FrameGuard::new(DynReader::from_file(path)?));
+            Source::Dbn(Box::new(dbn::decode::dbn::Decoder::with_upgrade_policy(
+                guarded, policy,
+            )?))
+        } else {
+            Source::Other(Box::new(DynDecoder::from_file(path, policy)?))
+        };
         let dataset = dec.metadata().dataset.clone();
         Ok(Self {
             dec,
@@ -306,6 +450,110 @@ mod tests {
     use super::*;
     use dbn::encode::EncodeRecord;
     use dbn::{FlagSet, MappingInterval, Metadata, RecordHeader, SType, Schema, SymbolMapping};
+
+    /// The fixture with its first record one 4-byte unit short, so the next header starts 4 bytes
+    /// off alignment, and a plausible length placed there (the shape the fuzzer found).
+    fn misaligned_fixture(path: &Path, version: u8) -> Vec<u8> {
+        write_fixture(path);
+        let mut bytes = std::fs::read(path).unwrap();
+        bytes[3] = version;
+        let meta_len = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        let first = 8 + meta_len;
+        assert_eq!(bytes[first], 12, "fixture: a trade record is 48 bytes");
+        bytes[first] = 11;
+        bytes[first + 44] = 12;
+        bytes[first + 45] = rtype::MBP_0;
+        bytes
+    }
+
+    fn replay_all(path: &Path) -> Result<u64, DbnError> {
+        let mut r = DbnReplay::open(path)?;
+        let mut symbols = ankaa_ingest::SymbolDict::new();
+        let mut out = ankaa_ingest::EventBatch::with_capacity(64);
+        let mut n = 0;
+        while let Some(k) = r.next_batch(&mut symbols, &mut out, 256)? {
+            n += k as u64;
+            out.clear();
+        }
+        Ok(n)
+    }
+
+    #[test]
+    fn a_record_length_off_the_8_byte_alignment_is_refused_not_misread() {
+        let dir = tempfile::tempdir().unwrap();
+        for version in [1u8, 2, 3] {
+            let plain = dir.path().join(format!("odd-v{version}.dbn"));
+            let bytes = misaligned_fixture(&plain, version);
+            std::fs::write(&plain, &bytes).unwrap();
+            // the same bytes compressed: the guard sits after decompression
+            let zst = dir.path().join(format!("odd-v{version}.dbn.zst"));
+            let mut w = dbn::encode::DynWriter::new(
+                std::fs::File::create(&zst).unwrap(),
+                dbn::Compression::Zstd,
+            )
+            .unwrap();
+            std::io::Write::write_all(&mut w, &bytes).unwrap();
+            drop(w);
+            for path in [&plain, &zst] {
+                let err = replay_all(path).expect_err("a misaligned record must not decode");
+                assert!(
+                    err.to_string().contains("not a multiple of 8"),
+                    "{}: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    /// The guard's state survives any split of the stream into reads, down to one byte.
+    #[test]
+    fn frame_guard_checks_every_boundary_whatever_the_read_size() {
+        struct Trickle<'a>(&'a [u8], usize);
+        impl std::io::Read for Trickle<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.1.min(buf.len()).min(self.0.len());
+                buf[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let good_path = dir.path().join("good.dbn");
+        write_fixture(&good_path);
+        let good = std::fs::read(&good_path).unwrap();
+        let bad = misaligned_fixture(&dir.path().join("bad.dbn"), 3);
+        for chunk in [1, 3, 7, 8, 13, 64, 4096] {
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut FrameGuard::new(Trickle(&good, chunk)), &mut out)
+                .unwrap_or_else(|e| panic!("valid stream refused at chunk {chunk}: {e}"));
+            assert_eq!(out, good);
+            let err = std::io::Read::read_to_end(
+                &mut FrameGuard::new(Trickle(&bad, chunk)),
+                &mut Vec::new(),
+            )
+            .expect_err("misaligned stream accepted");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "chunk {chunk}");
+        }
+    }
+
+    #[test]
+    fn valid_files_still_replay_through_the_guard_plain_and_compressed() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("ok.dbn");
+        write_fixture(&plain);
+        let bytes = std::fs::read(&plain).unwrap();
+        let zst = dir.path().join("ok.dbn.zst");
+        let mut w = dbn::encode::DynWriter::new(
+            std::fs::File::create(&zst).unwrap(),
+            dbn::Compression::Zstd,
+        )
+        .unwrap();
+        std::io::Write::write_all(&mut w, &bytes).unwrap();
+        drop(w);
+        let a = replay_all(&plain).unwrap();
+        assert!(a > 0);
+        assert_eq!(replay_all(&zst).unwrap(), a);
+    }
 
     fn write_fixture(path: &Path) {
         let day = time::macros::date!(2026 - 11 - 09);
