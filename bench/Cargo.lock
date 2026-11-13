@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "serde",
@@ -86,7 +86,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-feeds"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ankaa-core",
  "ankaa-ingest",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-ingest"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ankaa-store",
  "foldhash",
@@ -109,14 +109,14 @@ dependencies = [
 
 [[package]]
 name = "ankaa-simd"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "ankaa-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ankaa-simd",
  "parking_lot",
@@ -126,7 +126,7 @@ dependencies = [
 
 [[package]]
 name = "ankaa-tier"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ankaa-store",
  "arrow",
@@ -139,14 +139,14 @@ dependencies = [
 
 [[package]]
 name = "ankaa-ts"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "ankaa-wal"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crc32c",
  "thiserror",
