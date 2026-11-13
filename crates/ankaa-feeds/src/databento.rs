@@ -71,18 +71,47 @@ impl Source {
     }
 }
 
-/// Checks the framing of a DBN stream as it is read: every record must be a whole number of
-/// 8-byte words long.
+/// Checks the framing of a DBN stream as it is read, so that `dbn` never sees a record it would
+/// misread or panic on.
 ///
-/// `dbn` (0.73) checks a record's declared length against the header size but not its
-/// alignment. A damaged length that is odd in its 4-byte units places the next record 4 bytes off
-/// the 8-byte alignment `dbn` reads records with: a debug-assertion panic in `dbn`, and a
-/// misaligned read in a release build. Every DBN record type is a multiple of 8 bytes, so such a
-/// length is never valid; the guard ends the stream with an error at the first one. Found by the
-/// nightly `dbn_replay` fuzz run.
+/// 1. Every record must be a whole number of 8-byte words long. `dbn` (0.73) checks a record's
+///    declared length against the header size but not its alignment. A damaged length that is
+///    odd in its 4-byte units places the next record 4 bytes off the 8-byte alignment `dbn` reads
+///    records with: a debug-assertion panic in `dbn`, and a misaligned read in a release build.
+///    Every DBN record type is a multiple of 8 bytes, so such a length is never valid; the guard
+///    ends the stream with an error at the first one. Found by the nightly `dbn_replay` fuzz run.
+///
+/// 2. A record that `dbn` upgrades from DBN version 1 or 2 must be at least as long as the
+///    old-version struct it is read as ([`upgraded_min_len`]). `dbn` reads it with
+///    `RecordRef::get`, which asserts the length: a panic, and with `panic = "abort"` in release
+///    builds a crash of the process. Found by the same fuzz target.
 pub(crate) struct FrameGuard<R> {
     inner: R,
     state: Frame,
+    /// Records carry an 8-byte `ts_out` after their body (from the metadata).
+    ts_out: bool,
+}
+
+/// The shortest record of type `rtype` that `dbn` 0.73 accepts when it upgrades a DBN `version`
+/// stream to version 3: the size of the struct its upgrade path reads (with `ts_out`, the struct
+/// followed by the 8-byte timestamp). 0 for records that are not upgraded.
+fn upgraded_min_len(version: u8, rtype: u8, ts_out: bool) -> usize {
+    use dbn::rtype::{ERROR, INSTRUMENT_DEF, STATISTICS, SYMBOL_MAPPING, SYSTEM};
+    // `WithTsOut<T>` is `#[repr(C)] { rec: T, ts_out: u64 }` and every record is 8-aligned: the
+    // record followed by 8 bytes (spelled out: the v1 types do not fit its trait bound)
+    fn size<T>(ts_out: bool) -> usize {
+        std::mem::size_of::<T>() + if ts_out { 8 } else { 0 }
+    }
+    // the cases of `dbn`'s `upgrade_record_with_version` for `VersionUpgradePolicy::UpgradeToV3`
+    match (version, rtype) {
+        (1, INSTRUMENT_DEF) => size::<dbn::v1::InstrumentDefMsg>(ts_out),
+        (2, INSTRUMENT_DEF) => size::<dbn::v2::InstrumentDefMsg>(ts_out),
+        (1 | 2, STATISTICS) => size::<dbn::v1::StatMsg>(ts_out),
+        (1, SYMBOL_MAPPING) => size::<dbn::v1::SymbolMappingMsg>(ts_out),
+        (1, ERROR) => size::<dbn::v1::ErrorMsg>(ts_out),
+        (1, SYSTEM) => size::<dbn::v1::SystemMsg>(ts_out),
+        _ => 0,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -91,21 +120,24 @@ enum Frame {
     Prelude { buf: [u8; 8], got: usize },
     /// Skipping `left` more bytes (metadata, or the rest of a record).
     Skip { left: u64, version: u8 },
-    /// At a record boundary: the next byte is a record's length in 4-byte units.
-    Boundary { version: u8 },
+    /// At a record boundary: the next bytes are a record's length in 4-byte units (`units`
+    /// once read) and its type.
+    Boundary { version: u8, units: Option<u8> },
     /// Not a stream this guard understands (another format, a newer version): passed through
     /// unchecked; `dbn` refuses what it cannot decode.
     Pass,
 }
 
 impl<R> FrameGuard<R> {
-    pub(crate) fn new(inner: R) -> Self {
+    /// `ts_out`: the stream's metadata says its records carry the 8-byte `ts_out` timestamp.
+    pub(crate) fn new(inner: R, ts_out: bool) -> Self {
         Self {
             inner,
             state: Frame::Prelude {
                 buf: [0; 8],
                 got: 0,
             },
+            ts_out,
         }
     }
 
@@ -139,20 +171,23 @@ impl<R> FrameGuard<R> {
                     *left -= n as u64;
                     bytes = &bytes[n..];
                     if *left == 0 {
-                        self.state = Frame::Boundary { version: *version };
+                        self.state = Frame::Boundary {
+                            version: *version,
+                            units: None,
+                        };
                     }
                 }
-                Frame::Boundary { version } => {
+                Frame::Boundary {
+                    version,
+                    units: None,
+                } => {
                     // DBN 1–3: the first header byte is the record length in 4-byte units
                     let units = bytes[0];
                     if !units.is_multiple_of(2) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            format!(
-                                "record of {} bytes, not a multiple of 8: damaged DBN data",
-                                usize::from(units) * 4
-                            ),
-                        ));
+                        return Err(damaged(format!(
+                            "record of {} bytes, not a multiple of 8: damaged DBN data",
+                            usize::from(units) * 4
+                        )));
                     }
                     // a length shorter than the header is left to `dbn`, which refuses it; the
                     // guard stops checking there
@@ -160,15 +195,40 @@ impl<R> FrameGuard<R> {
                         self.state = Frame::Pass;
                         return Ok(());
                     }
-                    self.state = Frame::Skip {
-                        left: u64::from(units) * 4,
+                    self.state = Frame::Boundary {
                         version: *version,
+                        units: Some(units),
+                    };
+                    bytes = &bytes[1..];
+                }
+                Frame::Boundary {
+                    version,
+                    units: Some(units),
+                } => {
+                    // the second header byte is the record type
+                    let (version, len) = (*version, usize::from(*units) * 4);
+                    let rtype = bytes[0];
+                    let min = upgraded_min_len(version, rtype, self.ts_out);
+                    if len < min {
+                        return Err(damaged(format!(
+                            "record of type {rtype:#04x} is {len} bytes, shorter than the \
+                             {min} bytes of its DBN version {version} layout: damaged DBN data"
+                        )));
+                    }
+                    // the rest of the record, from its type byte on
+                    self.state = Frame::Skip {
+                        left: len as u64 - 1,
+                        version,
                     };
                 }
             }
         }
         Ok(())
     }
+}
+
+fn damaged(msg: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, msg)
 }
 
 impl<R: std::io::Read> std::io::Read for FrameGuard<R> {
@@ -266,7 +326,13 @@ impl DbnReplay {
         let is_dbn = check_prelude(path)?;
         let policy = VersionUpgradePolicy::UpgradeToV3;
         let dec = if is_dbn {
-            let guarded = std::io::BufReader::new(FrameGuard::new(DynReader::from_file(path)?));
+            // the guard needs `ts_out` before the first record; the metadata is read once more
+            // for it (its length was bounded by `check_prelude`)
+            let ts_out = dbn::decode::dbn::MetadataDecoder::new(DynReader::from_file(path)?)
+                .decode()?
+                .ts_out;
+            let guarded =
+                std::io::BufReader::new(FrameGuard::new(DynReader::from_file(path)?, ts_out));
             Source::Dbn(Box::new(dbn::decode::dbn::Decoder::with_upgrade_policy(
                 guarded, policy,
             )?))
@@ -505,6 +571,76 @@ mod tests {
         }
     }
 
+    /// A DBN version 1 file with `ts_out` whose only record is `rec` (raw bytes after the metadata).
+    fn v1_file_with(path: &Path, rec: &[u8]) {
+        let meta = Metadata::builder()
+            .version(1)
+            .dataset("XNAS.ITCH".to_owned())
+            .schema(Some(Schema::Trades))
+            .start(1)
+            .stype_in(Some(SType::RawSymbol))
+            .stype_out(SType::InstrumentId)
+            .ts_out(true)
+            .build();
+        let mut file = std::fs::File::create(path).unwrap();
+        dbn::encode::dbn::MetadataEncoder::new(&mut file)
+            .encode(&meta)
+            .unwrap();
+        std::io::Write::write_all(&mut file, rec).unwrap();
+    }
+
+    /// A record of `len` bytes with the given type: the header, the rest zero.
+    fn raw_record(len: usize, rtype: u8) -> Vec<u8> {
+        let mut r = vec![0u8; len];
+        r[0] = (len / 4) as u8;
+        r[1] = rtype;
+        r
+    }
+
+    #[test]
+    fn an_upgraded_record_shorter_than_its_old_layout_is_refused_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("short-v1.dbn");
+        // the fuzzer's shape: a v1 symbol mapping with ts_out needs 88 bytes; this one has 72
+        let need = upgraded_min_len(1, rtype::SYMBOL_MAPPING, true);
+        assert_eq!(need, 88);
+        v1_file_with(&path, &raw_record(72, rtype::SYMBOL_MAPPING));
+        let err = replay_all(&path).expect_err("a short upgraded record must not decode");
+        assert!(
+            err.to_string().contains("shorter than the 88 bytes"),
+            "{err}"
+        );
+        // every upgraded type, one 8-byte word short of its layout
+        for (version, rt) in [
+            (1, rtype::INSTRUMENT_DEF),
+            (1, rtype::STATISTICS),
+            (1, rtype::ERROR),
+            (1, rtype::SYSTEM),
+        ] {
+            let need = upgraded_min_len(version, rt, true);
+            assert!(need > 16, "{rt:#04x}");
+            v1_file_with(&path, &raw_record(need - 8, rt));
+            assert!(
+                replay_all(&path).is_err(),
+                "{rt:#04x} of {} bytes",
+                need - 8
+            );
+        }
+    }
+
+    #[test]
+    fn an_upgraded_record_of_full_length_still_decodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ok-v1.dbn");
+        let need = upgraded_min_len(1, rtype::SYMBOL_MAPPING, true);
+        v1_file_with(&path, &raw_record(need, rtype::SYMBOL_MAPPING));
+        assert_eq!(
+            replay_all(&path).unwrap(),
+            0,
+            "a symbol mapping is not a market event"
+        );
+    }
+
     /// The guard's state survives any split of the stream into reads, down to one byte.
     #[test]
     fn frame_guard_checks_every_boundary_whatever_the_read_size() {
@@ -524,11 +660,14 @@ mod tests {
         let bad = misaligned_fixture(&dir.path().join("bad.dbn"), 3);
         for chunk in [1, 3, 7, 8, 13, 64, 4096] {
             let mut out = Vec::new();
-            std::io::Read::read_to_end(&mut FrameGuard::new(Trickle(&good, chunk)), &mut out)
-                .unwrap_or_else(|e| panic!("valid stream refused at chunk {chunk}: {e}"));
+            std::io::Read::read_to_end(
+                &mut FrameGuard::new(Trickle(&good, chunk), false),
+                &mut out,
+            )
+            .unwrap_or_else(|e| panic!("valid stream refused at chunk {chunk}: {e}"));
             assert_eq!(out, good);
             let err = std::io::Read::read_to_end(
-                &mut FrameGuard::new(Trickle(&bad, chunk)),
+                &mut FrameGuard::new(Trickle(&bad, chunk), false),
                 &mut Vec::new(),
             )
             .expect_err("misaligned stream accepted");
