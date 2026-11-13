@@ -31,7 +31,7 @@ Optional, developer experience: **P0-09 streaming-SVE harness on Apple Silicon**
 | P1-10 | Python package (`maturin`, Arrow C Data Interface, GIL released), notebook | done |
 | P1-11 | `ankaad replay`, `serve`, `query`, `config`; graceful shutdown (SIGINT/SIGTERM), WAL recovery, TOML config with fail-fast checks | done |
 | P1-12 | Security: no-unwrap lints, 8 fuzz targets, `docs/security.md`, read-only Flight/Postgres, constant-time tokens, systemd supervision unit | done |
-| P1-13 | Benchmark harness (`bench/compare`, criterion, fixed-point histograms in `/metrics`) done; **24 h live soak: open** |
+| P1-13 | Benchmark harness (`bench/compare`, criterion, fixed-point histograms in `/metrics`) done; 24 h live soak of the v0.1.0 release build: clean (`docs/benchmarks/2026-11-12-axion-24h-soak.md`); a 24 h run of a later release: open |
 
 ## Performance work (continuous)
 Profiling passes are recorded under `docs/benchmarks/`. Pass 1 (2026-11-09): decoder, ingest locks, NEON kernels, SVE2 filter loop. Pass 1b: SBE decoder, simd-json (slower, opt-in), flat book (slower, reverted), dense forward ASOF, streaming capture reads. Next: typed column appends, SBE live verification.

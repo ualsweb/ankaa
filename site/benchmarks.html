@@ -197,11 +197,11 @@
           <tr><td>Run 5, development build</td><td class="num">1.6 h</td><td class="wrap-ok">Clean. Stopped to deploy a newer build.</td></tr>
           <tr><td>Run 6, development build</td><td class="num">0.6 h</td><td class="wrap-ok">Clean. Stopped to deploy the release build.</td></tr>
           <tr><td>Run 7, release build (v0.1.0)</td><td class="num">3.0 h</td><td class="wrap-ok"><b>Clean.</b> 1,376,627 frames from live Binance ingested into 10,959,440 rows: no feed gap, dropped frame, WAL error or rejected row. Started after a passing <code>kill -9</code> crash test (identical row counts after recovery, serving again in about a second). A 2-hour retention window expired and deleted segments on live data throughout. Memory outside the data tiers: 175 MB after the first hour, 200 MB at the end (+14 %, the check allows 50 %).</td></tr>
-          <tr><td>Run 8, release build (v0.1.0)</td><td class="num">24 h, running</td><td class="wrap-ok">Started 11 Nov 14:34 UTC on the same build. The result, pass or fail, replaces this line.</td></tr>
+          <tr><td>Run 8, release build (v0.1.0)</td><td class="num">24 h</td><td class="wrap-ok"><b>Clean.</b> 8,578,786 frames from live Binance ingested into 59,450,471 rows, 11 to 12 Nov: no feed gap, order-book resync, dropped frame, WAL error, rejected row or restart. Memory outside the data tiers: 211 MiB after the first hour, 245 MiB at the end (+16 %, highest +28 %; the check allows 50 %). <a href="https://github.com/ualsweb/ankaa/blob/main/docs/benchmarks/2026-11-12-axion-24h-soak.md">Note and raw CSV</a>.</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="note">Not done yet: one uninterrupted 24-hour run of the release build. It is the next item on the <a href="https://github.com/ualsweb/ankaa/blob/main/docs/launch-checklist.md">launch checklist</a>, and this table will say how it went, pass or fail.</p>
+    <p class="note">Not done yet: a 24-hour run of 0.2.0 or a later release, which change ingest, storage and query code. This table will say how it goes, pass or fail.</p>
   </div>
 </section>
 

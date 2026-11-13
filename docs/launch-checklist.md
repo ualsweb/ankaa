@@ -88,7 +88,7 @@ ankaad serve --config deploy/ankaad.example.toml &     # with wal_dir and checkp
 ANKAA_TOKEN=$ANKAA_TOKEN scripts/soak.sh --hours 24 --pid $! --out soak-$(date +%F).csv
 ```
 
-- [ ] `soak: clean` after 24 h: no feed gaps, no channel or WAL drops, no WAL errors, no bad
+- [x] `soak: clean` after 24 h (v0.1.0, 2026-11-12, `docs/benchmarks/2026-11-12-axion-24h-soak.md`): no feed gaps, no channel or WAL drops, no WAL errors, no bad
       frames, no restart, memory outside the data tiers (resident minus hot and warm tier bytes) within 50 % of its level after the first hour.
 - [ ] Restart the server once in the middle of a second run (SIGTERM) and once with `kill -9`:
       row counts continue, `ankaa_wal_recovered_frames` is non-zero after the crash, file and
@@ -96,7 +96,7 @@ ANKAA_TOKEN=$ANKAA_TOKEN scripts/soak.sh --hours 24 --pid $! --out soak-$(date +
 - [ ] If replication is part of the test: a standby reaches the primary's
       `ankaa_wal_durable_lsn`, survives a primary restart, and a deliberately stale standby
       (stopped across a checkpoint) exits with the re-seed message instead of serving a gap.
-- [ ] Keep the CSV; it goes into the soak note under `docs/benchmarks/`.
+- [x] Keep the CSV; it goes into the soak note under `docs/benchmarks/` (`bench/soak/`).
 
 ## 5. Deployment defaults to confirm on the first internet-reachable host
 
