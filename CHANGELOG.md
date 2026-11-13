@@ -4,6 +4,17 @@ All notable changes are recorded here. The project is pre-alpha: interfaces may 
 
 ## Unreleased
 
+- SIMD: the SVE2 kernels keep predicates out of the loop body: four full vectors per iteration with
+  unpredicated loads, compares under an all-true predicate, one accumulator per vector, a single
+  `whilelo` per block and a predicated tail. Counts merge the compare result with one predicated add
+  into vector accumulators; filters govern the second compare by the first (no `and`) and count with
+  independent `cntp`; the i64 range filter and count use one unsigned compare, `(x - lo) <= (hi - lo)`.
+  On Neoverse V2 (Google Axion, 1,024 values) every SVE2 kernel measured before and after is 1.4–2.6× faster (of the count kernels, only `gt` was benchmarked; the other comparisons share its code), and the
+  per-kernel choice at 128-bit vectors (`dispatch::SVE2_AT_128`) now takes the filters (215 against
+  240 ns f32, 348 against 510 ns i64) and the gathers (91 against 159 ns f32, 211 against 238 ns i64)
+  from SVE2, besides `min_max_i64`. Sums, float min/max and counts stay on NEON. Measurements and
+  limits: `docs/benchmarks/2026-11-13-axion-sve2-loop-shape.md`. New differential tests: every length
+  from 0 to 300, unsorted range bounds, i64 range edges.
 - Fixed: a `.dbn` file whose header declares more metadata than the file holds is refused when it is opened
   (`dbn: the header declares … bytes of metadata`). Before, the reader reserved the declared length first, so
   an 11-byte damaged file made `ankaad replay` ask for 4 GiB. Found by the nightly `dbn_replay` fuzz run;

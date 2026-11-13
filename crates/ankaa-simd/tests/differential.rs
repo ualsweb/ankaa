@@ -113,6 +113,27 @@ proptest! {
     }
 
     #[test]
+    fn filter_range_unsorted_bounds_match_scalar(
+        f in prop::collection::vec(arb_f32(), 0..=VECTOR_LEN),
+        i in prop::collection::vec(arb_i64(), 0..=VECTOR_LEN),
+        a in arb_f32(), b in arb_f32(), c in arb_i64(), d in arb_i64(),
+    ) {
+        let mut want = SelVec::new();
+        ScalarBackend.filter_range_f32(&f, a, b, &mut want);
+        for bk in backends() {
+            let mut got = SelVec::new();
+            bk.filter_range_f32(&f, a, b, &mut got);
+            prop_assert_eq!(got.as_slice(), want.as_slice(), "{} f32", bk.kind());
+        }
+        ScalarBackend.filter_range_i64(&i, c, d, &mut want);
+        for bk in backends() {
+            let mut got = SelVec::new();
+            bk.filter_range_i64(&i, c, d, &mut got);
+            prop_assert_eq!(got.as_slice(), want.as_slice(), "{} i64", bk.kind());
+        }
+    }
+
+    #[test]
     fn gather_matches_scalar(data in prop::collection::vec(arb_f32(), 1..=VECTOR_LEN), seed in any::<u64>()) {
         // Build a selection of roughly half the rows.
         let mut sel = SelVec::new();
@@ -166,10 +187,12 @@ proptest! {
     }
 
     #[test]
-    fn count_f32_matches(data in prop::collection::vec(arb_f32(), 0..=VECTOR_LEN), v in arb_f32(), w in arb_f32(), which in 0u8..7) {
+    fn count_f32_matches(data in prop::collection::vec(arb_f32(), 0..=VECTOR_LEN), v in arb_f32(), w in arb_f32(), which in 0u8..8) {
         let op = match which {
             0 => CmpOp::Lt(v), 1 => CmpOp::Le(v), 2 => CmpOp::Gt(v), 3 => CmpOp::Ge(v),
-            4 => CmpOp::Eq(v), 5 => CmpOp::Ne(v), _ => CmpOp::Range(v.min(w), v.max(w)),
+            4 => CmpOp::Eq(v), 5 => CmpOp::Ne(v), 6 => CmpOp::Range(v.min(w), v.max(w)),
+            // unsorted bounds: an empty range unless v <= w
+            _ => CmpOp::Range(v, w),
         };
         let want = ScalarBackend.count_f32(&data, op);
         for b in backends() {
@@ -178,10 +201,12 @@ proptest! {
     }
 
     #[test]
-    fn count_i64_matches(data in prop::collection::vec(arb_i64(), 0..=VECTOR_LEN), v in arb_i64(), w in arb_i64(), which in 0u8..7) {
+    fn count_i64_matches(data in prop::collection::vec(arb_i64(), 0..=VECTOR_LEN), v in arb_i64(), w in arb_i64(), which in 0u8..8) {
         let op = match which {
             0 => CmpOp::Lt(v), 1 => CmpOp::Le(v), 2 => CmpOp::Gt(v), 3 => CmpOp::Ge(v),
-            4 => CmpOp::Eq(v), 5 => CmpOp::Ne(v), _ => CmpOp::Range(v.min(w), v.max(w)),
+            4 => CmpOp::Eq(v), 5 => CmpOp::Ne(v), 6 => CmpOp::Range(v.min(w), v.max(w)),
+            // unsorted bounds: an empty range unless v <= w
+            _ => CmpOp::Range(v, w),
         };
         let want = ScalarBackend.count_i64(&data, op);
         for b in backends() {
@@ -273,5 +298,113 @@ fn full_selection_fits_in_slack() {
             sel.as_slice().last().copied(),
             Some((VECTOR_LEN - 1) as u16)
         );
+    }
+}
+
+/// Every length from 0 to 300: crosses the four-vector block and the single-vector tail at
+/// VL 128, 256 and 512 (block = 16/32/64 f32 lanes, 8/16/32 i64 lanes) for every kernel.
+#[test]
+fn every_length_up_to_300_matches_scalar() {
+    let f: Vec<f32> = (0..300)
+        .map(|i| match i % 37 {
+            5 => f32::NAN,
+            11 => f32::INFINITY,
+            17 => -0.0,
+            _ => ((i * 7919) % 201) as f32 - 100.0,
+        })
+        .collect();
+    let v: Vec<i64> = (0..300)
+        .map(|i| match i % 41 {
+            3 => i64::MIN,
+            7 => i64::MAX,
+            _ => (i64::from(i) * 7919) % 201 - 100,
+        })
+        .collect();
+    let s = ScalarBackend;
+    for n in 0..=300 {
+        let (f, v) = (&f[..n], &v[..n]);
+        for b in backends() {
+            let k = b.kind();
+            let (mut want, mut got) = (SelVec::new(), SelVec::new());
+            s.filter_range_f32(f, -50.0, 50.0, &mut want);
+            b.filter_range_f32(f, -50.0, 50.0, &mut got);
+            assert_eq!(got, want, "{k} filter_f32 n={n}");
+            s.filter_range_i64(v, -50, 50, &mut want);
+            b.filter_range_i64(v, -50, 50, &mut got);
+            assert_eq!(got, want, "{k} filter_i64 n={n}");
+            assert!(
+                approx_eq_sum(s.sum_f32(f), b.sum_f32(f), f),
+                "{k} sum_f32 n={n}"
+            );
+            assert_eq!(b.sum_i64(v), s.sum_i64(v), "{k} sum_i64 n={n}");
+            let (wmn, wmx) = s.min_max_f32(f);
+            let (mn, mx) = b.min_max_f32(f);
+            assert!(
+                f32_eq_or_both_nan(mn, wmn) && f32_eq_or_both_nan(mx, wmx),
+                "{k} min_max_f32 n={n}"
+            );
+            assert_eq!(b.min_max_i64(v), s.min_max_i64(v), "{k} min_max_i64 n={n}");
+            for op in [
+                CmpOp::Gt(0.0),
+                CmpOp::Ne(0.0),
+                CmpOp::Range(-50.0, 50.0),
+                CmpOp::Range(1.0, -1.0),
+            ] {
+                assert_eq!(
+                    b.count_f32(f, op),
+                    s.count_f32(f, op),
+                    "{k} count_f32 {op:?} n={n}"
+                );
+            }
+            for op in [
+                CmpOp::Gt(0),
+                CmpOp::Eq(-100),
+                CmpOp::Range(-50, 50),
+                CmpOp::Range(1, -1),
+            ] {
+                assert_eq!(
+                    b.count_i64(v, op),
+                    s.count_i64(v, op),
+                    "{k} count_i64 {op:?} n={n}"
+                );
+            }
+        }
+    }
+}
+
+/// The unsigned-difference range test of the i64 kernels at the edges of the type: a span of
+/// the whole range (`max - min` = 2^64 - 1), single-value ranges at both ends, and bounds that
+/// straddle zero.
+#[test]
+fn i64_range_extremes_match_scalar() {
+    let v: Vec<i64> = [i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX]
+        .iter()
+        .copied()
+        .cycle()
+        .take(VECTOR_LEN)
+        .collect();
+    let ranges = [
+        (i64::MIN, i64::MAX),
+        (i64::MIN, i64::MIN),
+        (i64::MAX, i64::MAX),
+        (i64::MIN, -1),
+        (0, i64::MAX),
+        (-1, 1),
+        (i64::MAX, i64::MIN),
+    ];
+    for b in backends() {
+        for (lo, hi) in ranges {
+            let (mut want, mut got) = (SelVec::new(), SelVec::new());
+            ScalarBackend.filter_range_i64(&v, lo, hi, &mut want);
+            b.filter_range_i64(&v, lo, hi, &mut got);
+            assert_eq!(got, want, "{} filter [{lo}, {hi}]", b.kind());
+            let op = CmpOp::Range(lo, hi);
+            assert_eq!(
+                b.count_i64(&v, op),
+                ScalarBackend.count_i64(&v, op),
+                "{} count [{lo}, {hi}]",
+                b.kind()
+            );
+        }
     }
 }
