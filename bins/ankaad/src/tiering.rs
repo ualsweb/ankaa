@@ -1752,7 +1752,9 @@ mod tests {
                 4,
                 usize::MAX,
                 Duration::from_secs(10),
-                Duration::from_millis(150),
+                // long enough that no stall of a loaded machine can make it elapse during the
+                // test; "the interval has passed" is set directly below instead of slept for
+                Duration::from_secs(3600),
             );
             let mut t2 = Tables::new(false);
             for lsn in 1..5u64 {
@@ -1766,7 +1768,8 @@ mod tests {
                 slow.tick(&t2, &metrics).is_none(),
                 "persisted, but not due yet"
             );
-            std::thread::sleep(Duration::from_millis(200));
+            // the interval passes: no truncation on record is the state in which it is due
+            slow.last_truncate = None;
             assert!(
                 slow.tick(&t2, &metrics).is_some(),
                 "due now, although nothing was persisted in this tick"
