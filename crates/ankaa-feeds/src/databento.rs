@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use ankaa_ingest::{BookSnapshot, EventBatch, Side, SymbolDict, Trade};
-use dbn::decode::{DbnMetadata, DecodeRecordRef, DynDecoder, DynReader};
+use dbn::decode::{DbnMetadata, DecodeRecordRef, DynReader};
 use dbn::{Mbp1Msg, Mbp10Msg, PitSymbolMap, TradeMsg, UNDEF_PRICE, VersionUpgradePolicy, rtype};
 
 /// DBN prices are fixed point with 9 decimals; ANKAA stores 8.
@@ -47,29 +47,6 @@ pub struct DbnStats {
 /// The decompressed stream of a file, checked record by record on its way into `dbn`.
 type GuardedStream =
     std::io::BufReader<FrameGuard<DynReader<'static, std::io::BufReader<std::fs::File>>>>;
-
-/// The decoder of one file: a DBN stream behind [`FrameGuard`], or anything else (the legacy
-/// DBZ format) through `dbn`'s own detection.
-enum Source {
-    Dbn(Box<dbn::decode::dbn::Decoder<GuardedStream>>),
-    Other(Box<DynDecoder<'static, std::io::BufReader<std::fs::File>>>),
-}
-
-impl Source {
-    fn metadata(&self) -> &dbn::Metadata {
-        match self {
-            Self::Dbn(d) => d.metadata(),
-            Self::Other(d) => d.metadata(),
-        }
-    }
-
-    fn decode_record_ref(&mut self) -> dbn::Result<Option<dbn::RecordRef<'_>>> {
-        match self {
-            Self::Dbn(d) => d.decode_record_ref(),
-            Self::Other(d) => d.decode_record_ref(),
-        }
-    }
-}
 
 /// Checks the framing of a DBN stream as it is read, so that `dbn` never sees a record it would
 /// misread or panic on.
@@ -241,7 +218,7 @@ impl<R: std::io::Read> std::io::Read for FrameGuard<R> {
 
 /// Streaming reader over one DBN file.
 pub struct DbnReplay {
-    dec: Source,
+    dec: Box<dbn::decode::dbn::Decoder<GuardedStream>>,
     /// Per-day instrument → symbol maps (DBN symbology is date-ranged).
     maps: HashMap<i32, PitSymbolMap>,
     stats: DbnStats,
@@ -266,6 +243,12 @@ pub enum DbnError {
     /// Timestamp outside the representable range.
     #[error("timestamp {0} out of range")]
     Timestamp(u64),
+    /// Not a DBN stream: another format, or Databento's legacy DBZ, which is not read.
+    #[error(
+        "not a DBN file (DBN 1 to 3, plain or zstd-compressed); a legacy DBZ file can be converted \
+         with Databento's `dbn` command-line tool"
+    )]
+    NotDbn,
     /// The header declares more metadata than the file can hold.
     #[error(
         "dbn: the header declares {declared} bytes of metadata, more than the {limit} this file can hold"
@@ -285,7 +268,7 @@ const MAX_METADATA_BYTES: u64 = 1 << 30;
 /// Refuses a file whose header declares more metadata than the file can hold. The `dbn` decoder
 /// reserves the declared length before it reads the section, so eleven bytes of a damaged or
 /// hostile file would otherwise ask for 4 GiB. Returns whether the file is a DBN stream (as
-/// opposed to the legacy DBZ format or something else, which `dbn` itself sorts out).
+/// opposed to the legacy DBZ format or something else).
 fn check_prelude(path: &Path) -> Result<bool, DbnError> {
     use std::io::Read as _;
     let io = |e: std::io::Error| DbnError::Dbn(dbn::Error::io(e, "reading the DBN header"));
@@ -302,7 +285,7 @@ fn check_prelude(path: &Path) -> Result<bool, DbnError> {
         }
     }
     if got < prelude.len() || &prelude[..3] != b"DBN" {
-        // not a DBN stream (or a legacy one): the decoder says what is wrong with it
+        // not a DBN stream (another format, a legacy DBZ file, or too short)
         return Ok(false);
     }
     let declared = u64::from(u32::from_le_bytes([
@@ -325,20 +308,20 @@ impl DbnReplay {
     pub fn open(path: &Path) -> Result<Self, DbnError> {
         let is_dbn = check_prelude(path)?;
         let policy = VersionUpgradePolicy::UpgradeToV3;
-        let dec = if is_dbn {
-            // the guard needs `ts_out` before the first record; the metadata is read once more
-            // for it (its length was bounded by `check_prelude`)
-            let ts_out = dbn::decode::dbn::MetadataDecoder::new(DynReader::from_file(path)?)
-                .decode()?
-                .ts_out;
-            let guarded =
-                std::io::BufReader::new(FrameGuard::new(DynReader::from_file(path)?, ts_out));
-            Source::Dbn(Box::new(dbn::decode::dbn::Decoder::with_upgrade_policy(
-                guarded, policy,
-            )?))
-        } else {
-            Source::Other(Box::new(DynDecoder::from_file(path, policy)?))
-        };
+        // Only DBN streams are read, each through `FrameGuard`. The legacy DBZ format is refused:
+        // `dbn`'s DBZ reader panics on a truncated header (found by fuzzing), and DBN replaced it.
+        if !is_dbn {
+            return Err(DbnError::NotDbn);
+        }
+        // the guard needs `ts_out` before the first record; the metadata is read once more for it
+        // (its length was bounded by `check_prelude`)
+        let ts_out = dbn::decode::dbn::MetadataDecoder::new(DynReader::from_file(path)?)
+            .decode()?
+            .ts_out;
+        let guarded = std::io::BufReader::new(FrameGuard::new(DynReader::from_file(path)?, ts_out));
+        let dec = Box::new(dbn::decode::dbn::Decoder::with_upgrade_policy(
+            guarded, policy,
+        )?);
         let dataset = dec.metadata().dataset.clone();
         Ok(Self {
             dec,
@@ -641,6 +624,23 @@ mod tests {
         );
     }
 
+    /// The input of the third `dbn_replay` fuzz crash (a legacy DBZ file whose metadata is cut
+    /// short; `dbn`'s DBZ reader panicked with "mid > len") and other non-DBN input are refused.
+    #[test]
+    fn legacy_dbz_and_other_formats_are_refused_not_a_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dbn/dbz-truncated-metadata.bin");
+        let other = dir.path().join("not-dbn.dbn");
+        std::fs::write(&other, b"this is not a databento file at all").unwrap();
+        let short = dir.path().join("short.dbn");
+        std::fs::write(&short, b"DBN").unwrap();
+        for path in [&fixture, &other, &short] {
+            let err = DbnReplay::open(path).expect_err("not a DBN stream");
+            assert!(matches!(err, DbnError::NotDbn), "{}: {err}", path.display());
+        }
+    }
+
     /// The guard's state survives any split of the stream into reads, down to one byte.
     #[test]
     fn frame_guard_checks_every_boundary_whatever_the_read_size() {
@@ -803,10 +803,10 @@ mod tests {
             })
         ));
 
-        // a short or foreign file still gets the decoder's own error
+        // a file too short to hold the prelude is not a DBN stream
         let short = dir.path().join("short.dbn");
         std::fs::write(&short, b"DBN\x01").unwrap();
-        assert!(matches!(DbnReplay::open(&short), Err(DbnError::Dbn(_))));
+        assert!(matches!(DbnReplay::open(&short), Err(DbnError::NotDbn)));
     }
 
     #[test]
