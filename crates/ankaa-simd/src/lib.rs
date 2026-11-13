@@ -19,7 +19,7 @@ pub mod sve2;
 
 pub mod dispatch;
 
-pub use dispatch::{BackendKind, SimdError, backend, best, detect, init_backend};
+pub use dispatch::{BackendKind, Kernel, SimdError, backend, best, detect, init_backend};
 pub use sel::{SelVec, VECTOR_LEN};
 
 /// Crate version string (from Cargo).

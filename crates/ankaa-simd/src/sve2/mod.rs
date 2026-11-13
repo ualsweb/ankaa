@@ -82,6 +82,11 @@ impl SimdBackend for Sve2Backend {
     fn filter_range_i64(&self, data: &[i64], min: i64, max: i64, sel: &mut SelVec) -> usize {
         debug_check_len(data.len());
         sel.clear();
+        // the kernel tests `(x - min) <= (max - min)` unsigned, which needs min <= max; an
+        // empty range selects nothing, as in the scalar reference
+        if min > max {
+            return 0;
+        }
         // SAFETY: as for `filter_range_f32`; .d lanes ≤ 32 per store, within the slack.
         let n = unsafe {
             kernels::ankaa_sve2_filter_range_i64_sel(
@@ -182,6 +187,8 @@ impl SimdBackend for Sve2Backend {
                 CmpOp::Ge(v) => kernels::ankaa_sve2_count_i64_ge(p, n, v, 0),
                 CmpOp::Eq(v) => kernels::ankaa_sve2_count_i64_eq(p, n, v, 0),
                 CmpOp::Ne(v) => kernels::ankaa_sve2_count_i64_ne(p, n, v, 0),
+                // the kernel tests `(x - lo) <= (hi - lo)` unsigned, which needs lo <= hi
+                CmpOp::Range(lo, hi) if lo > hi => 0,
                 CmpOp::Range(lo, hi) => kernels::ankaa_sve2_count_i64_range(p, n, lo, hi),
             }
         }

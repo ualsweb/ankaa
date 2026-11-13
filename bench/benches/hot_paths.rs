@@ -69,6 +69,22 @@ fn simd(c: &mut Criterion) {
         g.bench_with_input(BenchmarkId::new("count_f32_gt", k), &f32s, |bch, d| {
             bch.iter(|| black_box(b.count_f32(black_box(d), CmpOp::Gt(0.0))))
         });
+        g.bench_with_input(BenchmarkId::new("count_i64_range", k), &i64s, |bch, d| {
+            bch.iter(|| black_box(b.count_i64(black_box(d), CmpOp::Range(250, 750))))
+        });
+        // gathers of the half selection a filter leaves (NEON has no gather: scalar loop)
+        let mut sel_f = SelVec::new();
+        ScalarBackend.filter_range_f32(&f32s, -50.0, 50.0, &mut sel_f);
+        g.bench_with_input(BenchmarkId::new("gather_f32_half", k), &f32s, |bch, d| {
+            let mut out = vec![0f32; VECTOR_LEN];
+            bch.iter(|| black_box(b.gather_f32(black_box(d), &sel_f, &mut out)));
+        });
+        let mut sel_i = SelVec::new();
+        ScalarBackend.filter_range_i64(&i64s, 250, 750, &mut sel_i);
+        g.bench_with_input(BenchmarkId::new("gather_i64_half", k), &i64s, |bch, d| {
+            let mut out = vec![0i64; VECTOR_LEN];
+            bch.iter(|| black_box(b.gather_i64(black_box(d), &sel_i, &mut out)));
+        });
     }
     g.finish();
 }

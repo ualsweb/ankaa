@@ -91,16 +91,17 @@
         <table>
           <thead><tr><th>Kernel, 1,024 values</th><th class="num">scalar</th><th class="num">NEON</th><th class="num">SVE2</th></tr></thead>
           <tbody>
-            <tr><td>filter_range_f32</td><td class="num">966</td><td class="num best">242</td><td class="num">305</td></tr>
-            <tr><td>sum_f32</td><td class="num">665</td><td class="num best">89</td><td class="num">261</td></tr>
-            <tr><td>min_max_f32</td><td class="num">119</td><td class="num best">55</td><td class="num">162</td></tr>
-            <tr><td>min_max_i64</td><td class="num">183</td><td class="num">181</td><td class="num best">114</td></tr>
-            <tr><td>count_f32_gt</td><td class="num">175</td><td class="num best">57</td><td class="num">196</td></tr>
+            <tr><td>filter_range_f32</td><td class="num">966</td><td class="num">240</td><td class="num best">215</td></tr>
+            <tr><td>gather_f32</td><td class="num">154</td><td class="num">159</td><td class="num best">91</td></tr>
+            <tr><td>sum_f32</td><td class="num">664</td><td class="num best">89</td><td class="num">124</td></tr>
+            <tr><td>min_max_f32</td><td class="num">119</td><td class="num best">55</td><td class="num">63</td></tr>
+            <tr><td>min_max_i64</td><td class="num">182</td><td class="num">182</td><td class="num best">114</td></tr>
+            <tr><td>count_f32_gt</td><td class="num">176</td><td class="num best">57</td><td class="num">91</td></tr>
           </tbody>
         </table>
       </div>
     </div>
-    <p class="note">Nanoseconds unless stated. At 128-bit vectors NEON wins most kernels, so the engine picks per kernel at start-up: NEON on Axion and Graviton4 except 64-bit integer min/max, where SVE2 has instructions NEON lacks. Wider SVE vectors switch the default to SVE2. Full tables: <a href="https://github.com/ualsweb/ankaa/blob/main/docs/benchmarks/2026-11-10-axion-first-light.md">first-light note</a>.</p>
+    <p class="note">Nanoseconds unless stated. Decode and ingest measured 2026-11-10; the kernel table 2026-11-13, after the SVE2 loops were rewritten with fewer predicates. At 128-bit vectors SVE2 and NEON move the same data per clock, so the engine picks per kernel at start-up: SVE2 where it has instructions NEON lacks (<code>compact</code> in filters, gathers, 64-bit integer min/max), NEON for the plain loops. Wider SVE vectors switch the default to SVE2. Full tables: <a href="https://github.com/ualsweb/ankaa/blob/main/docs/benchmarks/2026-11-13-axion-sve2-loop-shape.md">loop-shape note</a>, <a href="https://github.com/ualsweb/ankaa/blob/main/docs/benchmarks/2026-11-10-axion-first-light.md">first-light note</a>.</p>
   </div>
 </section>
 
