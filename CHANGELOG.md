@@ -2,23 +2,53 @@
 
 All notable changes are recorded here. The project is pre-alpha: interfaces may change between releases.
 
-## Unreleased
+## 0.3.0 — 2026-11-13
+
+SVE2 kernels rebuilt around fewer predicates, with SVE2 now chosen per kernel where it measured faster at
+128-bit vectors, and fixes for damaged Databento files found by fuzzing.
+
+**Upgrading from 0.2.0.** Nothing breaks: the segment, log and configuration formats did not change, and
+data written by 0.2.0 is read as it is. Two behaviours change: on a CPU with SVE2 at 128-bit vectors (Google
+Axion, AWS Graviton4) the filter and gather kernels now run on SVE2 instead of NEON (`ANKAA_SIMD=neon`
+runs every kernel on NEON), a damaged `.dbn` file that 0.2.0 might have misread or crashed on is now
+refused, and Databento's legacy DBZ format is no longer read (convert DBZ files with Databento's `dbn`
+command-line tool; `.dbn` and `.dbn.zst` are read as before).
 
 - SIMD: the SVE2 kernels keep predicates out of the loop body: four full vectors per iteration with
-  unpredicated loads, compares under an all-true predicate, one accumulator per vector, a single
-  `whilelo` per block and a predicated tail. Counts merge the compare result with one predicated add
-  into vector accumulators; filters govern the second compare by the first (no `and`) and count with
-  independent `cntp`; the i64 range filter and count use one unsigned compare, `(x - lo) <= (hi - lo)`.
-  On Neoverse V2 (Google Axion, 1,024 values) every SVE2 kernel measured before and after is 1.4–2.6× faster (of the count kernels, only `gt` was benchmarked; the other comparisons share its code), and the
-  per-kernel choice at 128-bit vectors (`dispatch::SVE2_AT_128`) now takes the filters (215 against
-  240 ns f32, 348 against 510 ns i64) and the gathers (91 against 159 ns f32, 211 against 238 ns i64)
-  from SVE2, besides `min_max_i64`. Sums, float min/max and counts stay on NEON. Measurements and
-  limits: `docs/benchmarks/2026-11-13-axion-sve2-loop-shape.md`. New differential tests: every length
-  from 0 to 300, unsorted range bounds, i64 range edges.
+  unpredicated loads, compares under an all-true predicate, one accumulator per vector, a single `whilelo`
+  per block and a predicated tail. Counts merge the compare result with one predicated add into vector
+  accumulators; filters govern the second compare by the first (no `and`) and count with independent
+  `cntp`; the i64 range filter and count use one unsigned compare, `(x - lo) <= (hi - lo)`. On Neoverse V2
+  (Google Axion, 1,024 values) every SVE2 kernel measured before and after is 1.4–2.6× faster (of the
+  count kernels only `gt` was benchmarked; the other comparisons share its code). The per-kernel choice at
+  128-bit vectors (`dispatch::SVE2_AT_128`, new public `Kernel` enum) now takes the filters (215 against
+  240 ns f32, 348 against 510 ns i64) and the gathers (91 against 159 ns f32, 211 against 238 ns i64) from
+  SVE2, besides `min_max_i64`. Sums, float min/max and counts stay on NEON. Measurements and limits:
+  `docs/benchmarks/2026-11-13-axion-sve2-loop-shape.md`. New differential tests: every length from 0 to
+  300, unsorted range bounds, i64 range edges.
+- Fixed: a `.dbn` file with a record whose length is not a multiple of 8 bytes is refused (`record of …
+  bytes, not a multiple of 8: damaged DBN data`). The `dbn` crate checks a record's length against the
+  header but not its alignment, so such a length placed the next record 4 bytes off the 8-byte alignment it
+  reads records with: a panic in debug builds and a misaligned read in release builds, for DBN versions 1
+  to 3, plain and compressed. Every DBN record type is a multiple of 8 bytes, so no valid file is affected.
+  Found by the nightly `dbn_replay` fuzz run.
+- Fixed: in a DBN version 1 or 2 file, a record that `dbn` upgrades (instrument definition, statistics,
+  symbol mapping, error, system message) and that is shorter than its old layout is refused (`record of type
+  … is … bytes, shorter than the … bytes of its DBN version … layout`). `dbn` asserts that length while
+  upgrading, so such a record crashed `ankaad replay` (release builds abort on a panic). Found by the same
+  fuzz target, on the fix above.
+- Changed: `ankaad replay` reads DBN files only (versions 1 to 3, plain or zstd-compressed) and refuses
+  anything else (`not a DBN file …`). The `dbn` crate's reader for the legacy DBZ format panicked on a
+  truncated header (found by fuzzing), and DBN replaced DBZ; the documented inputs were always `.dbn` and
+  `.dbn.zst`.
 - Fixed: a `.dbn` file whose header declares more metadata than the file holds is refused when it is opened
   (`dbn: the header declares … bytes of metadata`). Before, the reader reserved the declared length first, so
   an 11-byte damaged file made `ankaad replay` ask for 4 GiB. Found by the nightly `dbn_replay` fuzz run;
   a compressed file is held to 1 GiB of metadata. The `fuzz-smoke` workflow can now be started by hand.
+- Tests: the tiering checkpoint test no longer depends on a 150 ms wall-clock window (it failed once on a
+  loaded machine).
+- Endurance: the 24-hour live soak of the v0.1.0 release build on Google Axion was clean
+  (`docs/benchmarks/2026-11-12-axion-24h-soak.md`, raw CSV in `bench/soak/`).
 
 ## 0.2.0 — 2026-11-12
 
